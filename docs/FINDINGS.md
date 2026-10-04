@@ -22,6 +22,7 @@ against a CPU reference, and "it runs" was never taken as evidence.
 | No fast 3x3 convolution after that | Fixed (new solver) | `patches/miopen/winograd-f2x3-hip-gfx803.patch` |
 | fp16 3x3 convolutions slow (GEMM only) | Fixed (same solver, fp16) | same |
 | rocBLAS fp16 N/T GEMMs 15-25x slow | Fixed (shim fp16 route) | `patches/sgemm-shim-batched/` |
+| bf16 reported as supported (no bf16 hardware) | Checked: correct; convs 1.7x slower than fp16 | none needed |
 | PyTorch int8 matmul fails on every call | Fixed (port of upstream's fix) | `patches/pytorch/` |
 | PyTorch layer_norm wrong | Worked around | `runtime/python/` |
 | torchvision nms has no gfx803 kernel | Worked around (CPU) | `runtime/python/` |
@@ -260,6 +261,18 @@ fit. fp8 weight storage changes the UNet output by about 6% against fp32;
 that is fp8's rounding, identical on any GPU (the GPU matches a CPU run with
 the same fp8-rounded weights to 1e-3). A real 12-step `sdxl_train_network.py`
 run at 768 px in fp16 completed with loss 0.20 and a 7.9 GB card peak.
+
+**bf16.** gfx803 has no bf16 hardware, but PyTorch reports compute capability
+8.0 and `torch.cuda.is_bf16_supported()` returns True, so ComfyUI, sd-scripts
+and other tools may choose bf16 on their own. On this stack that is safe:
+casts, elementwise math, reductions, softmax, matmuls (plain, batched,
+linear), 3x3 convolution, group and layer norm and attention all match the CPU
+to bf16's own rounding (about 2e-3), with no faults or hangs. Upstream's
+ROCm 10 line reported bf16 hanging the card under vLLM (Schaka/rocm-gfx803,
+`vllm/NOTES.md`); that does not reproduce here. bf16 matmuls run at fp16/fp32
+speed, but 3x3 convolutions take about 1.7x as long (2.54 ms against 1.43 ms
+fp16 for 320 channels at 64x64), because the Winograd solver above covers fp32
+and fp16 only. Prefer fp16 for half precision on this card.
 
 ## 7. llama.cpp and Ollama
 
