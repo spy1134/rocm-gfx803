@@ -727,6 +727,12 @@ RUN git init -q /pytorch \
     && git -C /pytorch checkout -q FETCH_HEAD \
     && git -C /pytorch submodule update -q --init --recursive --depth 1
 
+# torch._int_mm reaches hipBLASLt unconditionally, and hipBLASLt has no gfx803
+# kernels, so every int8 matmul fails; the patch routes it to rocBLAS. Applied
+# to the CUDA source, before build_amd.py hipifies it.
+COPY patches/pytorch/ /pytorch-patches/
+RUN sh /pytorch-patches/gfx803-int8-gemm-rocblas.sh /pytorch
+
 WORKDIR /pytorch
 RUN pip install --no-cache-dir -r requirements.txt
 

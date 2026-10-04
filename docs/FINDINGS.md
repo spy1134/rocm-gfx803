@@ -22,6 +22,7 @@ against a CPU reference, and "it runs" was never taken as evidence.
 | No fast 3x3 convolution after that | Fixed (new solver) | `patches/miopen/winograd-f2x3-hip-gfx803.patch` |
 | fp16 3x3 convolutions slow (GEMM only) | Fixed (same solver, fp16) | same |
 | rocBLAS fp16 N/T GEMMs 15-25x slow | Fixed (shim fp16 route) | `patches/sgemm-shim-batched/` |
+| PyTorch int8 matmul fails on every call | Fixed (port of upstream's fix) | `patches/pytorch/` |
 | PyTorch layer_norm wrong | Worked around | `runtime/python/` |
 | torchvision nms has no gfx803 kernel | Worked around (CPU) | `runtime/python/` |
 | Patched HSA runtime page faults | Open; stock runtime selectable | start scripts |
@@ -171,9 +172,21 @@ twice on the second generation after a model reload, which fits the patched
 runtime's pattern but is not proven. Which runtime the image should default
 to is still open.
 
-## 5. PyTorch-level workarounds in the base image
+## 5. PyTorch fixes and workarounds in the base image
 
-These are loaded into every Python process through `sitecustomize` in the base
+**int8 matmul.** `torch._int_mm` (int8 x int8 -> int32, used by anything that
+quantizes linear layers to int8, such as ComfyUI's int8 backends) failed on
+every call with `HIPBLAS_STATUS_INVALID_VALUE`: on ROCm, PyTorch sends it to
+hipBLASLt unconditionally, and hipBLASLt has no gfx803 kernels.
+`TORCH_BLAS_PREFER_HIPBLASLT=0` does not help, because this one path never
+checks it. [`rocm6.4.4/patches/pytorch/`](../rocm6.4.4/patches/pytorch/) routes
+it to rocBLAS whenever hipBLASLt is not the preferred backend, as PyTorch's
+floating-point GEMMs already do. The fix comes from upstream's ROCm 10 line
+(Schaka/rocm-gfx803 commit 5061404), adapted to torch 2.8. Check: 18 of 18
+shapes and transpose layouts bit-exact against an int64 CPU product; 4 TOPS at
+2048^3.
+
+The workarounds below are loaded into every Python process through `sitecustomize` in the base
 image; the modules are in [`rocm6.4.4/runtime/python/`](../rocm6.4.4/runtime/python/).
 They are workarounds with their source fixes still to do.
 

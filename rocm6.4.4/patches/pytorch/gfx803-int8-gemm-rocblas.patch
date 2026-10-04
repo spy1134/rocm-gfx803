@@ -1,0 +1,123 @@
+PyTorch (ROCm/pytorch release/2.8, commit d618db8): route torch._int_mm to
+rocBLAS on gfx803 instead of hipBLASLt.
+
+WHY
+torch._int_mm (int8 x int8 -> int32) fails on every call on gfx803. On ROCm,
+at::cuda::blas::int8_gemm calls hipBLASLt and has no other path, and
+hipBLASLt has never shipped kernels for gfx803, so its heuristic query
+returns HIPBLAS_STATUS_INVALID_VALUE:
+
+  RuntimeError: CUDA error: HIPBLAS_STATUS_INVALID_VALUE when calling
+  `hipblasLtMatmulAlgoGetHeuristic( ltHandle, ...`
+
+TORCH_BLAS_PREFER_HIPBLASLT=0, which the base image sets, does not help:
+int8_gemm never asks for the preferred backend, while the fp gemm, bgemm and
+addmm paths in the same file do and fall back to rocBLAS. Anything that
+quantizes a linear layer to int8 reaches it (ComfyUI's int8 backends, for
+example). To reproduce, run torch._int_mm on two 1024x1024 int8 GPU tensors.
+
+The fix and its analysis come from the upstream rocm-gfx803 project's ROCm 10
+line (Schaka/rocm-gfx803 commit 5061404, written against torch 2.14). This is
+the same change adapted to torch 2.8: 2.8 has neither
+getHipblasltSupportedArchs() nor CUBLAS_SM_CARVEOUT_GUARD, so the rocBLAS path
+is chosen with the check 2.8's own fp gemm paths use instead.
+
+WHAT
+int8_gemm calls rocblas_gemm_ex (i8 inputs, i32 output and compute) whenever
+the preferred BLAS backend is not hipBLASLt. Context makes hipBLASLt the
+preferred backend only on archs it supports (gfx90a, gfx942 and a few newer
+ones) and falls back to rocBLAS elsewhere, so gfx803 always takes the rocBLAS
+path, and archs that use hipBLASLt keep the Lt path unchanged. The call uses
+the same handle, stream and column-major contract as the file's existing
+rocblas_gemm_ex calls. rocBLAS 6.4.4 as built for gfx803 here carries int8
+(I8I_HPA) Tensile kernels for all four transpose layouts.
+
+REAL-HARDWARE VERIFICATION (RX 590, this image)
+torch._int_mm on the GPU against an exact int64 CPU product: 18 of 18 cases
+bit-exact (shapes from 17x8x8 to 2048x6144x2048, plain, transposed-A,
+transposed-B and both, including odd sizes). Before the patch every one of
+them raised the error above. 2048x2048x2048 runs in 4.24 ms (4.05 TOPS).
+
+diff --git a/aten/src/ATen/cuda/CUDABlas.cpp b/aten/src/ATen/cuda/CUDABlas.cpp
+index 573389b..7ef9ae9 100644
+--- a/aten/src/ATen/cuda/CUDABlas.cpp
++++ b/aten/src/ATen/cuda/CUDABlas.cpp
+@@ -1996,6 +1996,60 @@ void scaled_gemm(
+   TORCH_CHECK(false, "scaled_gemm is only supported for CUDA 11.8 and above");
+ }
+ 
++#ifdef USE_ROCM
++// GFX803_INT8_GEMM_ROCBLAS_PATCH: hipBLASLt ships no kernels for gfx803 (or
++// any arch it does not list), so the Lt heuristic query below fails there with
++// HIPBLAS_STATUS_INVALID_VALUE. rocBLAS carries int8 -> int32 Tensile kernels
++// for those archs, with the same column-major contract as the Lt call.
++static void int8_gemm_rocblas(
++    bool transpose_mat1,
++    bool transpose_mat2,
++    int64_t m,
++    int64_t n,
++    int64_t k,
++    const int8_t* mat1_ptr,
++    int64_t mat1_ld,
++    const int8_t* mat2_ptr,
++    int64_t mat2_ld,
++    int32_t* result_ptr,
++    int64_t result_ld) {
++  CUDABLAS_NONNEGINT_CHECK(int8_gemm, m);
++  CUDABLAS_NONNEGINT_CHECK(int8_gemm, n);
++  CUDABLAS_NONNEGINT_CHECK(int8_gemm, k);
++  CUDABLAS_POSINT_CHECK(int8_gemm, mat1_ld);
++  CUDABLAS_POSINT_CHECK(int8_gemm, mat2_ld);
++  CUDABLAS_POSINT_CHECK(int8_gemm, result_ld);
++  cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
++  int32_t alpha = 1;
++  int32_t beta = 0;
++  TORCH_CUDABLAS_CHECK(rocBLASStatusToHIPStatus(rocblas_gemm_ex(
++      (rocblas_handle)handle,
++      transpose_mat1 ? rocblas_operation_transpose : rocblas_operation_none,
++      transpose_mat2 ? rocblas_operation_transpose : rocblas_operation_none,
++      m,
++      n,
++      k,
++      &alpha,
++      mat1_ptr,
++      rocblas_datatype_i8_r,
++      mat1_ld,
++      mat2_ptr,
++      rocblas_datatype_i8_r,
++      mat2_ld,
++      &beta,
++      result_ptr,
++      rocblas_datatype_i32_r,
++      result_ld,
++      result_ptr,
++      rocblas_datatype_i32_r,
++      result_ld,
++      rocblas_datatype_i32_r,
++      rocblas_gemm_algo_standard,
++      0,
++      0)));
++}
++#endif
++
+ void int8_gemm(
+     bool transpose_mat1,
+     bool transpose_mat2,
+@@ -2008,6 +2062,17 @@ void int8_gemm(
+     int64_t mat2_ld,
+     int32_t* result_ptr,
+     int64_t result_ld) {
++#ifdef USE_ROCM
++  // The same rule the fp gemm paths in this file follow: rocBLAS unless
++  // hipBLASLt is the preferred backend, which Context only allows on archs
++  // hipBLASLt supports.
++  if (at::globalContext().blasPreferredBackend() != BlasBackend::Cublaslt) {
++    int8_gemm_rocblas(
++        transpose_mat1, transpose_mat2, m, n, k,
++        mat1_ptr, mat1_ld, mat2_ptr, mat2_ld, result_ptr, result_ld);
++    return;
++  }
++#endif
+ 
+   cublasComputeType_t computeType = CUBLAS_COMPUTE_32I;
+   cudaDataType_t scaleType = CUDA_R_32I;
