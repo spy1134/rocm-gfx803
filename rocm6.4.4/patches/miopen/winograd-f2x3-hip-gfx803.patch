@@ -1,0 +1,627 @@
+MIOpen (pinned tag rocm-6.4.4, commit 4d17e9a): add ConvHipWinogradF2x3, a
+Winograd F(2x2,3x3) solver for 3x3, stride-1, pad-1 fp32 and fp16 convolutions
+on gfx8, forward and backward data.
+
+WHY
+winograd-bin-gfx803-disable.patch takes MIOpen's binary Winograd solvers off
+gfx803 because they corrupt memory and hang the GPU there. That leaves the
+GEMM solvers (GemmFwdRest, GemmBwdRest) for every 3x3 convolution: an im2col
+copy that expands the input 9x, then one large GEMM. Every other Winograd
+solver in this MIOpen is unusable on gfx803: ConvMPBidirectWinograd and the
+multi-pass weight-gradient solvers run gfx9 assembly transform kernels and
+reject gfx8 in IsApplicable, and the rest are gfx9+ or fp16-dot only.
+
+Winograd F(2x2,3x3) needs 2.25x fewer multiplies than direct or im2col
+convolution and keeps the GEMM it reduces to large. This solver splits it into
+three small HIP kernels around one strided-batched rocBLAS GEMM:
+  filter transform  w -> U[16][K][C]  (for backward data, the 180-degree
+                    rotated filter with the channel axes swapped)
+  input transform   x -> V[16][C][P]  (P = N * ceil(H/2) * ceil(W/2) tiles)
+  GEMM              M[t] = U[t] * V[t] for the 16 tile positions t
+  output transform  M -> y
+The kernels are plain one-thread-per-(channel, tile) HIP code compiled through
+MIOpen's normal HIP kernel path, with no persistent launch and no LDS, unlike
+the binary kernels above. On gfx803 with this repo's SGEMM shim the GEMM runs
+on the shim, so no Tensile fp32 kernel is involved. The solver is registered
+in the Winograd list, so Find benchmarks it against the GEMM solvers and keeps
+whichever is faster per shape.
+
+For fp16 tensors the workspace is fp16 and the transforms still compute in
+fp32, so values round only where they are stored; the GEMM goes through
+MIOpen's half-precision rocBLAS call, which accumulates in fp32. Without this
+solver gfx803 has no fast fp16 3x3 convolution at all: the binary Winograd
+solvers are off, and the GEMM path's backward data hits a rocBLAS fp16 layout
+that is 15-25x slower than the others (see the SGEMM shim's header).
+
+Measured on an RX 590 (gfx803), batch 1, SD1.5 UNet shapes, GEMM solvers
+against this solver as Find selected it:
+  320->320  at 64x64: fwd 2.99 -> 1.50 ms, bwd-data 3.01 -> 1.55 ms
+  1280->640 at 32x32: fwd 6.36 -> 2.97 ms, bwd-data 5.57 -> 3.46 ms
+  2560->1280 at 16x16: fwd 7.65 -> 5.33 ms; bwd-data stays on GEMM (5.38)
+  1280->1280 at 8x8 and the 4-channel input conv stay on GEMM.
+Results are more accurate than the GEMM path's: relative error against a
+float64 CPU reference is 7e-7 to 2.4e-6, against 2e-6 to 7e-6.
+
+fp16, the same 17 shapes (batch 1 and 2), summed over all of them: forward
+59.3 -> 36.7 ms and backward data 388.2 -> 32.0 ms against the GEMM path, close
+to fp32's 34.7 and 33.8 ms on this solver; relative error against a float64
+CPU reference of the same fp16 inputs 6e-4 to 1.1e-3, against the GEMM path's
+3e-4 to 6e-4, since the transformed tiles are stored in fp16. The SD1.5 UNet
+forward at a 64x64 latent then takes 394 ms in fp16 against 390 ms in fp32
+(452 ms in fp16 without this solver). SD1.5 LoRA
+training (fp32, batch 1, gradient checkpointing) runs at 4.05-4.3 s/step against
+4.75 with the GEMM solvers, same seed and loss. The first steps after the
+find-db is cleared take 30-50 s each while Find benchmarks each new bucket
+size; later runs reuse the records. The SD1.5 VAE encode that
+exposed the binary kernels' corruption runs 14 of its 28 conv problems on this
+solver and produces latents identical to a CPU encode in 3 of 3 runs.
+
+To reproduce the comparison: run torch.nn.functional.conv2d and
+torch.nn.grad.conv2d_input for a 3x3 pad-1 conv on gfx803 with
+MIOPEN_DEBUG_CONV_HIP_WINOGRAD_F2X3=0 and without, each with an empty
+MIOPEN_USER_DB_PATH, and compare times and results against a float64 CPU
+run. MIOPEN_DEBUG_FIND_ONLY_SOLVER=ConvHipWinogradF2x3 forces this solver.
+
+A user find-db written before this solver existed keeps returning its old
+choice for every convolution it has a record for, so delete the user
+*.ufdb.txt files once after installing a build with this patch.
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 78a4ef7..65f3db0 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -270,6 +270,7 @@ set( MIOpen_Source
+     solver/conv/conv_hip_implicit_gemm_wrw_v4r4_xdlops.cpp
+     solver/conv/conv_hip_implicit_gemm_wrw_v4r4_xdlops_padded_gemm.cpp
+     solver/conv/conv_MP_bidirectional_winograd.cpp
++    solver/conv/conv_hip_winograd_f2x3.cpp
+     solver/conv/conv_mlir_igemm_bwd.cpp
+     solver/conv/conv_mlir_igemm_bwd_xdlops.cpp
+     solver/conv/conv_mlir_igemm_fwd.cpp
+@@ -379,6 +380,7 @@ if( MIOPEN_BACKEND MATCHES "OpenCL" OR MIOPEN_BACKEND STREQUAL "HIPOC" OR MIOPEN
+     file(GLOB_RECURSE GPU_REFERENCE_KERNEL_HIP "kernels/gpu_reference_kernel/*.cpp")
+     file(GLOB_RECURSE GPU_REFERENCE_KERNEL_ASM "kernels/gpu_reference_kernel/*.s")
+     file(GLOB_RECURSE GPU_BATCHED_TRANSPOSE_KERNEL_HIP "kernels/gpu_batched_transpose_kernel/*.cpp")
++    file(GLOB_RECURSE GPU_WINOGRAD_F2X3_KERNEL_HIP "kernels/gpu_winograd_f2x3_kernel/*.cpp")
+     file(GLOB_RECURSE GPU_GENERAL_TENSOR_REORDER_KERNEL_HIP_INCLUDE "kernels/gpu_general_tensor_reorder_kernel/*.hpp")
+     file(GLOB_RECURSE GPU_GENERAL_TENSOR_REORDER_KERNEL_HIP_SOURCE "kernels/gpu_general_tensor_reorder_kernel/*.cpp")
+ 
+@@ -521,6 +523,7 @@ if( MIOPEN_BACKEND MATCHES "OpenCL" OR MIOPEN_BACKEND STREQUAL "HIPOC" OR MIOPEN
+         ${GPU_REFERENCE_KERNEL_HIP}
+         ${GPU_REFERENCE_KERNEL_ASM}
+         ${GPU_BATCHED_TRANSPOSE_KERNEL_HIP}
++        ${GPU_WINOGRAD_F2X3_KERNEL_HIP}
+         ${GPU_GENERAL_TENSOR_REORDER_KERNEL_HIP_SOURCE}
+         kernels/MIOpenAdam.cpp
+         kernels/MIOpenCat.cpp
+diff --git a/src/include/miopen/conv/solvers.hpp b/src/include/miopen/conv/solvers.hpp
+index 4890519..277581a 100644
+--- a/src/include/miopen/conv/solvers.hpp
++++ b/src/include/miopen/conv/solvers.hpp
+@@ -1922,6 +1922,26 @@ struct ConvBinWinogradRxSf2x3g1 final : ConvSolver
+     GetSolution(const ExecutionContext&, const miopen::conv::ProblemDescription&) const override;
+ };
+ 
++/// Winograd F(2x2,3x3) for 3x3, stride-1, pad-1 fp32 and fp16 convolutions on gfx8,
++/// forward and backward data: HIP transform kernels around one strided-batched
++/// rocBLAS GEMM over the 16 transformed tile positions.
++struct ConvHipWinogradF2x3 final : ConvSolver
++{
++    const std::string& SolverDbId() const override
++    {
++        return GetSolverDbId<ConvHipWinogradF2x3>();
++    }
++
++    MIOPEN_INTERNALS_EXPORT bool
++    IsApplicable(const ExecutionContext&, const miopen::conv::ProblemDescription&) const override;
++    bool IsDynamic() const override { return true; }
++    MIOPEN_INTERNALS_EXPORT size_t GetWorkspaceSize(
++        const ExecutionContext&, const miopen::conv::ProblemDescription&) const override;
++    bool MayNeedWorkspace() const override { return true; }
++    MIOPEN_INTERNALS_EXPORT ConvSolution
++    GetSolution(const ExecutionContext&, const miopen::conv::ProblemDescription&) const override;
++};
++
+ template <int WinoDataH, int WinoFilterH, int WinoDataW = WinoDataH, int WinoFilterW = WinoFilterH>
+ struct ConvMPBidirectWinograd final : ConvSolver
+ {
+diff --git a/src/kernels/gpu_winograd_f2x3_kernel/winograd_f2x3_xform.cpp b/src/kernels/gpu_winograd_f2x3_kernel/winograd_f2x3_xform.cpp
+new file mode 100644
+index 0000000..8e38764
+--- /dev/null
++++ b/src/kernels/gpu_winograd_f2x3_kernel/winograd_f2x3_xform.cpp
+@@ -0,0 +1,223 @@
++/*******************************************************************************
++ *
++ * MIT License
++ *
++ * Copyright (c) 2026 the rocm-gfx803 contributors
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ *
++ *******************************************************************************/
++#ifndef MIOPEN_DONT_USE_HIP_RUNTIME_HEADERS
++#include <hip/hip_runtime.h>
++#endif
++
++// Transforms for Winograd F(2x2,3x3) of a 3x3, stride-1, pad-1 convolution on
++// packed NCHW fp32 or fp16 tensors, used by ConvHipWinogradF2x3. The products
++// between them are 16 independent GEMMs, one per transformed tile position,
++// which the solver runs as one strided-batched rocBLAS call. The workspace has
++// the tensors' type; the transforms compute in fp32 either way, so fp16 rounds
++// only where a value is stored, as the GEMM (fp32 accumulation) does.
++//
++// Workspace layouts (row-major):
++//   U[16][K][C]  transformed filters
++//   V[16][C][P]  transformed input tiles, P = N * TH * TW
++//   M[16][K][P]  GEMM result, U[t] x V[t]
++// Tile (th, tw) of image n covers input rows 2*th-1 .. 2*th+2 and columns
++// 2*tw-1 .. 2*tw+2 (pad 1) and yields output rows 2*th, 2*th+1 and columns
++// 2*tw, 2*tw+1. Each thread handles one (channel, tile) pair, so consecutive
++// threads touch consecutive P and every V/M access is coalesced.
++
++// U = G g G^T, G = [1 0 0; 1/2 1/2 1/2; 1/2 -1/2 1/2; 0 0 1].
++// The weights tensor is w[Kw][Cw][3][3]. Forward: K = Kw, C = Cw and
++// g = w[k][c]. Backward data computes dx as a forward convolution of dy with
++// each filter rotated by 180 degrees and the two channel axes swapped, so with
++// mirror set K = Cw, C = Kw and g[r][s] = w[c][k][2-r][2-s].
++template <typename T>
++__device__ void xform_filter(const T* __restrict__ w, T* __restrict__ U, int K, int C, int mirror)
++{
++    const long long kc  = (long long)blockIdx.x * blockDim.x + threadIdx.x;
++    const long long n_kc = (long long)K * C;
++    if(kc >= n_kc)
++        return;
++    const int k = (int)(kc / C);
++    const int c = (int)(kc % C);
++
++    float g[3][3];
++    const T* src = mirror ? w + ((long long)c * K + k) * 9 : w + ((long long)k * C + c) * 9;
++    for(int r = 0; r < 3; r++)
++        for(int s = 0; s < 3; s++)
++            g[r][s] = static_cast<float>(mirror ? src[(2 - r) * 3 + (2 - s)] : src[r * 3 + s]);
++
++    float t[4][3];
++    for(int s = 0; s < 3; s++)
++    {
++        t[0][s] = g[0][s];
++        t[1][s] = 0.5f * (g[0][s] + g[1][s] + g[2][s]);
++        t[2][s] = 0.5f * (g[0][s] - g[1][s] + g[2][s]);
++        t[3][s] = g[2][s];
++    }
++    T* dst = U + kc;
++    for(int i = 0; i < 4; i++)
++    {
++        dst[(i * 4 + 0) * n_kc] = static_cast<T>(t[i][0]);
++        dst[(i * 4 + 1) * n_kc] = static_cast<T>(0.5f * (t[i][0] + t[i][1] + t[i][2]));
++        dst[(i * 4 + 2) * n_kc] = static_cast<T>(0.5f * (t[i][0] - t[i][1] + t[i][2]));
++        dst[(i * 4 + 3) * n_kc] = static_cast<T>(t[i][2]);
++    }
++}
++
++// V = B^T d B, B^T = [1 0 -1 0; 0 1 1 0; 0 -1 1 0; 0 1 0 -1].
++template <typename T>
++__device__ void
++xform_in(const T* __restrict__ x, T* __restrict__ V, int N, int C, int H, int W, int TH, int TW)
++{
++    const long long P   = (long long)N * TH * TW;
++    const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
++    if(idx >= P * C)
++        return;
++    const long long p = idx % P;
++    const int c       = (int)(idx / P);
++    const int tw      = (int)(p % TW);
++    const int th      = (int)((p / TW) % TH);
++    const int n       = (int)(p / ((long long)TW * TH));
++
++    const T* xs = x + ((long long)n * C + c) * H * W;
++    float d[4][4];
++    for(int i = 0; i < 4; i++)
++    {
++        const int h = 2 * th - 1 + i;
++        for(int j = 0; j < 4; j++)
++        {
++            const int wc = 2 * tw - 1 + j;
++            d[i][j] = (h >= 0 && h < H && wc >= 0 && wc < W)
++                          ? static_cast<float>(xs[(long long)h * W + wc])
++                          : 0.0f;
++        }
++    }
++    float t[4][4];
++    for(int j = 0; j < 4; j++)
++    {
++        t[0][j] = d[0][j] - d[2][j];
++        t[1][j] = d[1][j] + d[2][j];
++        t[2][j] = d[2][j] - d[1][j];
++        t[3][j] = d[1][j] - d[3][j];
++    }
++    const long long stride = (long long)C * P;
++    T* dst                 = V + (long long)c * P + p;
++    for(int i = 0; i < 4; i++)
++    {
++        dst[(i * 4 + 0) * stride] = static_cast<T>(t[i][0] - t[i][2]);
++        dst[(i * 4 + 1) * stride] = static_cast<T>(t[i][1] + t[i][2]);
++        dst[(i * 4 + 2) * stride] = static_cast<T>(t[i][2] - t[i][1]);
++        dst[(i * 4 + 3) * stride] = static_cast<T>(t[i][1] - t[i][3]);
++    }
++}
++
++// y = A^T m A, A^T = [1 1 1 0; 0 1 -1 -1].
++template <typename T>
++__device__ void
++xform_out(const T* __restrict__ M, T* __restrict__ y, int N, int K, int H, int W, int TH, int TW)
++{
++    const long long P   = (long long)N * TH * TW;
++    const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
++    if(idx >= P * K)
++        return;
++    const long long p = idx % P;
++    const int k       = (int)(idx / P);
++    const int tw      = (int)(p % TW);
++    const int th      = (int)((p / TW) % TH);
++    const int n       = (int)(p / ((long long)TW * TH));
++
++    const long long stride = (long long)K * P;
++    const T* src           = M + (long long)k * P + p;
++    float m[4][4];
++    for(int i = 0; i < 16; i++)
++        m[i / 4][i % 4] = static_cast<float>(src[i * stride]);
++    float t[2][4];
++    for(int j = 0; j < 4; j++)
++    {
++        t[0][j] = m[0][j] + m[1][j] + m[2][j];
++        t[1][j] = m[1][j] - m[2][j] - m[3][j];
++    }
++    T* ys = y + ((long long)n * K + k) * H * W;
++    for(int i = 0; i < 2; i++)
++    {
++        const int h = 2 * th + i;
++        const int wc = 2 * tw;
++        if(h < H)
++        {
++            if(wc < W)
++                ys[(long long)h * W + wc] = static_cast<T>(t[i][0] + t[i][1] + t[i][2]);
++            if(wc + 1 < W)
++                ys[(long long)h * W + wc + 1] = static_cast<T>(t[i][1] - t[i][2] - t[i][3]);
++        }
++    }
++}
++
++// Entry points, one per storage type.
++extern "C" __global__ void
++miopenWinogradF2x3XformFilter(const float* __restrict__ w, float* __restrict__ U, int K, int C, int mirror)
++{
++    xform_filter(w, U, K, C, mirror);
++}
++
++extern "C" __global__ void miopenWinogradF2x3XformFilterHalf(const _Float16* __restrict__ w,
++                                                             _Float16* __restrict__ U,
++                                                             int K,
++                                                             int C,
++                                                             int mirror)
++{
++    xform_filter(w, U, K, C, mirror);
++}
++
++extern "C" __global__ void miopenWinogradF2x3XformIn(
++    const float* __restrict__ x, float* __restrict__ V, int N, int C, int H, int W, int TH, int TW)
++{
++    xform_in(x, V, N, C, H, W, TH, TW);
++}
++
++extern "C" __global__ void miopenWinogradF2x3XformInHalf(const _Float16* __restrict__ x,
++                                                         _Float16* __restrict__ V,
++                                                         int N,
++                                                         int C,
++                                                         int H,
++                                                         int W,
++                                                         int TH,
++                                                         int TW)
++{
++    xform_in(x, V, N, C, H, W, TH, TW);
++}
++
++extern "C" __global__ void miopenWinogradF2x3XformOut(
++    const float* __restrict__ M, float* __restrict__ y, int N, int K, int H, int W, int TH, int TW)
++{
++    xform_out(M, y, N, K, H, W, TH, TW);
++}
++
++extern "C" __global__ void miopenWinogradF2x3XformOutHalf(const _Float16* __restrict__ M,
++                                                          _Float16* __restrict__ y,
++                                                          int N,
++                                                          int K,
++                                                          int H,
++                                                          int W,
++                                                          int TH,
++                                                          int TW)
++{
++    xform_out(M, y, N, K, H, W, TH, TW);
++}
+diff --git a/src/mlo_dir_conv.cpp b/src/mlo_dir_conv.cpp
+index 316c574..b5b8c2e 100644
+--- a/src/mlo_dir_conv.cpp
++++ b/src/mlo_dir_conv.cpp
+@@ -138,7 +138,8 @@ static auto GetWindogradSolvers()
+         miopen::solver::conv::ConvMPBidirectWinograd_xdlops<4, 3>,
+         miopen::solver::conv::ConvMPBidirectWinograd_xdlops<5, 3>,
+         miopen::solver::conv::ConvMPBidirectWinograd_xdlops<6, 3>,
+-        miopen::solver::conv::ConvWinoFuryRxS<2, 3>>{};
++        miopen::solver::conv::ConvWinoFuryRxS<2, 3>,
++        miopen::solver::conv::ConvHipWinogradF2x3>{};
+ }
+ 
+ static auto GetImplicitGemmWrWSolvers()
+diff --git a/src/solver.cpp b/src/solver.cpp
+index c3b077d..b2b1892 100644
+--- a/src/solver.cpp
++++ b/src/solver.cpp
+@@ -707,6 +707,8 @@ inline SolverRegistrar::SolverRegistrar(IdRegistryData& registry)
+              multimarginloss::MultiMarginLossForward{}.SolverDbId());
+ 
+     Register(registry, ++id, Primitive::Mha, mha::MhaCKFlashAttentionV2Forward{}.SolverDbId());
++    RegisterWithSolver(
++        registry, ++id, conv::ConvHipWinogradF2x3{}, miopenConvolutionAlgoWinograd);
+     // IMPORTANT: New solvers should be added to the end of the function, and don't leave a white
+     // space between this comment and the newly registered solver(s)!
+ }
+diff --git a/src/solver/conv/conv_hip_winograd_f2x3.cpp b/src/solver/conv/conv_hip_winograd_f2x3.cpp
+new file mode 100644
+index 0000000..3795879
+--- /dev/null
++++ b/src/solver/conv/conv_hip_winograd_f2x3.cpp
+@@ -0,0 +1,238 @@
++/*******************************************************************************
++ *
++ * MIT License
++ *
++ * Copyright (c) 2026 the rocm-gfx803 contributors
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ *
++ *******************************************************************************/
++
++#include <miopen/conv/solvers.hpp>
++#include <miopen/conv/data_invoke_params.hpp>
++#include <miopen/env.hpp>
++#include <miopen/gemm_v2.hpp>
++#include <miopen/handle.hpp>
++#include <miopen/stringutils.hpp>
++
++MIOPEN_DECLARE_ENV_VAR_BOOL(MIOPEN_DEBUG_CONV_HIP_WINOGRAD_F2X3)
++
++namespace miopen {
++namespace solver {
++namespace conv {
++
++using ProblemDescription = miopen::conv::ProblemDescription;
++
++namespace {
++
++constexpr int xform_tiles = 16; // 4x4 transformed tile positions
++constexpr size_t block_size = 256;
++
++struct WinoF2x3Sizes
++{
++    int N, C, K, H, W, TH, TW;
++    long long P;
++    size_t u_elems, v_elems, m_elems;
++    // The workspace holds U, V and M in the tensors' type.
++    bool half;
++    size_t elem_bytes;
++
++    explicit WinoF2x3Sizes(const ProblemDescription& problem)
++        // Backward data runs as a forward pass from dy (problem "in") to dx
++        // (problem "out"), so in/out channels are read the same way for both.
++        : N(static_cast<int>(problem.GetBatchSize())),
++          C(static_cast<int>(problem.GetInChannels())),
++          K(static_cast<int>(problem.GetOutChannels())),
++          H(static_cast<int>(problem.GetOutHeight())),
++          W(static_cast<int>(problem.GetOutWidth())),
++          TH((H + 1) / 2),
++          TW((W + 1) / 2),
++          P(static_cast<long long>(N) * TH * TW),
++          u_elems(static_cast<size_t>(xform_tiles) * K * C),
++          v_elems(static_cast<size_t>(xform_tiles) * C * P),
++          m_elems(static_cast<size_t>(xform_tiles) * K * P),
++          half(problem.IsFp16()),
++          elem_bytes(half ? 2 : sizeof(float))
++    {
++    }
++
++    size_t WorkspaceBytes() const { return (u_elems + v_elems + m_elems) * elem_bytes; }
++};
++
++KernelInfo MakeKernel(const ExecutionContext& ctx, const std::string& name, size_t threads)
++{
++    KernelInfo k;
++    k.kernel_file  = "winograd_f2x3_xform.cpp";
++    k.kernel_name  = name;
++    k.comp_options = ctx.general_compile_options;
++    k.l_wk         = {block_size, 1, 1};
++    k.g_wk         = {(threads + block_size - 1) / block_size * block_size, 1, 1};
++    return k;
++}
++
++} // namespace
++
++bool ConvHipWinogradF2x3::IsApplicable(const ExecutionContext& ctx,
++                                       const ProblemDescription& problem) const
++{
++#if MIOPEN_BACKEND_HIP && MIOPEN_USE_ROCBLAS
++    if(env::disabled(MIOPEN_DEBUG_CONV_HIP_WINOGRAD_F2X3))
++        return false;
++    if(!ctx.use_hip_kernels)
++        return false;
++    // Validated only on gfx803, where MIOpen's own Winograd kernels are not
++    // usable: the binary ones corrupt memory and the multi-pass ones are gfx9
++    // assembly.
++    if(!StartsWith(ctx.GetStream().GetDeviceName(), "gfx8"))
++        return false;
++    if(!problem.Is2d() || !(problem.IsFp32() || problem.IsFp16()) || problem.IsTensorsCasted())
++        return false;
++    if(!(problem.IsDirectionForward() || problem.IsDirectionBackwardData()))
++        return false;
++    if(!problem.IsLayoutDefault())
++        return false;
++    if(!(problem.GetIn().IsPacked() && problem.GetWeights().IsPacked() &&
++         problem.GetOut().IsPacked()))
++        return false;
++    if(problem.GetConv().mode != miopenConvolution || problem.GetGroupCount() != 1)
++        return false;
++    if(problem.GetWeightsHeight() != 3 || problem.GetWeightsWidth() != 3)
++        return false;
++    if(problem.GetPadH() != 1 || problem.GetPadW() != 1)
++        return false;
++    if(problem.GetKernelStrideH() != 1 || problem.GetKernelStrideW() != 1)
++        return false;
++    if(problem.GetDilationH() != 1 || problem.GetDilationW() != 1)
++        return false;
++    if(problem.GetInHeight() != problem.GetOutHeight() ||
++       problem.GetInWidth() != problem.GetOutWidth())
++        return false;
++    if(problem.GetAlphaBetaCase() != DEFAULT)
++        return false;
++
++    // rocBLAS takes m, n, k and the leading dimensions as int.
++    const WinoF2x3Sizes s(problem);
++    constexpr long long int_max = 0x7fffffffLL;
++    if(s.P > int_max || static_cast<long long>(s.C) * s.P > int_max ||
++       static_cast<long long>(s.K) * s.P > int_max)
++        return false;
++    return true;
++#else
++    std::ignore = ctx;
++    std::ignore = problem;
++    return false;
++#endif
++}
++
++size_t ConvHipWinogradF2x3::GetWorkspaceSize(const ExecutionContext&,
++                                             const ProblemDescription& problem) const
++{
++    return WinoF2x3Sizes(problem).WorkspaceBytes();
++}
++
++ConvSolution ConvHipWinogradF2x3::GetSolution(const ExecutionContext& ctx,
++                                              const ProblemDescription& problem) const
++{
++    ConvSolution result;
++    const WinoF2x3Sizes s(problem);
++    result.workspace_sz = s.WorkspaceBytes();
++
++    const std::string suffix = s.half ? "Half" : "";
++    result.construction_params.push_back(MakeKernel(
++        ctx, "miopenWinogradF2x3XformFilter" + suffix, static_cast<size_t>(s.K) * s.C));
++    result.construction_params.push_back(
++        MakeKernel(ctx, "miopenWinogradF2x3XformIn" + suffix, static_cast<size_t>(s.C) * s.P));
++    result.construction_params.push_back(
++        MakeKernel(ctx, "miopenWinogradF2x3XformOut" + suffix, static_cast<size_t>(s.K) * s.P));
++
++#if MIOPEN_BACKEND_HIP && MIOPEN_USE_ROCBLAS
++    const int mirror = problem.IsDirectionBackwardData() ? 1 : 0;
++    const int P      = static_cast<int>(s.P);
++    // M[t] (K x P) = U[t] (K x C) * V[t] (C x P), row-major, t = 0..15. For
++    // fp16, MIOpen's rocBLAS call accumulates in fp32.
++    const GemmDescriptor gemm{false,
++                              false,
++                              false,
++                              s.K,
++                              P,
++                              s.C,
++                              s.C,
++                              P,
++                              P,
++                              xform_tiles,
++                              static_cast<long long>(s.K) * s.C,
++                              static_cast<long long>(s.C) * P,
++                              static_cast<long long>(s.K) * P,
++                              1.0f,
++                              0.0f,
++                              s.half ? miopenHalf : miopenFloat,
++                              problem.GetConv().attribute.deterministic};
++    const size_t u_off = 0;
++    const size_t v_off = s.u_elems;
++    const size_t m_off = s.u_elems + s.v_elems;
++
++    result.invoker_factory = [=](const std::vector<Kernel>& kernels) {
++        return [=](const Handle& handle, const AnyInvokeParams& primitive_parameters) {
++            const auto& data_ctx = primitive_parameters.CastTo<miopen::conv::DataInvokeParams>();
++            const auto& tensors  = data_ctx.tensors;
++            if(data_ctx.workSpace == nullptr || data_ctx.workSpaceSize < s.WorkspaceBytes())
++                MIOPEN_THROW(miopenStatusBadParm, "ConvHipWinogradF2x3: workspace too small");
++            // Offsets are in elements of the workspace's type.
++            char* ws_bytes = static_cast<char*>(data_ctx.workSpace);
++            auto ws_at     = [&](size_t off) { return static_cast<void*>(ws_bytes + off * s.elem_bytes); };
++
++            // With profiling on, each launch resets the handle's kernel time,
++            // so the first three steps are summed and added to the last one.
++            float elapsed = 0.0f;
++            auto step_done = [&](bool last) {
++                if(!handle.IsProfilingEnabled())
++                    return;
++                if(last)
++                    handle.AccumKernelTime(elapsed);
++                else
++                    elapsed += handle.GetKernelTime();
++            };
++
++            handle.Run(kernels[0])(tensors.w, ws_at(u_off), s.K, s.C, mirror);
++            step_done(false);
++            handle.Run(kernels[1])(tensors.in, ws_at(v_off), s.N, s.C, s.H, s.W, s.TH, s.TW);
++            step_done(false);
++            const auto status = CallGemmStridedBatched(handle,
++                                                       gemm,
++                                                       data_ctx.workSpace,
++                                                       u_off,
++                                                       data_ctx.workSpace,
++                                                       v_off,
++                                                       data_ctx.workSpace,
++                                                       m_off,
++                                                       GemmBackend_t::rocblas);
++            if(status != miopenStatusSuccess)
++                MIOPEN_THROW(status, "ConvHipWinogradF2x3: GEMM failed");
++            step_done(false);
++            handle.Run(kernels[2])(ws_at(m_off), tensors.out, s.N, s.K, s.H, s.W, s.TH, s.TW);
++            step_done(true);
++        };
++    };
++#endif
++    return result;
++}
++
++} // namespace conv
++} // namespace solver
++} // namespace miopen

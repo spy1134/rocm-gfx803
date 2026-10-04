@@ -54,11 +54,14 @@ instead of patching this one, the same way patches/miopen's other fixes
 do: MIOpen's newer general fused Winograd
 (ConvBinWinogradRxSf2x3g1Fused, src/solver/conv_winoRxS_fused.cpp) is
 gated to gfx9/gfx10/gfx11 only and was never ported to gfx8 at all --
-unlike the *non*-fused general Winograd (ConvBinWinogradRxS,
-src/solver/conv/conv_bin_winoRxS.cpp), which does list gfx803 and is
-almost certainly why "unfused" (ConvActivationFusion disabled) already
-tests much closer to correct (cos 0.91-0.96) than "fused" (0.42-0.86) in
-the same audiomuse-rocm-plugin session. No in-place kernel fix was
+unlike the *non*-fused ConvBinWinogradRxS
+(src/solver/conv/conv_bin_winoRxS.cpp), which does list gfx803 -- but on
+gfx803 in fp32 it runs the same wheel-kernel family
+(conv_3x3_wheel_alpha_v9_0_15), which corrupts memory there, and
+winograd-bin-gfx803-disable.patch makes it not applicable on gfx803, so it
+is no redirect target. In the same audiomuse-rocm-plugin session, "unfused"
+(ConvActivationFusion disabled) tested closer to correct (cos 0.91-0.96)
+than "fused" (0.42-0.86). No in-place kernel fix was
 attempted: the payload is ~2700 lines of unlabeled GCN3 ISA
 (src/kernels/conv_3x3_wheel_alpha_v9_2_7_gfx8.inc) with runtime (not
 compile-time) R/S arguments, and correctly patching the specific
@@ -122,12 +125,12 @@ diff --git a/src/solver/conv_bin_winoRxS_fused.cpp b/src/solver/conv_bin_winoRxS
 +    // shape (this kernel's actual designed case, and what its own GetWti
 +    // rates as by far its best) computes correctly (cos=1.0000, 3/3 runs),
 +    // so this is scoped to exclude only the generalized (non-3x3) padding
-+    // path rather than disabling the solver outright -- MIOpen's newer,
-+    // properly-general Winograd family (Conv_Winograd_v13_3_12/v14_3_3, see
-+    // solver/conv/conv_bin_winoRxS.cpp) already covers gfx803 correctly for
-+    // arbitrary filter sizes on the non-fused path; this old kernel's fused
-+    // (Conv+Bias+Activation) variant was apparently never carried forward to
-+    // it. See winograd-fused-conv-miscompute.patch for the full writeup.
++    // path rather than disabling the solver outright. The non-fused
++    // ConvBinWinogradRxS (solver/conv/conv_bin_winoRxS.cpp) is no fallback on
++    // gfx803: it runs the same wheel-kernel family there and is disabled on
++    // gfx803 by winograd-bin-gfx803-disable.patch for corrupting memory.
++    // Non-3x3 shapes fall through to the other fusion solvers or unfused GEMM.
++    // See winograd-fused-conv-miscompute.patch for the full writeup.
 +    if(!(y == 3 && x == 3))
 +        return false;
 +

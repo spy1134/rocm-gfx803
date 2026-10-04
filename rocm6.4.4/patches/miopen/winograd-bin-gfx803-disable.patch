@@ -1,0 +1,90 @@
+MIOpen (pinned tag rocm-6.4.4, commit 4d17e9a): make ConvBinWinogradRxS and
+ConvBinWinograd3x3U not applicable on gfx803.
+
+WHY
+---
+On gfx803 these two solvers are MIOpen's first choice for nearly every fp32
+3x3 convolution (forward and backward-data), and both run legacy hand-written
+"wheel" assembly kernels (conv_3x3_wheel_alpha_v9_0_15_gfx8.inc for RxS,
+conv_3x3_wheel_alpha_v3_0b.inc for 3x3U) launched persistently, one 512-thread
+workgroup per CU, each holding all 64 KiB of LDS. On an RX 590 they do two
+things wrong.
+
+They corrupt memory. Memory one of these kernels wrote reverts to that
+kernel's output after later kernels overwrite it, once PyTorch's caching
+allocator hands the block to a new tensor. In an SD1.5 VAE encode, the
+tensors computed right after the encoder (logvar, then 0.5 * logvar, then
+std) land in memory the final 3x3 conv wrote; every wrong logvar element
+equals the encoder output's old value at the same address (333/333, 335/335
+and 328/328 in three runs), and keeping the encoder output alive makes every
+run correct. sd-scripts' latent caching samples from that std, so 7 to 11 of
+34 cached latents came out with std from 80 to 5e16 instead of about 4.5,
+and LoRA training loss sat at 0.6-1.2 instead of 0.1-0.2. A full device
+synchronize does not help, writes into never-used memory nearly never go
+wrong, and neither bounding the kernel's output buffer descriptor by the
+real output size nor marking its stores glc changes anything.
+
+They also hang the GPU. In every decoded GPU hang under sustained load, the
+stuck dispatch was one of these kernels (512x1x1 workgroups, grid
+512 * CU count, 64 KiB LDS; identical code bytes in a training hang and in a
+standalone replay). An uncapped replay of one SD1.5 UNet block crashed the
+host 5 times out of 5 within 3.5 to 21 minutes; with these solvers out of
+the way the same replay ran 45 minutes clean, and a full 1200-step LoRA
+training run ran 2 hours 34 minutes clean.
+
+Disabling only RxS is not enough: MIOpen then selects 3x3U, which is built the
+same way and corrupts the same way. The only other solvers MIOpen can use for
+these convolutions on gfx803 are its GEMM-based ones (GemmFwdRest,
+GemmBwdRest and the 1x1 GEMM variants); every other Winograd solver is gfx9+
+only or weight-gradient only. The GEMM solvers are correct: the cached
+latents match a CPU encode exactly, and a full-UNet GPU-vs-CPU check passes.
+They are slower than the Winograd kernels per convolution; with this repo's
+gfx803 SGEMM shim (patches/sgemm-shim-batched), training runs at the same
+speed as before (8.3 s/step against 8.1-8.4).
+
+To reproduce without this patch, with PyTorch on gfx803: encode one image at
+512x512 with the SD1.5 VAE in float32 the way sd-scripts caches latents
+(vae.encode(x).latent_dist), several times, and compare latent_dist.std with
+a CPU encode; most runs show elements wrong by orders of magnitude.
+MIOPEN_DEBUG_CONV_WINOGRAD=0 makes every run match, and so does this patch: on
+an RX 590, with a find-db that lists ConvBinWinogradRxS first and no
+environment override, MIOpen built with it selects GemmFwdRest/GemmFwd1x1_0_1
+instead, and the cached latents match the CPU in 3/3 runs.
+
+WHAT
+----
+Return false from both solvers' IsApplicable on gfx803, right after the device
+name is read. Every other device keeps both solvers.
+
+--- a/src/solver/conv/conv_bin_winoRxS.cpp
++++ b/src/solver/conv/conv_bin_winoRxS.cpp
+@@ -254,6 +254,13 @@
+         return false;
+ 
+     const auto name = ctx.GetStream().GetDeviceName();
++    // WINOGRAD_BIN_GFX803_DISABLE_PATCH: on gfx803 this solver's kernel corrupts
++    // memory the convolution wrote: once that memory is reused, it reverts to the
++    // kernel's output after later kernels overwrite it, and the same kernel is the
++    // stuck dispatch in GPU hangs under sustained load. The GEMM solvers MIOpen
++    // falls back to are correct. See winograd-bin-gfx803-disable.patch.
++    if(name == "gfx803")
++        return false;
+     const bool fp16 = problem.IsFp16();
+     if(fp16)
+     {
+--- a/src/solver/conv/conv_bin_wino3x3U.cpp
++++ b/src/solver/conv/conv_bin_wino3x3U.cpp
+@@ -60,6 +60,13 @@
+         return false;
+ 
+     const auto name = ctx.GetStream().GetDeviceName();
++    // WINOGRAD_BIN_GFX803_DISABLE_PATCH: on gfx803 this solver's kernel corrupts
++    // memory the convolution wrote: once that memory is reused, it reverts to the
++    // kernel's output after later kernels overwrite it, and the same kernel is the
++    // stuck dispatch in GPU hangs under sustained load. The GEMM solvers MIOpen
++    // falls back to are correct. See winograd-bin-gfx803-disable.patch.
++    if(name == "gfx803")
++        return false;
+     if(!(name == "gfx803" || name == "gfx900" || name == "gfx906" || name == "gfx908"))
+         return false;
+ 
