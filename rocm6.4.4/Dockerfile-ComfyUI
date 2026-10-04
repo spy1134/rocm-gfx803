@@ -1,0 +1,116 @@
+# syntax=docker/dockerfile:1
+# ComfyUI and sd-scripts (SD1.5 LoRA training) on the rocm-gfx803 base image.
+# Build the base first, from this directory:
+#   docker build -t rocm-gfx803:rocm6.4.4 -f Dockerfile .
+#   docker build -t rocm-gfx803-comfyui:latest -f Dockerfile-ComfyUI .
+FROM rocm-gfx803:rocm6.4.4
+
+# None of these projects has release branches to pin to, so each is pinned to the
+# exact commit this image was last built and verified with on gfx803. Override a
+# pin with --build-arg to try a newer commit.
+ARG COMFYUI_REF=65787d668397d230bf5839d69a0a7239e2dad378
+ARG COMFYUI_MANAGER_REF=2a6cb164309d4db45471d4bf14c8beb75014e56c
+ARG COMFYUI_GGUF_REF=373048b8403a7820620065210a691263d4da0a61
+ARG COMFYUI_ESSENTIALS_REF=9d9f4bedfc9f0321c19faf71855e228c93bd0dc9
+ARG IMPACT_PACK_REF=429d0159ad429e64d2b3916e6e7be9c22d025c3c
+ARG IMPACT_SUBPACK_REF=50c7b71a6a224734cc9b21963c6d1926816a97f1
+ARG SAM2_REF=2b90b9f5ceec907a1c18123530e92e794ad901a4
+ARG SD_SCRIPTS_REF=690ea7f96c23182352ec63def76d431c6120bd2f
+
+# Compilers for the pip packages that build native extensions here (sam2 below
+# builds against the image's torch).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git cmake ninja-build build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone https://github.com/comfyanonymous/ComfyUI.git /opt/ComfyUI \
+    && git -C /opt/ComfyUI checkout "$COMFYUI_REF"
+WORKDIR /opt/ComfyUI
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Custom nodes are cloned into a staging folder and copied into
+# /opt/ComfyUI/custom_nodes when the container starts (see CMD): that folder is a
+# volume mount, which would hide anything installed into it at build time.
+WORKDIR /opt/staging_nodes
+
+RUN git clone https://github.com/ltdrdata/ComfyUI-Manager.git \
+    && git -C ComfyUI-Manager checkout "$COMFYUI_MANAGER_REF" \
+    && pip install --no-cache-dir -r ComfyUI-Manager/requirements.txt
+
+# leejet's fork of ComfyUI-GGUF.
+RUN git clone https://github.com/leejet/ComfyUI-GGUF.git \
+    && git -C ComfyUI-GGUF checkout "$COMFYUI_GGUF_REF" \
+    && pip install --no-cache-dir -r ComfyUI-GGUF/requirements.txt
+
+RUN git clone https://github.com/cubiq/ComfyUI_essentials.git \
+    && git -C ComfyUI_essentials checkout "$COMFYUI_ESSENTIALS_REF" \
+    && pip install --no-cache-dir -r ComfyUI_essentials/requirements.txt
+
+# Impact-Pack's requirements.txt lists sam2 as an unpinned git URL; it is
+# installed separately at a fixed commit instead. --no-build-isolation builds it
+# against the image's own torch rather than a torch pip would download.
+RUN git clone https://github.com/ltdrdata/ComfyUI-Impact-Pack.git \
+    && git -C ComfyUI-Impact-Pack checkout "$IMPACT_PACK_REF" \
+    && sed -i '/^git+/d' ComfyUI-Impact-Pack/requirements.txt \
+    && pip install --no-cache-dir -r ComfyUI-Impact-Pack/requirements.txt \
+    && pip install --no-cache-dir --no-build-isolation \
+        "git+https://github.com/facebookresearch/sam2@${SAM2_REF}"
+
+# Impact-Subpack (the UltralyticsDetectorProvider nodes) installs as its own
+# top-level custom node, a sibling of Impact-Pack, per its README.
+RUN git clone https://github.com/ltdrdata/ComfyUI-Impact-Subpack.git \
+    && git -C ComfyUI-Impact-Subpack checkout "$IMPACT_SUBPACK_REF" \
+    && pip install --no-cache-dir -r ComfyUI-Impact-Subpack/requirements.txt
+
+RUN git clone https://github.com/kohya-ss/sd-scripts.git /opt/sd-scripts \
+    && git -C /opt/sd-scripts checkout "$SD_SCRIPTS_REF"
+WORKDIR /opt/sd-scripts
+# bitsandbytes has no gfx803 kernels and the training wrapper never uses it
+# (AdamW only).
+RUN sed -i '/^bitsandbytes/d' requirements.txt \
+    && pip install --no-cache-dir -r requirements.txt
+
+# sd-scripts' WD14 tagger (finetune/tag_images_by_wd14_tagger.py --onnx), for
+# captioning datasets, imports onnx to read the model's batch size, and
+# requirements.txt does not list it.
+RUN pip install --no-cache-dir onnx==1.23.1 ml_dtypes==0.6.0
+
+# opencv-python and opencv-python-headless both provide the cv2 module, and pip
+# installs both side by side, each overwriting the other's files. Resolve to one
+# package last, so nothing installed above has the final say.
+RUN pip uninstall -y opencv-python opencv-python-headless \
+    && pip install --no-cache-dir opencv-python==4.10.0.84
+
+# Reports dependency conflicts in the build log without failing the build; the
+# known ones (see README.md) are harmless.
+RUN pip check || true
+
+# start-comfyui.sh runs the container as the user who starts it, with an
+# arbitrary UID and HOME=/home/gfx803. Everything else it writes lands in
+# host-owned bind mounts; these two are the only image paths it needs to write.
+RUN mkdir -p /home/gfx803 /opt/ComfyUI/temp \
+    && chmod 1777 /home/gfx803 /opt/ComfyUI/temp
+
+# The gfx803 terminal UI (gfx803-app): Textual for the interface, plotext
+# through textual-plotext for its graphs, textual-image for image previews
+# (Sixel or the Kitty graphics protocol where the terminal has them, coloured
+# half-blocks otherwise). Before the training/ copy, so editing the scripts
+# does not reinstall them.
+RUN pip install --no-cache-dir textual==8.2.8 textual-plotext==1.0.1 plotext==5.3.2 textual-image==0.14.1
+
+# Training wrapper, queue service, terminal UI and GPU-vs-CPU checks. Last, so
+# editing them rebuilds only this layer.
+COPY training/ /opt/gfx803-training/
+RUN cd /opt/gfx803-training \
+    && chmod +x gfx803-train.sh gfx803_queue.py gfx803_service.py gfx803_app.py \
+    && ln -s /opt/gfx803-training/gfx803-train.sh /usr/local/bin/gfx803-train \
+    && ln -s /opt/gfx803-training/gfx803_queue.py /usr/local/bin/gfx803-queue \
+    && ln -s /opt/gfx803-training/gfx803_service.py /usr/local/bin/gfx803-service \
+    && ln -s /opt/gfx803-training/gfx803_app.py /usr/local/bin/gfx803-app
+
+WORKDIR /opt/ComfyUI
+EXPOSE 8188
+
+# Copy the staged custom nodes into the mounted folder without overwriting
+# anything already there, then start ComfyUI.
+CMD ["sh", "-c", "cp -an /opt/staging_nodes/* /opt/ComfyUI/custom_nodes/ 2>/dev/null || true; exec python3 main.py --listen 0.0.0.0 --lowvram --use-split-cross-attention"]
