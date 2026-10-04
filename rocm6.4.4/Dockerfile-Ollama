@@ -1,0 +1,108 @@
+# syntax=docker/dockerfile:1
+# Ollama on the rocm-gfx803 base image, with llama.cpp's HIP backend compiled
+# for gfx803. At runtime it loads the base's patched rocBLAS and HSA runtime.
+# Build the base first, from this directory:
+#   docker build -t rocm-gfx803:rocm6.4.4 -f Dockerfile .
+#   docker build -t rocm-gfx803-ollama:latest -f Dockerfile-Ollama .
+#
+# Verified on an RX 590 with Qwen2.5-Coder 7B and Qwen3 8B (Q4_K_M): llama.cpp's
+# matmul and flash-attention tests pass against the CPU backend and greedy
+# output agrees with a CPU run. patches/ollama/llama-cpp/ takes Qwen3 8B's prompt
+# processing from 15 to 163 tok/s, and 4096 tokens deep from 55 to 143 tok/s;
+# with a q8_0 KV cache, generation 8192 tokens deep goes from 20.9 to 24.4 tok/s.
+ARG BASE_IMAGE=rocm-gfx803:rocm6.4.4
+# Compiling needs only ROCm's compiler, headers and link libraries, so the build
+# runs on AMD's image (the same one, pinned by digest, that the base is built
+# from) rather than on the base: rebuilding the base, for a shim change for
+# example, then reruns only the final stage instead of this whole build. The
+# HIP backend links rocBLAS and the HIP runtime by soname with a RUNPATH of
+# /opt/rocm-6.4.4/lib, so at runtime it picks up the base's gfx803 builds.
+ARG BUILDER_IMAGE=rocm/dev-ubuntu-24.04:6.4.4-complete@sha256:31418ac10a3769a71eaef330c07280d1d999d7074621339b8f93c484c35f6078
+
+FROM ${BUILDER_IMAGE} AS ollama-builder
+
+# Ollama publishes tags but no release branches, so it is pinned to the commit
+# of the release tag. llama.cpp is fetched at configure time at the version
+# Ollama's own LLAMA_CPP_VERSION file pins.
+ARG OLLAMA_REF=b0c1ca4f7549d7acdfa52a7dcffc934bc63a43ce
+ARG ROCM_ARCH=gfx803
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git curl ca-certificates cmake ninja-build build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone https://github.com/ollama/ollama.git /ollama \
+    && git -C /ollama checkout "$OLLAMA_REF"
+WORKDIR /ollama
+
+RUN curl -fsSL "https://go.dev/dl/go$(awk '/^go / { print $2 }' go.mod).linux-amd64.tar.gz" \
+    | tar xz -C /usr/local
+ENV PATH=/usr/local/go/bin:$PATH
+
+# The CPU build provides llama-server itself and the CPU backends; the ROCm
+# build adds only the HIP backend module next to them.
+RUN cmake -S llama/server --preset cpu \
+    && cmake --build build/llama-server-cpu --parallel "$(nproc)" \
+    && cmake --install build/llama-server-cpu --component llama-server --strip
+
+# Ollama applies every *.patch under llama/compat to the llama.cpp source it
+# fetches, in filename order. Copied here rather than before the CPU build: the
+# patches change only the HIP backend, so the CPU layer stays cached.
+COPY patches/ollama/llama-cpp/*.patch llama/compat/gfx803/
+
+# Ollama's ROCm preset is named for ROCm 7.2, but its build settings are plain
+# GGML_HIP; ggml itself requires only HIP 6.1. Setting AMDGPU_TARGETS selects
+# the preset variant that builds for the given target instead of Ollama's list,
+# which starts at gfx908. HIP sources need ROCm's clang.
+RUN CC=/opt/rocm/llvm/bin/clang CXX=/opt/rocm/llvm/bin/clang++ \
+    cmake -S llama/server --preset rocm_v7_2_user_arch \
+        -DAMDGPU_TARGETS="$ROCM_ARCH" -DCMAKE_PREFIX_PATH=/opt/rocm \
+    && { grep -q ggml_cuda_mmq_get_config_gcn4 \
+             build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/mmq.cuh \
+         || { echo "100-gfx803-mmq-tile-table.patch was not applied" >&2; exit 1; }; } \
+    && { grep -q ggml_cuda_fattn_tile_kernel \
+             build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/fattn-tile.cuh \
+         || { echo "101-gfx803-fattn-tile.patch was not applied" >&2; exit 1; }; } \
+    && { grep -q ggml_cuda_flash_attn_ext_gcn4_decode \
+             build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/fattn.cu \
+         || { echo "102-gfx803-fattn-decode.patch was not applied" >&2; exit 1; }; } \
+    && cmake --build build/llama-server-rocm_v7_2 --parallel "$(nproc)" \
+    && cmake --install build/llama-server-rocm_v7_2 --component llama-server --strip
+
+# Ollama's install bundles copies of the ROCm libraries it found (4.6 GB,
+# mostly rocBLAS kernels) for machines without ROCm. Here they duplicate the
+# base's patched libraries, and the runner's LD_LIBRARY_PATH puts the copies
+# ahead of /opt/rocm, so a library swapped in under /opt/rocm for a test (a
+# bind-mounted rocBLAS or HIP runtime) would never be loaded. libggml-hip.so's
+# RUNPATH already points at /opt/rocm-<version>/lib.
+RUN find dist/lib/ollama/rocm_v7_2 -mindepth 1 ! -name libggml-hip.so -exec rm -rf {} +
+
+# Patches to Ollama's own Go code. Applied after the llama-server builds so a
+# change here does not recompile them.
+COPY patches/ollama/ollama/*.patch /tmp/ollama-patches/
+RUN for p in /tmp/ollama-patches/*.patch; do git apply "$p" || exit 1; done \
+    && { grep -q 'func (t ToolFunctionParameters) MarshalJSON' api/types.go \
+         || { echo "tool-parameters-empty-schema.patch was not applied" >&2; exit 1; }; }
+
+# The release tag's version, which the binary reports. Declared here, not with
+# OLLAMA_REF, because an ARG is part of the cache key of every RUN after it.
+ARG OLLAMA_VERSION=0.35.1
+RUN go build -trimpath -buildmode=pie -o /ollama/dist/bin/ollama \
+    -ldflags="-w -s -X=github.com/ollama/ollama/version.Version=$OLLAMA_VERSION -X=github.com/ollama/ollama/server.mode=release" .
+
+FROM ${BASE_IMAGE}
+
+# ollama finds its runners in ../lib/ollama relative to its own binary.
+COPY --from=ollama-builder /ollama/dist/bin/ollama /usr/bin/ollama
+COPY --from=ollama-builder /ollama/dist/lib/ollama /usr/lib/ollama
+
+ENV OLLAMA_HOST=0.0.0.0:11434
+# The 8-bit KV cache halves the context's VRAM, which on an 8 GB card decides
+# whether a long context fits next to the model, and with the gfx803 decode
+# kernel (patches/ollama/llama-cpp/102-*) it also generates faster than f16
+# from about 4k tokens of context. OLLAMA_KV_CACHE_TYPE=f16 restores full
+# precision.
+ENV OLLAMA_KV_CACHE_TYPE=q8_0
+EXPOSE 11434
+ENTRYPOINT ["/usr/bin/ollama"]
+CMD ["serve"]

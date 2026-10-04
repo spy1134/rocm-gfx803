@@ -1,0 +1,84 @@
+Ollama v0.35.1 (commit b0c1ca4f): marshal a tool function without parameters
+as an empty object schema.
+
+WHY
+---
+Any OpenAI-compatible client that declares a function with no arguments gets
+HTTP 400 from Ollama, for every request in the session:
+
+    Unable to generate parser for this template. Automatic parser generation
+    failed: JSON schema error at #: properties must be an object
+
+Qwen Code 0.24.7 hits this on its first request: its get_goal and list_agents
+tools have no "parameters" key, which the OpenAI API allows (leaving it out
+means the function takes no arguments). The bug is not specific to gfx803 or
+to any backend.
+
+Ollama decodes each tool into api.ToolFunction and encodes it again for
+llama-server. A missing "parameters" (or {} or {"type": "object"}) leaves
+ToolFunctionParameters at its zero value, whose Properties pointer is nil and
+whose Type is empty, so the request llama-server receives says
+"parameters": {"type": "", "properties": null}. llama.cpp's JSON schema
+builder rejects a non-object "properties". The same tools sent straight to
+llama-server succeed, because llama.cpp itself normalizes a missing or empty
+"parameters" to {"type": "object", "properties": {}}
+(common_chat_tool_parameters).
+
+To reproduce, with any model loaded:
+
+    curl -s 127.0.0.1:11434/v1/chat/completions -H 'Content-Type: application/json' -d \
+      '{"model":"<model>","max_tokens":1,"messages":[{"role":"user","content":"hi"}],
+        "tools":[{"type":"function","function":{"name":"t","description":"d"}}]}'
+
+Without the patch this returns the error above; with it, a completion. Adding
+"parameters": {"type": "object", "properties": {}} works either way.
+
+WHAT
+----
+ToolFunctionParameters gets a MarshalJSON that fills in Type "object" when it
+is empty and an empty properties map when Properties is nil, so every encoder
+of a tool (the llama-server request, the chat template's tool list) writes a
+valid schema. The expectation in TestChatDebugRenderOnly, which recorded the
+old "properties": null output, changes to match. go test ./api/ ./openai/
+./server/ passes.
+
+diff --git a/api/types.go b/api/types.go
+index f5b04b14..a5182f7a 100644
+--- a/api/types.go
++++ b/api/types.go
+@@ -477,6 +477,22 @@ type ToolFunctionParameters struct {
+ 	Properties *ToolPropertiesMap `json:"properties"`
+ }
+ 
++// MarshalJSON writes a function that takes no arguments as an object schema
++// with no properties. The OpenAI API lets a client leave out a function's
++// parameters, and the zero value would marshal to "type": "" and
++// "properties": null, which llama.cpp's tool-call parser generator rejects.
++func (t ToolFunctionParameters) MarshalJSON() ([]byte, error) {
++	type params ToolFunctionParameters
++	p := params(t)
++	if p.Type == "" {
++		p.Type = "object"
++	}
++	if p.Properties == nil {
++		p.Properties = NewToolPropertiesMap()
++	}
++	return json.Marshal(p)
++}
++
+ func (t *ToolFunctionParameters) String() string {
+ 	bts, _ := json.Marshal(t)
+ 	return string(bts)
+diff --git a/server/routes_debug_test.go b/server/routes_debug_test.go
+index aa723777..6e8c4013 100644
+--- a/server/routes_debug_test.go
++++ b/server/routes_debug_test.go
+@@ -366,7 +366,7 @@ func TestChatDebugRenderOnly(t *testing.T) {
+ 				DebugRenderOnly: true,
+ 			},
+ 			expectDebug:    true,
+-			expectTemplate: "[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"description\":\"Get weather information\",\"parameters\":{\"type\":\"\",\"properties\":null}}}]user: Get the weather\n",
++			expectTemplate: "[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"description\":\"Get weather information\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}}]user: Get the weather\n",
+ 		},
+ 	}
+ 

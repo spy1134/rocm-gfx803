@@ -1,0 +1,453 @@
+llama.cpp (as fetched by Ollama v0.35.1, llama.cpp b11232): a gfx803 kernel
+for token generation with a q8_0 KV cache and grouped-query attention.
+
+WHY
+---
+On gfx803, token generation with a q8_0 KV cache slows down as the context
+grows, much more than the extra K/V traffic explains. Qwen3 8B Q4_K_M on an
+RX 590, llama-bench tg64: 27.9 tok/s on an empty context, 23.7 tok/s 4096
+tokens deep, 20.9 tok/s 8192 deep. With an f16 KV cache, twice the bytes, it
+runs 24.0 tok/s 8192 deep.
+
+Generation (one query token) with a quantized KV cache runs the vec kernel
+(fattn-vec.cuh). On gfx803 its q8_0 instance needs 229 VGPRs, so a SIMD holds
+one of its waves and nothing hides the latency of its K/V loads. At 8192
+tokens one layer of Qwen3 takes 286 us (test-backend-ops perf, 8 K/V heads x
+4 query heads, head size 128), which moves K/V at about 60 GB/s of the card's
+256 GB/s. Time follows the number of query heads, not the bytes: Qwen2.5-
+Coder's shape (4 K/V heads x 7 query heads, half the K/V bytes) takes 280 us.
+The vec kernel reads each K/V head once per query head of its group.
+
+The vec kernel does not fit gfx803 with less: capping it at 128 VGPRs spills
+157 VGPRs and runs 6x slower. Letting each block serve the 4 query heads of
+a group (sharing every K/V load) spills too, 26 VGPRs at 4 heads and 85 at 8,
+and runs slower than the original.
+
+WHAT
+----
+fattn-gcn4-decode.cuh adds flash_attn_gcn4_decode_q8_0<D, ncols2>, built so
+that few registers stay live:
+
+  - A block serves ncols2 (2, 4 or 8) query heads that share one K/V head,
+    so each K/V row is read once for all of them. A group whose size is not
+    a multiple of ncols2 (Qwen2.5's 7) ends in a partial tile.
+  - Scores: every lane owns one K row and dots it with all ncols2 query
+    vectors. The query vectors sit in shared memory, where every lane reads
+    the same address. A pair of q8_0 blocks is 68 bytes, so with 4-byte
+    aligned rows each pair loads as 17 whole dwords.
+  - Weighted sum over V: every lane owns D/64 output dimensions, so a warp
+    reads each V row in one coalesced sweep. The softmax weights travel from
+    the lane that computed them by readlane.
+  - The four warps of a block each take 64 rows of a 256-row slice and are
+    combined in shared memory at the end; blocks split the KV length and
+    are combined by launch_fattn's usual flash_attn_combine_results.
+
+The D=128 kernels use 66 / 86 / 104 VGPRs at ncols2 = 2 / 4 / 8, with no
+spills. Wider groups read K/V fewer times but give fewer, longer blocks, so
+the host picks ncols2 = 8 from 128 blocks, 4 from 32 blocks, else 2 (block
+counts measured on the RX 590, 36 CUs). Per layer, test-backend-ops perf:
+
+    K/V length            256    1024    4096    8192
+    Qwen3 shape, vec      27.2   57.6    169     287 us
+    Qwen3 shape, new      22.9   40.0    92.6    148 us
+    Qwen2.5 shape, vec    27.3   58.7    139     280 us
+    Qwen2.5 shape, new    22.9   37.1    77.1    137 us
+
+ggml_cuda_flash_attn_ext() tries the new kernel first wherever the kernel
+selection picks the vec kernel. It applies only on gfx803 (cc ==
+GGML_CUDA_CC_GCN4) for one query token, q8_0 K and V of head size 64, 128 or
+256, GQA ratio 2 or more, a mask, no ALiBi and no logit softcap, a KV length
+that is a multiple of 256, and dword-aligned K rows; everything else goes to
+the vec kernel as before. Its device code is compiled for GCN4 only.
+
+Result on an RX 590, llama-bench, flash attention on, q8_0 KV cache, tg64 at
+depth 0 / 4096 / 8192 tokens:
+
+    Qwen3 8B Q4_K_M           27.9 / 23.7 / 20.9  ->  28.1 / 26.0 / 24.4 tok/s
+    Qwen2.5-Coder 7B Q4_K_M   30.1 / 27.1 / 24.8  ->  30.3 / 28.8 / 27.2 tok/s
+
+Prompt processing is unchanged.
+
+Verified on an RX 590: test-backend-ops test -b ROCm0 -o FLASH_ATTN_EXT
+passes against the CPU backend for q8_0 (364 stock cases), q4_0 and f16 K/V,
+plus 120 added grouped-query decode cases per type: head sizes 64, 128 and
+256, GQA ratios 2, 3, 4, 6, 7, 8, 12 and 16, 4 K/V heads, KV length 512 and
+1024, with and without sinks, and 2 K/V heads x 3 sequences. Through Ollama
+(q8_0 KV cache, a 5.2k-token prompt, greedy, 128 tokens), the logprobs of
+the tokens before the first near-tie stay within 0.04 (Qwen3 8B) and 0.05
+(Qwen2.5-Coder 7B) of a CPU run, as with the vec kernel (0.04, 0.03), and
+generation runs 22.3 -> 24.4 tok/s (Qwen3) and 25.6 -> 27.3 tok/s
+(Qwen2.5-Coder). To reproduce,
+build llama.cpp b11232 with GGML_HIP=ON and AMDGPU_TARGETS=gfx803, then run
+with and without the patch:
+
+    llama-bench -m <Qwen3 8B Q4_K_M> -ngl 99 -fa 1 -ctk q8_0 -ctv q8_0 \
+        -p 0 -n 64 -d 0,4096,8192
+
+Applies on its own; it does not touch the files of 100- and 101-.
+
+diff --git a/ggml/src/ggml-cuda/fattn-gcn4-decode.cuh b/ggml/src/ggml-cuda/fattn-gcn4-decode.cuh
+new file mode 100644
+index 0000000..12c2b01
+--- /dev/null
++++ b/ggml/src/ggml-cuda/fattn-gcn4-decode.cuh
+@@ -0,0 +1,336 @@
++#include "common.cuh"
++#include "fattn-common.cuh"
++
++// Token generation with a q8_0 KV cache on gfx803 (GCN4).
++//
++// The generic vec kernel needs about 229 VGPRs here, so a SIMD holds one of its waves and
++// nothing hides the latency of its K/V loads: at 8192 tokens of context it moves K/V at about
++// a quarter of the card's bandwidth. Narrowing its register budget spills, and widening it to
++// serve several query heads per K/V row (grouped-query attention) spills too.
++//
++// This kernel reorganizes the work so that few registers are live. A block serves ncols2
++// query heads that share one K/V head, so each K/V row is read once for all of them. For the
++// scores, every lane owns one K row and dots it with all ncols2 query vectors, which sit in
++// shared memory where every lane reads the same address. For the weighted sum over V, every
++// lane owns D/64 output dimensions, so a warp reads each V row in one coalesced sweep, and
++// the softmax weights travel from the lane that computed them by readlane.
++
++// GCN runs 64-wide wavefronts. The host pass sees WARP_SIZE as 32, so the launch needs this too.
++static constexpr int fattn_gcn4_warp_size = 64;
++static constexpr int fattn_gcn4_nwarps    = 4;
++static constexpr int fattn_gcn4_rows      = fattn_gcn4_nwarps*fattn_gcn4_warp_size; // K/V rows per block iteration
++
++static_assert(fattn_gcn4_rows == FATTN_KQ_STRIDE, "the KV length must be a multiple of the rows per iteration");
++
++template <int D, int ncols2> // D == head size, ncols2 == query heads per block
++__launch_bounds__(fattn_gcn4_nwarps*fattn_gcn4_warp_size, 1)
++static __global__ void flash_attn_gcn4_decode_q8_0(
++        const char * Q_ptr,
++        const char * K_ptr,
++        const char * V_ptr,
++        const char * mask_ptr,
++        const char * sinks_ptr,
++        const int  * KV_max_ptr,
++        float      * dst_ptr,
++        float2     * dst_meta_ptr,
++        const float scale,
++        const float max_bias,
++        const float m0,
++        const float m1,
++        const uint32_t n_head_log2,
++        const float logit_softcap,
++        const int32_t ne00, const uint3   ne01, const int32_t ne02, const int32_t ne03,
++                            const int32_t nb01, const int32_t nb02, const int32_t nb03,
++        const int32_t ne10, const int32_t ne11, const int32_t ne12, const int32_t ne13,
++                            const int32_t nb11, const int32_t nb12, const int64_t nb13,
++                            const int32_t nb21, const int32_t nb22, const int64_t nb23,
++                            const int32_t ne31, const int32_t ne32, const int32_t ne33,
++                            const int32_t nb31, const int32_t nb32, const int64_t nb33) {
++    ggml_cuda_pdl_lc();
++#if defined(FLASH_ATTN_AVAILABLE) && defined(GCN4)
++    constexpr int nblocks_row = D/QK8_0;                // q8_0 blocks per K/V row
++    constexpr int dims_lane   = D/fattn_gcn4_warp_size; // output dimensions per lane
++    static_assert(nblocks_row % 2 == 0, "K rows are read in pairs of q8_0 blocks");
++
++    const int lane = threadIdx.x;
++    const int warp = threadIdx.y;
++
++    // A group whose size is not a multiple of ncols2 ends in a partial tile.
++    const int gqa_ratio    = ne02 / ne12;
++    const int ntiles_z_gqa = (gqa_ratio + ncols2 - 1) / ncols2;
++    const int sequence     = blockIdx.z / (ntiles_z_gqa*ne12);
++    const int zt           = blockIdx.z - sequence*(ntiles_z_gqa*ne12);
++    const int head_KV      = zt / ntiles_z_gqa;
++    const int head0        = head_KV*gqa_ratio + (zt - head_KV*ntiles_z_gqa)*ncols2;
++    const int nheads       = min(ncols2, (head_KV + 1)*gqa_ratio - head0);
++
++    const char * K     = K_ptr + nb13*sequence + int64_t(nb12)*head_KV;
++    const char * V     = V_ptr + nb23*sequence + int64_t(nb22)*head_KV;
++    const half * maskh = (const half *) (mask_ptr + nb33*(sequence % ne33));
++
++    __shared__ float Q_s[ncols2][D];
++    __shared__ float KQ_max_s[fattn_gcn4_nwarps][ncols2];
++    __shared__ float VKQ_s[ncols2][D];
++    __shared__ float KQ_sum_s[ncols2];
++
++    ggml_cuda_pdl_sync();
++    for (int i = warp*fattn_gcn4_warp_size + lane; i < ncols2*D; i += fattn_gcn4_rows) {
++        const int c = i / D;
++        const float * Q_c = (const float *) (Q_ptr + nb03*sequence + int64_t(nb02)*(head0 + c));
++        Q_s[c][i % D] = c < nheads ? scale*Q_c[i % D] : 0.0f;
++    }
++    __syncthreads();
++
++    float KQ_max[ncols2];
++    float KQ_sum[ncols2]; // this lane's share, reduced over the warp at the end
++    float VKQ[ncols2][dims_lane];
++#pragma unroll
++    for (int c = 0; c < ncols2; ++c) {
++        KQ_max[c] = -FLT_MAX/2.0f;
++        KQ_sum[c] = 0.0f;
++#pragma unroll
++        for (int e = 0; e < dims_lane; ++e) {
++            VKQ[c][e] = 0.0f;
++        }
++    }
++
++    // Each lane's V dimensions lie in one q8_0 block of the row.
++    const int dim0   = lane*dims_lane;
++    const int ib_V   = dim0 / QK8_0;
++    const int iqs_V  = dim0 % QK8_0;
++
++    const int k_VKQ_max = KV_max_ptr ? KV_max_ptr[sequence*gridDim.x + blockIdx.x] : ne11;
++    for (int k0 = blockIdx.y*fattn_gcn4_rows + warp*fattn_gcn4_warp_size; k0 < k_VKQ_max; k0 += gridDim.y*fattn_gcn4_rows) {
++        const int k = k0 + lane;
++
++        // Q_s does not change inside this loop, so the compiler would otherwise hoist all
++        // ncols2*D of its values into registers; an offset it cannot see through keeps them
++        // as shared memory reads.
++        int Q_off = 0;
++        asm volatile("" : "+s"(Q_off));
++        const float * Q_it = &Q_s[0][0] + Q_off;
++
++        float KQ[ncols2];
++#pragma unroll
++        for (int c = 0; c < ncols2; ++c) {
++            KQ[c] = 0.0f;
++        }
++
++        // A pair of q8_0 blocks is 68 bytes, so with 4-byte aligned rows each pair starts
++        // 4-byte aligned and loads as 17 whole dwords: the first block's scale is the low
++        // half of dword 0 and its quants start at byte 2, the second block's scale is the
++        // high half of dword 8 and its quants are dwords 9-16.
++        const int * K_row = (const int *) (K + int64_t(k)*nb11);
++#pragma unroll
++        for (int ib = 0; ib < nblocks_row; ib += 2) {
++            int w[17];
++#pragma unroll
++            for (int l = 0; l < 17; ++l) {
++                w[l] = K_row[(ib/2)*17 + l];
++            }
++            const float d0 = __half2float(__ushort_as_half(uint16_t(w[0] & 0xFFFF)));
++            const float d1 = __half2float(__ushort_as_half(uint16_t(uint32_t(w[8]) >> 16)));
++
++            float sum0[ncols2];
++            float sum1[ncols2];
++#pragma unroll
++            for (int c = 0; c < ncols2; ++c) {
++                sum0[c] = 0.0f;
++                sum1[c] = 0.0f;
++            }
++#pragma unroll
++            for (int b = 0; b < QK8_0; ++b) {
++                const float k0f = float(int8_t(w[(b + 2)/4] >> (8*((b + 2) % 4))));
++                const float k1f = float(int8_t(w[9 + b/4]   >> (8*(b % 4))));
++#pragma unroll
++                for (int c = 0; c < ncols2; ++c) {
++                    sum0[c] += k0f*Q_it[c*D +  ib     *QK8_0 + b];
++                    sum1[c] += k1f*Q_it[c*D + (ib + 1)*QK8_0 + b];
++                }
++            }
++#pragma unroll
++            for (int c = 0; c < ncols2; ++c) {
++                KQ[c] += d0*sum0[c] + d1*sum1[c];
++            }
++        }
++
++        const float mask_k = __half2float(maskh[k]);
++#pragma unroll
++        for (int c = 0; c < ncols2; ++c) {
++            KQ[c] += mask_k;
++            const float KQ_max_new   = fmaxf(KQ_max[c], warp_reduce_max<fattn_gcn4_warp_size>(KQ[c]));
++            const float KQ_max_scale = expf(KQ_max[c] - KQ_max_new);
++            KQ_max[c] = KQ_max_new;
++            KQ[c]     = expf(KQ[c] - KQ_max_new);
++            KQ_sum[c] = KQ_sum[c]*KQ_max_scale + KQ[c];
++#pragma unroll
++            for (int e = 0; e < dims_lane; ++e) {
++                VKQ[c][e] *= KQ_max_scale;
++            }
++        }
++
++#pragma unroll 4
++        for (int r = 0; r < fattn_gcn4_warp_size; ++r) {
++            const block_q8_0 * V_r = (const block_q8_0 *) (V + int64_t(k0 + r)*nb21) + ib_V;
++            const float d = __half2float(V_r->d);
++            int8_t qs[dims_lane];
++            if constexpr (dims_lane == 1) {
++                qs[0] = V_r->qs[iqs_V];
++            } else {
++                ggml_cuda_memcpy_1<dims_lane, 2>(qs, V_r->qs + iqs_V);
++            }
++            float v[dims_lane];
++#pragma unroll
++            for (int e = 0; e < dims_lane; ++e) {
++                v[e] = d*float(qs[e]);
++            }
++#pragma unroll
++            for (int c = 0; c < ncols2; ++c) {
++                const float p = __int_as_float(__builtin_amdgcn_readlane(__float_as_int(KQ[c]), r));
++#pragma unroll
++                for (int e = 0; e < dims_lane; ++e) {
++                    VKQ[c][e] += p*v[e];
++                }
++            }
++        }
++    }
++
++    // Combine the warps: rescale each to the block's maximum, then sum them in shared memory.
++    if (lane == 0) {
++#pragma unroll
++        for (int c = 0; c < ncols2; ++c) {
++            KQ_max_s[warp][c] = KQ_max[c];
++        }
++    }
++    __syncthreads();
++#pragma unroll
++    for (int c = 0; c < ncols2; ++c) {
++        float KQ_max_block = KQ_max_s[0][c];
++#pragma unroll
++        for (int w = 1; w < fattn_gcn4_nwarps; ++w) {
++            KQ_max_block = fmaxf(KQ_max_block, KQ_max_s[w][c]);
++        }
++        const float KQ_max_scale = expf(KQ_max[c] - KQ_max_block);
++        KQ_max[c] = KQ_max_block;
++        KQ_sum[c] = warp_reduce_sum<fattn_gcn4_warp_size>(KQ_sum[c])*KQ_max_scale;
++#pragma unroll
++        for (int e = 0; e < dims_lane; ++e) {
++            VKQ[c][e] *= KQ_max_scale;
++        }
++    }
++#pragma unroll
++    for (int w = 0; w < fattn_gcn4_nwarps; ++w) {
++        if (warp == w) {
++#pragma unroll
++            for (int c = 0; c < ncols2; ++c) {
++#pragma unroll
++                for (int e = 0; e < dims_lane; ++e) {
++                    VKQ_s[c][dim0 + e] = w == 0 ? VKQ[c][e] : VKQ_s[c][dim0 + e] + VKQ[c][e];
++                }
++                if (lane == 0) {
++                    KQ_sum_s[c] = w == 0 ? KQ_sum[c] : KQ_sum_s[c] + KQ_sum[c];
++                }
++            }
++        }
++        __syncthreads();
++    }
++
++    for (int i = warp*fattn_gcn4_warp_size + lane; i < ncols2*D; i += fattn_gcn4_rows) {
++        const int c = i / D;
++        if (c >= nheads) {
++            break;
++        }
++        float KQ_max_c = KQ_max_s[0][c];
++#pragma unroll
++        for (int w = 1; w < fattn_gcn4_nwarps; ++w) {
++            KQ_max_c = fmaxf(KQ_max_c, KQ_max_s[w][c]);
++        }
++        float KQ_sum_c = KQ_sum_s[c];
++        float val      = VKQ_s[c][i % D];
++        if (sinks_ptr && blockIdx.y == 0) {
++            const float sink        = ((const float *) sinks_ptr)[head0 + c];
++            const float KQ_max_new  = fmaxf(KQ_max_c, sink);
++            const float KQ_max_scale = expf(KQ_max_c - KQ_max_new);
++            KQ_max_c = KQ_max_new;
++            KQ_sum_c = KQ_sum_c*KQ_max_scale + expf(sink - KQ_max_new);
++            val     *= KQ_max_scale;
++        }
++        const int j_dst = (sequence*int(ne01.z)*ne02 + head0 + c)*gridDim.y + blockIdx.y;
++        dst_ptr[j_dst*D + i % D] = gridDim.y == 1 ? val/KQ_sum_c : val;
++        if (gridDim.y != 1 && i % D == 0) {
++            dst_meta_ptr[j_dst] = make_float2(KQ_max_c, KQ_sum_c);
++        }
++    }
++#else
++    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
++        max_bias, m0, m1, n_head_log2, logit_softcap,
++        ne00, ne01, ne02, ne03,
++              nb01, nb02, nb03,
++        ne10, ne11, ne12, ne13,
++              nb11, nb12, nb13,
++              nb21, nb22, nb23,
++              ne31, ne32, ne33,
++              nb31, nb32, nb33);
++    NO_DEVICE_CODE;
++#endif // defined(FLASH_ATTN_AVAILABLE) && defined(GCN4)
++}
++
++template <int D, int ncols2>
++static void ggml_cuda_flash_attn_ext_gcn4_decode_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    launch_fattn<D, 1, ncols2>(ctx, dst, flash_attn_gcn4_decode_q8_0<D, ncols2>, fattn_gcn4_nwarps, 0,
++        fattn_gcn4_rows, false, false, false, false, fattn_gcn4_warp_size);
++}
++
++template <int D>
++static void ggml_cuda_flash_attn_ext_gcn4_decode_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int gqa_ratio) {
++    // Wider head groups read K/V fewer times but give fewer, longer blocks, which only pays
++    // off once there are enough blocks to fill the GPU. The block counts at which a width
++    // starts to win were measured on an RX 590 (36 CUs) with 4 and 8 K/V heads.
++    const ggml_tensor * K = dst->src[1];
++    auto nblocks = [&](const int ncols2) {
++        return K->ne[2]*K->ne[3]*((gqa_ratio + ncols2 - 1)/ncols2)*(K->ne[1]/fattn_gcn4_rows);
++    };
++    if (gqa_ratio > 4 && nblocks(8) >= 128) {
++        ggml_cuda_flash_attn_ext_gcn4_decode_case<D, 8>(ctx, dst);
++    } else if (gqa_ratio > 2 && nblocks(4) >= 32) {
++        ggml_cuda_flash_attn_ext_gcn4_decode_case<D, 4>(ctx, dst);
++    } else {
++        ggml_cuda_flash_attn_ext_gcn4_decode_case<D, 2>(ctx, dst);
++    }
++}
++
++// Runs the kernel above and returns true if it applies to dst, else returns false.
++static bool ggml_cuda_flash_attn_ext_gcn4_decode(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * Q    = dst->src[0];
++    const ggml_tensor * K    = dst->src[1];
++    const ggml_tensor * V    = dst->src[2];
++    const ggml_tensor * mask = dst->src[3];
++
++    if (ggml_cuda_info().devices[ggml_cuda_get_device()].cc != GGML_CUDA_CC_GCN4) {
++        return false;
++    }
++
++    float max_bias;
++    float logit_softcap;
++    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
++    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
++
++    const int gqa_ratio = Q->ne[2] / K->ne[2];
++    if (Q->ne[1] != 1 || gqa_ratio < 2 || !mask || max_bias != 0.0f || logit_softcap != 0.0f) {
++        return false;
++    }
++    if (K->type != GGML_TYPE_Q8_0 || V->type != GGML_TYPE_Q8_0 || K->ne[0] != V->ne[0] || K->ne[1] % fattn_gcn4_rows != 0) {
++        return false;
++    }
++    // K rows are read as whole dwords.
++    if (uintptr_t(K->data) % 4 != 0 || K->nb[1] % 4 != 0 || K->nb[2] % 4 != 0 || K->nb[3] % 4 != 0) {
++        return false;
++    }
++
++    switch (K->ne[0]) {
++        case  64: ggml_cuda_flash_attn_ext_gcn4_decode_switch_ncols2< 64>(ctx, dst, gqa_ratio); return true;
++        case 128: ggml_cuda_flash_attn_ext_gcn4_decode_switch_ncols2<128>(ctx, dst, gqa_ratio); return true;
++        case 256: ggml_cuda_flash_attn_ext_gcn4_decode_switch_ncols2<256>(ctx, dst, gqa_ratio); return true;
++        default:  return false;
++    }
++}
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index ad4d1df..9b2ef40 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -3,6 +3,7 @@
+ #include "fattn-mma-f16.cuh"
+ #include "fattn-tile.cuh"
+ #include "fattn-vec.cuh"
++#include "fattn-gcn4-decode.cuh"
+ #include "fattn.cuh"
+ 
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+@@ -764,7 +765,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+             ggml_cuda_flash_attn_ext_tile(ctx, dst);
+             break;
+         case BEST_FATTN_KERNEL_VEC:
+-            ggml_cuda_flash_attn_ext_vec(ctx, dst);
++            if (!ggml_cuda_flash_attn_ext_gcn4_decode(ctx, dst)) {
++                ggml_cuda_flash_attn_ext_vec(ctx, dst);
++            }
+             break;
+         case BEST_FATTN_KERNEL_MMA_F16:
+             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
