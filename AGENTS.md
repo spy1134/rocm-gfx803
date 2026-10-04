@@ -4,6 +4,21 @@ Read `README.md` first. It gives the layout and the status of each line. This
 file gives the process rules and the judgment calls. You cannot get either one
 from the code or from a patch header alone.
 
+## Scope of this fork
+
+This repository is a fork of Schaka/rocm-gfx803 that maintains only the
+`rocm6.4.4/` line and the host tools in `tools/`. Work there. The ROCm 10 line
+at the root (`docker/`, `docker-bake.hcl`, `scripts/`, `patches/`, `vllm/`, the
+CI workflows) and the archived `rocm7.14/` are inherited and unmaintained here:
+do not build, change or "fix" them unless asked, and do not apply their rules
+to `rocm6.4.4/`. Most sections below were written for that ROCm 10 line (the
+bake graph, the hosted-runner disk budget, branch pins, the vLLM fork, the
+box at 192.168.1.214); the standing philosophy, the investigation workflow and
+the patch conventions apply to `rocm6.4.4/` as written. `rocm6.4.4/` builds with
+plain `docker build`, has no CI, and is validated on a local card.
+`docs/FINDINGS.md` holds this fork's findings; `README-rocm10.md` is the
+inherited ROCm 10 README.
+
 ## Standing philosophy
 
 ### Build locally. Never push.
