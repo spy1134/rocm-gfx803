@@ -46,3 +46,19 @@ database
 # graft's local graph cache — regenerable, not committed (run `graft build`).
 graft/
 .mcp.json
+
+# Model weights, latent caches and other per-user data, wherever they land
+*.safetensors
+*.ckpt
+*.gguf
+*.npz
+
+# Python environments and bytecode
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Per-machine output of the host tools and local notes
+/gpu_monitor.log
+/CLAUDE.local.md

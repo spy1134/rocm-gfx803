@@ -1,11 +1,20 @@
-# Build context for this Dockerfile is this directory (rocm6.4.4/). Only
-# patches/ is ever COPYed from it; everything else here is documentation or
-# host-side tooling that would otherwise be hashed and shipped to the daemon
-# on every build. Same reasoning as the repo-root .dockerignore (the rocm7
-# line, which has its own context and its own .dockerignore).
+# Build context for all three Dockerfiles is this directory (rocm6.4.4/). Only
+# patches/ and runtime/ (Dockerfile, Dockerfile-Ollama) and training/
+# (Dockerfile-ComfyUI) are COPYed from it; everything else here is
+# documentation, host-side tooling, or user data that would otherwise be hashed
+# and shipped to the daemon on every build. The patterns below match the top
+# level only, so the Python files under training/ and runtime/ are kept.
 #
 # This does not affect layer caching: BuildKit keys a COPY on the checksums of
 # the files it actually copies, not on the whole context.
 *.md
 *.py
 tools/
+# Bytecode from running training/'s scripts on the host; the image compiles
+# its own.
+**/__pycache__
+# Models, datasets, run output, caches and MIOpen databases: hundreds of GB.
+ComfyUI/
+workspace/
+ollama/
+miopen/

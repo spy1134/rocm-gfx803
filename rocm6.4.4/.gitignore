@@ -1,0 +1,12 @@
+# Everything the launchers mount into their containers: models, ComfyUI
+# outputs and custom nodes, MIOpen's per-machine databases and caches, the
+# workspace (datasets, training runs, LoRA output) and Ollama's models. All of
+# it is per-user, large, or both.
+/ComfyUI/
+/ollama/
+/miopen/
+/workspace/
+__pycache__/
+
+# Build logs written by setup.sh
+/setup-logs/

@@ -1,10 +1,9 @@
 # syntax=docker/dockerfile:1
-# Polaris / gfx803 variant: MIGraphX + ONNX Runtime + PyTorch on ROCm 6.4.x.
-# User-facing docs (versions, packages, caveats): gfx803/README.md
+# Polaris / gfx803 base image: MIGraphX + ONNX Runtime + PyTorch on ROCm 6.4.4,
+# with rocBLAS, MIOpen and the HSA runtime rebuilt for gfx803. User-facing docs
+# (versions, building, caveats): README.md in this directory.
 #
-# Separate from the main Dockerfile on purpose. gfx803 (RX 460/470/480/550/560/
-# 570/580/590) cannot be an arch in that build's matrix, because it isn't a
-# different GPU target on the same stack -- it's a different ROCm major:
+# Why ROCm 6.4.4 for gfx803 (RX 460/470/480/550/560/570/580/590):
 #
 #   * ROCm 7's ROCR-Runtime rejects agents whose HSA DoorbellType is 0 or 1
 #     ("legacy" doorbells), which is what Polaris reports. The GPU agent is
@@ -15,8 +14,7 @@
 #     image enumerates a Polaris card as shipped, no runtime patch required.
 #
 # So this file pins the last ROCm 6 release (6.4.4) rather than carrying the
-# ROCR patch set on 7.x. Everything here is version-pinned and built manually
-# (see .github/workflows/gfx803.yml) -- there is no nightly for it.
+# ROCR patch set on 7.x. Everything here is version-pinned and built locally.
 #
 # What still has to be rebuilt from source, and why:
 #
@@ -34,23 +32,19 @@
 #                the gfx803 Tensile logic (Logic/asm_full/r9nano/*.yaml) is
 #                still in the tree, so `rmake.py -a gfx803` builds it back.
 #                The base image's prebuilt rocBLAS has no gfx803 code objects.
-#   MIGraphX  -- prebuilt for gfx900+ only, same as on the main image.
+#   MIGraphX  -- prebuilt for gfx900+ only.
 #   PyTorch   -- no gfx803 wheel has ever been published.
 #   ORT       -- built against the MIGraphX above.
-#   MIOpen    -- the base image's prebuilt MIOpen keeps its
-#                Ellesmere/Baffin/Polaris10/Polaris11 -> gfx803 device map and
-#                its gfx803 asm/Winograd conv solvers fine (it only lacked a
-#                gfx803 .kdb, the *tuning* database -- untuned, not broken).
-#                But ConvOclDirectFwd (-> MIOpenConvUniBatchNormActiv via the
-#                fused ConvActivationFusion path) has a genuine out-of-bounds
-#                weights-buffer read for grouped/depthwise convolutions on
-#                gfx803: confirmed via a minimal, deterministic, standalone
-#                repro and two independent AMD_SERIALIZE_KERNEL=3-attributed
-#                production crashes (see KERNEL_BUGS.md). Rebuilt with
-#                patches/miopen/conv-direct-fwd-grouped-oob.sh, which makes
-#                that solver's applicability check reject grouped convs
-#                outright, so MIOpen routes them to a different solver
-#                instead of ever reaching the broken kernel.
+#   MIOpen    -- keeps its Ellesmere/Baffin/Polaris10/Polaris11 -> gfx803
+#                device map and gfx803 solvers (with no gfx803 .kdb, the
+#                tuning database, so untuned), but several of those solvers
+#                compute wrong on gfx803. Rebuilt with patches/miopen/, whose
+#                applicability-check patches route the affected shapes to
+#                other solvers: ConvOclDirectFwd's out-of-bounds weights read
+#                for grouped/depthwise convolutions (see KERNEL_BUGS.md), the
+#                fused Winograd kernel's non-3x3 padding path, and the binary
+#                Winograd solvers (ConvBinWinogradRxS, ConvBinWinograd3x3U),
+#                which corrupt memory and hang the GPU on gfx803.
 #
 # What is switched off, because no version of it has ever supported gfx8:
 #
@@ -63,14 +57,15 @@
 # Expect this to be slow: untuned MIOpen, no packed-fp16, no dot instructions.
 # It is meant to make a 20-euro card usable, not competitive.
 #
-# Build: docker build -f gfx803/Dockerfile -t <tag> gfx803
-ARG BASE_IMAGE=rocm/dev-ubuntu-24.04:6.4.4-complete
+# Build, from this directory: docker build -t rocm-gfx803:rocm6.4.4 -f Dockerfile .
+# Pinned by digest as well as tag: AMD can re-push a tag, and a moved base
+# changes every stage below.
+ARG BASE_IMAGE=rocm/dev-ubuntu-24.04:6.4.4-complete@sha256:31418ac10a3769a71eaef330c07280d1d999d7074621339b8f93c484c35f6078
 
-# Component-image references, same indirection as the main Dockerfile: in CI
-# each component builds as its own job/image and the next stage COPYs the
-# prebuilt result instead of recompiling. Defaults point at the local stage
-# names so a plain one-shot `docker build -f gfx803/Dockerfile gfx803`
-# still works.
+# Component-image references. Each defaults to its own stage, so a plain
+# `docker build` compiles everything; pointing one at a previously built image
+# (--build-arg MIGRAPHX_IMAGE=<image>) reuses that image's result instead of
+# recompiling the component.
 ARG ROCBLAS_IMAGE=rocblas-builder
 ARG MIOPEN_IMAGE=miopen-builder
 ARG MIGRAPHX_IMAGE=migraphx-builder
@@ -78,30 +73,32 @@ ARG PYTORCH_IMAGE=pytorch-builder
 ARG ORT_IMAGE=ort-builder
 ARG ROCR_IMAGE=rocr-builder
 
-# Everything below is pinned. Unlike the main image there is no develop-tracking
-# ref and so no SOURCE_DATE cache-bust: each of these refs is immutable, so its
-# clone layer's cache key only changes when the pin does, which is what we want.
+# Everything below is pinned to an immutable ref: a release tag, or a commit
+# where the project only offers a moving release branch. A clone layer's cache
+# key is its command text, so a branch that moves upstream would otherwise be
+# picked up silently by a build without cache and never by one with it.
 #
 # ROCM_VERSION picks the rocBLAS/rocm-cmake source tags and must match
 # BASE_IMAGE's ROCm release -- rocBLAS built from a different release than the
 # hipBLAS/hipBLASLt it links against is not a supported combination.
 ARG ROCM_VERSION=6.4.4
 
-# MIGraphX 6.4 is the newest release branch on the ROCm 6 line.
-ARG MIGRAPHX_REF=release/rocm-rel-6.4
+# MIGraphX 6.4 is the newest release on the ROCm 6 line.
+ARG MIGRAPHX_REF=rocm-${ROCM_VERSION}
 
 # PyTorch from ROCm's fork, not upstream: the fork carries the ROCm-side fixes
 # for the release it's cut against, and it's what the gfx803 community builds
 # have used. release/2.8 matches what AMD ships in their own
 # rocm/onnxruntime:rocm6.4.4_* image (torch 2.8.0).
 #
-# Caveat worth knowing before debugging a failure here: the *hardware*-verified
-# gfx803 torch is release/2.6 (that's what has actually been run on RX 570/580
-# by the gfx803_rocm project). 2.8 is verified against ROCm 6.4.4, not against
-# gfx803. If torch misbehaves on-device, dropping to
-# --build-arg PYTORCH_REF=release/2.6 TORCHVISION_REF=v0.21.0
-# TORCHAUDIO_REF=v2.6.0 is the known-good fallback.
-ARG PYTORCH_REF=release/2.8
+# 2.8 is validated on gfx803 for fp32 work (op-by-op and whole SD1.5 UNet
+# against a CPU reference). The gfx803_rocm project's hardware-verified torch is
+# release/2.6, the fallback if torch misbehaves on-device:
+# --build-arg PYTORCH_REF=<a commit of release/2.6> TORCHVISION_REF=v0.21.0
+# TORCHAUDIO_REF=v2.6.0.
+# ROCm/pytorch tags none of its release-branch commits, so PYTORCH_REF is the
+# commit of release/2.8 the image is built and verified with.
+ARG PYTORCH_REF=d618db82b9591e37af258fbf654ae688f0f3d8a3
 ARG TORCHVISION_REF=v0.23.0
 ARG TORCHAUDIO_REF=v2.8.0
 
@@ -127,9 +124,8 @@ ARG BUILD_PARALLEL_LEVEL=auto
 
 # Shared ancestor. Ubuntu 24.04's native python3 IS 3.12, which is the version
 # every wheel here has to target (downstream consumers pin numpy in a way that
-# only resolves against onnx's deps under 3.12) -- so unlike the main
-# Dockerfile, which has to overlay a uv-managed 3.12 onto a 3.14 base, this
-# variant just uses the system interpreter throughout.
+# only resolves against onnx's deps under 3.12) -- so this image uses the
+# system interpreter throughout.
 FROM ${BASE_IMAGE} AS python-base
 ENV DEBIAN_FRONTEND=noninteractive
 # PIP_BREAK_SYSTEM_PACKAGES: Ubuntu 24.04 marks the system interpreter
@@ -151,7 +147,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # mis-read freshly written data -- ORT ReductionOpTest.ReduceSum_
 # apex_matrix_large. The patch defers freed-VAs on a length-bounded FIFO
 # and defaults the fragment allocator to off. See the patch file and
-# KERNEL_BUGS.md for the full investigation, and gfx803/tools/reduce-harness/
+# KERNEL_BUGS.md for the full investigation, and tools/reduce-harness/
 # for the repro harness. Only libhsa-runtime64 is rebuilt: the KFD-layer
 # allocator is statically linked into it, so clr/HIP does not need a rebuild.
 FROM python-base AS rocr-builder
@@ -213,13 +209,11 @@ RUN git clone --branch "rocm-${ROCM_VERSION}" --depth 1 \
 # the reasoning, and it fails the build if it ever stops matching upstream.
 #
 # A source-level replacement (wgm-miscompute-source.{patch,sh}, also in this
-# directory) exists but is NOT wired in -- the rocm7 line's real
-# rocblas-builder build (same underlying source, same anchor text) found it
-# leaves 518 WGM8 kernel symbols in TensileLibrary_Type_*_fallback_gfx803
-# libraries, which don't route through the SolutionStructs.py hook this
-# patch targets. See ../Dockerfile's identical comment for the full story.
-# Not swapped in here until that gap is closed and independently
-# re-verified against a real build of this line specifically.
+# directory) exists but is NOT wired in: a build of the same rocBLAS source
+# with it left 518 WGM8 kernel symbols in the TensileLibrary_Type_*_fallback_
+# gfx803 libraries, which don't route through the SolutionStructs.py hook that
+# patch targets. Not swapped in until that gap is closed and re-verified
+# against a real build of this line.
 COPY patches/rocblas/ /rocblas-patches/
 RUN sh /rocblas-patches/wgm-miscompute.sh /rocblas-src
 
@@ -248,7 +242,7 @@ WORKDIR /rocblas-src
 # can only fail on this hardware.
 #
 # Disk: Tensile generates an enormous intermediate tree even for a single
-# architecture, and a hosted runner has ~14GB of disk after the base image.
+# architecture.
 # rmake.py has its own --cleanup flag for this, but it deletes the entire
 # build/release tree -- including the install output this stage needs to
 # copy out to /opt/rocm -- as its last internal action, before returning
@@ -256,8 +250,8 @@ WORKDIR /rocblas-src
 # step below. --cleanup is intentionally NOT passed here; the `rm -rf
 # /rocblas-src/build` after the copy reclaims the same disk without the race.
 #
-# Job count uses the same MemAvailable/4GB-per-job "auto" sizing as the main
-# Dockerfile's compile stages.
+# Job count: "auto" allows one job per 4 GB of free memory, at most one per
+# core, the same sizing as the other compile stages.
 RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocblas-ccache \
     jobs="${BUILD_PARALLEL_LEVEL}"; \
     if [ "$jobs" = "auto" ]; then \
@@ -362,12 +356,11 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocblas-ccache \
     fi \
     && echo "OK: librocblas.so.4 resolves to a gfx803 build with a ${fatbin_size}-byte .hip_fatbin."
 
-# rocBLAS/Tensile's own SGEMM kernels are unreliable on gfx803 for every shape
-# tested (not just the already-fixed WGM8 bug) -- see sgemm-shim/gfx803_sgemm.h
-# for the full investigation. This builds an LD_PRELOAD shim that intercepts
-# the standard-algo f32 rocblas_sgemm/rocblas_gemm_ex path and routes it to a
-# plain, correctness-verified replacement kernel instead; the ENV enabling it
-# lives in the final stage.
+# The original SGEMM shim: intercepts rocblas_sgemm/rocblas_gemm_ex only, not
+# the strided-batched calls attention uses, so its attention gradients are
+# wrong. It stays in the image for A/B comparisons (gfx803-train.sh
+# --shim original); the shim the image preloads is the batched one built in
+# sgemm-shim-builder below.
 RUN mkdir -p /opt/rocm-sgemm-shim
 COPY patches/rocblas/sgemm-shim/ /opt/rocm-sgemm-shim/
 RUN hipcc -O2 -fPIC -shared --offload-arch=gfx803 -I/opt/rocm/include \
@@ -401,44 +394,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN git clone --branch "rocm-${ROCM_VERSION}" --depth 1 \
         https://github.com/ROCm/MIOpen.git /miopen-src
 
-# MIOpenConvUniBatchNormActiv (generated by ConvOclDirectFwd/
-# ConvOclDirectFwdFused, src/solver/conv/conv_ocl_dir2Dfwd.cpp) has an
-# out-of-bounds weights-buffer read for grouped convolutions on gfx803 --
-# see the script for the full investigation and how it was root-caused.
-COPY patches/miopen/ /miopen-patches/
-RUN sh /miopen-patches/conv-direct-fwd-grouped-oob.sh /miopen-src
-
-# ConvBinWinogradRxSFused (src/solver/conv_bin_winoRxS_fused.cpp) miscomputes
-# for its padding-generalized non-3x3 shapes (e.g. plain 1x1 pointwise convs)
-# -- see the patch for the full investigation and why it's scoped to spare
-# genuine 3x3 shapes, where the same kernel is verified correct.
-RUN sh /miopen-patches/winograd-fused-conv-miscompute.sh /miopen-src
-
-# ReduceCalculation's Prod (multiply) kernel seeds its accumulator with 0
-# instead of 1, so miopenReduceCalculationForward(..., PROD) always returns
-# all zeros -- a plain logic bug in arch-generic kernel source, not specific
-# to gfx8, still present unfixed as of the newest upstream tag we could find
-# (rocm-7.2.4). Kept in this repo's patch set since we build MIOpen from
-# source here anyway; see the patch for the full investigation.
-RUN sh /miopen-patches/reduce-prod-wrong-identity.sh /miopen-src
-
-# miopenReduceTensor's dynamic-reduction dispatch intermittently returns wrong
-# sums on gfx803 (confirmed via ReductionOpTest.ReduceSum_apex_matrix_large and a
-# standalone repro). The prior kernel-cache-eviction workaround
-# (reduce-kernel-cache-eviction.patch) passed every standalone repro but failed
-# ORT's real test suite, and was abandoned. A NEW narrow workaround
-# (reduce-program-bound-eviction.patch, which bounds how many distinct reduction
-# programs stay resident instead of evicting every call) is under validation and
-# opt-in here via ENABLE_REDUCE_BOUND -- NOT part of any default production
-# build until it passes the real ORT suite AND a perf benchmark. See
-# KERNEL_BUGS.md, "The ReduceSum kernel-cache mystery".
-ARG ENABLE_REDUCE_BOUND=0
-RUN if [ "$ENABLE_REDUCE_BOUND" = "1" ]; then \
-        sh /miopen-patches/reduce-program-bound-eviction.sh /miopen-src; \
-    else \
-        echo "reduce-program-bound workaround NOT applied (opt-in, gfx803 validation)"; \
-    fi
-
 # MIOpen's requirements.txt unconditionally pulls in composable_kernel and
 # rocMLIR, neither of which has ever supported gfx8 (see the top-of-file
 # comment) -- composable_kernel alone is tens of thousands of instantiation
@@ -460,10 +415,69 @@ WORKDIR /miopen-src
 RUN --mount=type=cache,target=/root/.ccache,id=gfx803-miopen-ccache \
     cmake -P install_deps.cmake --minimum --prefix /miopen-deps
 
+# The patches are applied after install_deps.cmake, which reads only
+# requirements.txt: a patch edit then reruns just the steps from here on. Each
+# step copies only its own patch and driver, and the steps run from the most
+# settled patch to the one most likely to change, so an edit reruns only its
+# own step and the ones after it.
+
+# MIOpenConvUniBatchNormActiv (generated by ConvOclDirectFwd/
+# ConvOclDirectFwdFused, src/solver/conv/conv_ocl_dir2Dfwd.cpp) has an
+# out-of-bounds weights-buffer read for grouped convolutions on gfx803 --
+# see the script for the full investigation and how it was root-caused.
+COPY patches/miopen/conv-direct-fwd-grouped-oob.patch patches/miopen/conv-direct-fwd-grouped-oob.sh /miopen-patches/
+RUN sh /miopen-patches/conv-direct-fwd-grouped-oob.sh /miopen-src
+
+# ConvBinWinogradRxSFused (src/solver/conv_bin_winoRxS_fused.cpp) miscomputes
+# for its padding-generalized non-3x3 shapes (e.g. plain 1x1 pointwise convs)
+# -- see the patch for the full investigation and why it's scoped to spare
+# genuine 3x3 shapes, where the same kernel is verified correct.
+COPY patches/miopen/winograd-fused-conv-miscompute.patch patches/miopen/winograd-fused-conv-miscompute.sh /miopen-patches/
+RUN sh /miopen-patches/winograd-fused-conv-miscompute.sh /miopen-src
+
+# ReduceCalculation's Prod (multiply) kernel seeds its accumulator with 0
+# instead of 1, so miopenReduceCalculationForward(..., PROD) always returns
+# all zeros -- a plain logic bug in arch-generic kernel source, not specific
+# to gfx8, still present unfixed as of the newest upstream tag we could find
+# (rocm-7.2.4). Kept in this repo's patch set since we build MIOpen from
+# source here anyway; see the patch for the full investigation.
+COPY patches/miopen/reduce-prod-wrong-identity.patch patches/miopen/reduce-prod-wrong-identity.sh /miopen-patches/
+RUN sh /miopen-patches/reduce-prod-wrong-identity.sh /miopen-src
+
+# ConvBinWinogradRxS and ConvBinWinograd3x3U run legacy assembly kernels that
+# corrupt memory on gfx803 and are the stuck dispatch in its GPU hangs; the
+# patch makes both not applicable there, so MIOpen uses its GEMM solvers.
+COPY patches/miopen/winograd-bin-gfx803-disable.patch patches/miopen/winograd-bin-gfx803-disable.sh /miopen-patches/
+RUN sh /miopen-patches/winograd-bin-gfx803-disable.sh /miopen-src
+
+# miopenReduceTensor's dynamic-reduction dispatch intermittently returns wrong
+# sums on gfx803 (confirmed via ReductionOpTest.ReduceSum_apex_matrix_large and a
+# standalone repro). The prior kernel-cache-eviction workaround
+# (reduce-kernel-cache-eviction.patch) passed every standalone repro but failed
+# ORT's real test suite, and was abandoned. A NEW narrow workaround
+# (reduce-program-bound-eviction.patch, which bounds how many distinct reduction
+# programs stay resident instead of evicting every call) is under validation and
+# opt-in here via ENABLE_REDUCE_BOUND -- NOT part of any default production
+# build until it passes the real ORT suite AND a perf benchmark. See
+# KERNEL_BUGS.md, "The ReduceSum kernel-cache mystery".
+ARG ENABLE_REDUCE_BOUND=0
+COPY patches/miopen/reduce-program-bound-eviction.patch patches/miopen/reduce-program-bound-eviction.sh /miopen-patches/
+RUN if [ "$ENABLE_REDUCE_BOUND" = "1" ]; then \
+        sh /miopen-patches/reduce-program-bound-eviction.sh /miopen-src; \
+    else \
+        echo "reduce-program-bound workaround NOT applied (opt-in, gfx803 validation)"; \
+    fi
+
+# Gives gfx803 a Winograd solver again, for 3x3 stride-1 fp32 and fp16 convs:
+# small HIP transform kernels around one batched GEMM (the SGEMM shim runs the
+# fp32 one), about 2x faster than the GEMM solvers on most SD1.5 convs; Find
+# picks per shape.
+COPY patches/miopen/winograd-f2x3-hip-gfx803.patch patches/miopen/winograd-f2x3-hip-gfx803.sh /miopen-patches/
+RUN sh /miopen-patches/winograd-f2x3-hip-gfx803.sh /miopen-src
+
 # -DMIOPEN_USE_COMPOSABLEKERNEL/MLIR/HIPBLASLT=Off: none of the three has
 # ever supported gfx8 (see top-of-file comment); Off here matches the
-# filtered requirements.txt above and the main Dockerfile's own gfx803
-# switches. -DMIOPEN_BUILD_DRIVER/BUILD_TESTING=Off: neither ships in the
+# filtered requirements.txt above. -DMIOPEN_BUILD_DRIVER/BUILD_TESTING=Off: neither ships in the
 # final image, skipping them cuts real build time.
 RUN --mount=type=cache,target=/root/.ccache,id=gfx803-miopen-ccache \
     jobs="${BUILD_PARALLEL_LEVEL}"; \
@@ -542,8 +556,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-pybind11 \
     && rm -rf /var/lib/apt/lists/*
 
-# Fresh rocm-cmake at the matching release tag, same reasoning as the main
-# Dockerfile: MIGraphX's CMakeLists.txt uses macros (rocm_add_version_resource)
+# Fresh rocm-cmake at the matching release tag: MIGraphX's CMakeLists.txt uses macros (rocm_add_version_resource)
 # that the bundled copy doesn't reliably carry.
 RUN git clone --branch "rocm-${ROCM_VERSION}" --depth 1 \
         https://github.com/ROCm/rocm-cmake.git /rocm-cmake-src \
@@ -643,10 +656,8 @@ RUN sed -i \
     && grep -q 'void dump_mlir_to_file(module, const std::vector<shape>&, const fs::path&) {}' src/targets/gpu/mlir.cpp \
     && grep -q 'void dump_mlir_to_mxr(module, const std::vector<instruction_ref>&, const fs::path&) {}' src/targets/gpu/mlir.cpp
 
-# Same ccache-mount and job-capping reasoning as the main Dockerfile. Without
-# rocMLIR in the graph this build no longer compiles LLVM, so it is far lighter
-# than the main image's migraphx stage -- the cap is kept anyway because the
-# MIGraphX TUs themselves are still multi-GB.
+# Jobs are capped at one per 4 GB of free memory: the MIGraphX TUs are multi-GB
+# each even without rocMLIR, which is stripped above so LLVM is not compiled.
 RUN --mount=type=cache,target=/root/.ccache,id=gfx803-migraphx-ccache \
     ulimit -s unlimited && \
     jobs="${BUILD_PARALLEL_LEVEL}"; \
@@ -677,7 +688,7 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-migraphx-ccache \
         -T install \
     && rm -rf /migraphx-deps /mlir-stub
 
-# Same version stamp as the main image, so downstream consumers can detect a
+# A version stamp, so downstream consumers can detect a
 # MIGraphX change and invalidate a compiled-model cache.
 RUN echo "${MIGRAPHX_REF} $(git -C /migraphx-src rev-parse HEAD)" > /opt/rocm/migraphx-version.txt
 
@@ -711,8 +722,10 @@ RUN python3 -m venv /build-venv \
     && /build-venv/bin/pip install --no-cache-dir numpy pyyaml typing_extensions requests six
 ENV PATH=/build-venv/bin:$PATH
 
-RUN git clone --recursive --branch "${PYTORCH_REF}" --depth 1 --shallow-submodules \
-        https://github.com/ROCm/pytorch.git /pytorch
+RUN git init -q /pytorch \
+    && git -C /pytorch fetch -q --depth 1 https://github.com/ROCm/pytorch.git "${PYTORCH_REF}" \
+    && git -C /pytorch checkout -q FETCH_HEAD \
+    && git -C /pytorch submodule update -q --init --recursive --depth 1
 
 WORKDIR /pytorch
 RUN pip install --no-cache-dir -r requirements.txt
@@ -723,8 +736,7 @@ RUN python3 tools/amd_build/build_amd.py
 
 # USE_FLASH_ATTENTION/USE_MEM_EFF_ATTENTION: default on for ROCm and pull in
 # aotriton, which has no gfx803 support whatsoever (and configures its own
-# isolated venv that breaks this stage's build anyway, same as on the main
-# image).
+# isolated venv that breaks this stage's build anyway).
 #
 # USE_DISTRIBUTED: pulls in NCCL/NVSHMEM paths that don't build under ROCm at
 # these tags, and a single Polaris card has no use for it.
@@ -830,7 +842,7 @@ RUN eigen_commit=$(grep '^eigen;' /onnxruntime/cmake/deps.txt | cut -d';' -f2 | 
     && git checkout -q FETCH_HEAD
 
 WORKDIR /onnxruntime
-# Unlike the main Dockerfile's v1.27 build, 1.21 still has a real ROCm EP, so
+# This ORT release still has a real ROCm EP, so
 # both --use_rocm and --use_migraphx are passed: the MIGraphX EP handles what
 # MIGraphX can compile and the ROCm EP is the fallback for the rest. On gfx803
 # that fallback matters more than usual, since MIGraphX here has no CK and no
@@ -877,6 +889,25 @@ RUN built_whl="$(ls /onnxruntime/build/Release/dist/*.whl)" \
     && python3 -m wheel pack "$unpack_dir/$new_name" -d /onnxruntime/dist
 
 FROM ${ORT_IMAGE} AS ort-export
+
+# The SGEMM shim every image built on this one preloads (see the shim's own
+# header for why rocBLAS's fp32 GEMMs need replacing on gfx803). It builds in
+# its own stage from its own directory: rocblas-builder copies all of
+# patches/rocblas/ before it compiles rocBLAS, and MIGraphX and ORT build on
+# top of that, so a shim kept under patches/rocblas/ would rebuild all three
+# on every edit.
+FROM python-base AS sgemm-shim-builder
+COPY patches/sgemm-shim-batched/ /sgemm-shim/
+RUN mkdir -p /out \
+    && hipcc -O2 -fPIC -shared --offload-arch=gfx803 -I/opt/rocm/include \
+        /sgemm-shim/sgemm_shim.cpp \
+        -o /out/libgfx803_sgemm_shim_batched.so \
+        -L/opt/rocm/lib -Wl,-rpath,/opt/rocm/lib -lrocblas -ldl \
+    && for sym in rocblas_sgemm rocblas_gemm_ex rocblas_sgemm_strided_batched rocblas_gemm_strided_batched_ex; do \
+        nm -D --defined-only /out/libgfx803_sgemm_shim_batched.so | grep -qw "$sym" \
+            || { echo "FATAL: shim does not export $sym" >&2; exit 1; }; \
+    done \
+    && echo "OK: libgfx803_sgemm_shim_batched.so exports all four intercepted entry points"
 
 FROM python-base
 
@@ -942,13 +973,6 @@ ENV HSA_OVERRIDE_GFX_VERSION=8.0.3
 ENV ROC_ENABLE_PRE_VEGA=1
 ENV TORCH_BLAS_PREFER_HIPBLASLT=0
 
-# rocBLAS/Tensile's SGEMM kernels are unreliable on gfx803 (see
-# patches/rocblas/sgemm-shim/gfx803_sgemm.h) -- this routes the standard-algo
-# f32 GEMM path through a correctness-verified replacement instead. Set
-# GFX803_SGEMM_SHIM_DISABLE=1 at runtime to fall back to stock rocBLAS for
-# A/B testing.
-ENV LD_PRELOAD=/opt/rocm/lib/libgfx803_sgemm_shim.so
-
 # MIOpen's grouped-conv OOB fix is a source patch (miopen-builder, above,
 # via patches/miopen/conv-direct-fwd-grouped-oob.sh) rather than an env var:
 # an earlier, blunter fix (MIOPEN_DEBUG_CONV_DIRECT_OCL_FWD=0) disabled the
@@ -982,9 +1006,25 @@ RUN "$VIRTUAL_ENV/bin/pip" install --no-cache-dir numpy /tmp/ort/*.whl /tmp/torc
 # satisfy the pin from any index, only by reusing what's already installed.
 # Both env vars are set because pip reads PIP_CONSTRAINT and uv reads
 # UV_CONSTRAINT -- neither honors the other's.
-RUN "$VIRTUAL_ENV/bin/pip" freeze --local | grep -E '^(torch|torchvision|torchaudio|onnxruntime)==' > /opt/pip-constraints.txt \
+RUN "$VIRTUAL_ENV/bin/pip" list --format=freeze | grep -E '^(torch|torchvision|torchaudio|onnxruntime)==' > /opt/pip-constraints.txt \
     && cat /opt/pip-constraints.txt
 ENV PIP_CONSTRAINT=/opt/pip-constraints.txt
 ENV UV_CONSTRAINT=/opt/pip-constraints.txt
 
 ENV PATH="$VIRTUAL_ENV/bin:${PATH}"
+
+# Python-level gfx803 workarounds (PyTorch layer_norm, torchvision nms,
+# accelerate and torch.distributed on a build without distributed support),
+# loaded into every Python process through sitecustomize; PYTHONPATH above puts
+# /opt/rocm/lib on the path. Each module's header says what it works around.
+COPY runtime/python/ /opt/rocm/lib/
+
+# rocBLAS/Tensile's fp32 GEMMs return wrong results on gfx803 (see
+# patches/sgemm-shim-batched/gfx803_sgemm.h); the shim runs the standard-algo
+# fp32 GEMMs, plain and strided-batched, on a replacement kernel instead. Set
+# for the whole image so every service built on it inherits it.
+# GFX803_SGEMM_SHIM_DISABLE=1 at runtime passes every call to stock rocBLAS
+# for A/B testing. Last in the stage, so the build steps above run without it
+# and a shim change rebuilds only these two layers.
+COPY --from=sgemm-shim-builder /out/libgfx803_sgemm_shim_batched.so /opt/rocm/lib/
+ENV LD_PRELOAD=/opt/rocm/lib/libgfx803_sgemm_shim_batched.so
