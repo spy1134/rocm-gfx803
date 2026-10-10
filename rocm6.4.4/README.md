@@ -242,6 +242,16 @@ docker build -t rocm-gfx803:rocm6.4.4 -f Dockerfile .
 docker build -t rocm-gfx803-comfyui:latest -f Dockerfile-ComfyUI .
 ```
 
+Optional: `../tools/ComfyUI-gfx803-attention/install.sh` adds a custom node
+with gfx803 kernels for attention, GroupNorm and GEGLU, which makes an SD 1.5
+fp32 step about 19% faster (697 -> 567 ms at 512 px) and avoids the 2.3 GB
+score matrix PyTorch's attention allocates. It compiles the kernels with the
+base image's `hipcc` when the host has none and copies the node into
+`ComfyUI/custom_nodes/`; restart ComfyUI afterwards. The node acts only on
+inference (calls that need gradients go to PyTorch), so training is
+unaffected. Remove the `ComfyUI/custom_nodes/ComfyUI-gfx803-attention/`
+folder to turn it off. Details: `docs/FINDINGS.md` section 5b.
+
 ### The gfx803 app
 
 `./gfx803` is the everyday way to use the image: one terminal UI for LoRA

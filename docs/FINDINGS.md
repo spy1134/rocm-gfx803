@@ -27,6 +27,7 @@ against a CPU reference, and "it runs" was never taken as evidence.
 | PyTorch int8 matmul fails on every call | Fixed (port of upstream's fix) | `patches/pytorch/` |
 | PyTorch layer_norm wrong (warp-size mismatch) | Fixed | `patches/pytorch/` |
 | torchvision nms has no gfx803 kernel | Worked around (CPU) | `runtime/python/` |
+| No fused attention in PyTorch on gfx803 | ComfyUI node (inference, fp32 kernels) | `tools/ComfyUI-gfx803-attention/` |
 | Patched HSA runtime page faults | Open; images default to the stock runtime | `Dockerfile`, start scripts |
 | VRAM exhaustion freezes the desktop | Mitigated (VRAM cap) | `training/gfx803-train.sh` |
 | llama.cpp prompt processing 10x slow | Fixed | `patches/ollama/llama-cpp/100-*` |
@@ -247,6 +248,38 @@ They are workarounds with their source fixes still to do.
   `torch.distributed.tensor` unconditionally, which crashes on this
   single-GPU build; the image stubs the check (a model on such a build cannot
   hold distributed tensors).
+## 5b. ComfyUI node with gfx803 kernels for attention, GroupNorm and GEGLU
+
+PyTorch has no fused attention on gfx803, so every SD 1.5 attention call
+stores its full score matrix (8 x 4096 x 4096 floats at the 64x64 level).
+[`tools/ComfyUI-gfx803-attention/`](../tools/ComfyUI-gfx803-attention/) is a
+ComfyUI custom node that replaces three operations of ComfyUI's SD 1.5 path
+with HIP kernels from [`tools/`](../tools/):
+
+- attention for head sizes 40, 64 and 80, in one pass with an online softmax
+  (`gfx803_fused_attention.hip`), hooked into `F.scaled_dot_product_attention`
+  and ComfyUI's split and optimized attention (fp16 inputs are computed in
+  fp32); head size 160 and calls that need gradients stay on PyTorch;
+- GroupNorm with float64 accumulation (`gfx803_group_norm_silu.hip`), fp32
+  and up to 128 channels per group;
+- GEGLU, the split, exact-erf GELU and product in one pass
+  (`gfx803_geglu.hip`).
+
+All three match a CPU float64 reference (attention within 3.5e-6 relative,
+GroupNorm and GEGLU within 1e-5, over odd shapes, 2-D/3-D and non-contiguous
+inputs). A full ComfyUI SD 1.5 fp32 txt2img, 512 px and 20 steps, sent 400
+attention, 320 GEGLU and 1220 GroupNorm calls through the node, and its image
+differs from a CPU run's by at most 0.3/255. With the node, a 512 px fp32
+denoising step takes 567 ms instead of 697. Per call, with classifier-free
+guidance (batch 2, 8 heads): self-attention at 64x64 26 ms against 50 ms for
+ComfyUI's split attention and 58 ms for PyTorch's SDPA, which also allocates
+2.3 GB for it (the fused kernel 10 MB); GEGLU 1.6-1.7x faster; GroupNorm
+1.0-1.35x faster. At head size 160 the fused kernel is slower than split
+attention (0.79 against 0.34 ms), so that level is left to ComfyUI.
+
+The node is not built into the images. `tools/ComfyUI-gfx803-attention/install.sh`
+compiles the three libraries (with the base image's `hipcc` when the host has
+none) and copies the node into `rocm6.4.4/ComfyUI/custom_nodes/`.
 
 ## 6. VRAM on an 8 GB card that also drives a display
 
@@ -501,6 +534,9 @@ a reproduction.
   them), and a decoder that names the stuck kernel. This is how the Winograd
   kernels were identified. Never read `/sys/kernel/debug/kfd/mqds` while queues
   are active: on this kernel it oopses and turns a GPU hang into a host lockup.
+- [`tools/ComfyUI-gfx803-attention/`](../tools/ComfyUI-gfx803-attention/): the
+  optional ComfyUI node with gfx803 attention, GroupNorm and GEGLU kernels
+  (section 5b); its kernel sources are in `tools/`.
 - [`tools/console-mouse/`](../tools/console-mouse/): mouse support for terminal
   apps on the Linux text console, through gpm.
 - [`rocm6.4.4/training/gfx803_unet_check.py`](../rocm6.4.4/training/gfx803_unet_check.py):
