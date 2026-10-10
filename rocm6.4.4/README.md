@@ -504,6 +504,15 @@ itself, on every GPU: a tool that takes no arguments is re-encoded with
 `"properties": null`, which llama.cpp's server rejects (HTTP 400), so clients
 that declare such tools (Qwen Code does) fail on their first request. The
 patch encodes the empty schema as `{"type":"object","properties":{}}`.
+`patches/ollama/llama-cpp-server/090-mmproj-fit-target-device.patch` fixes
+llama.cpp's server, on every GPU. When it fits a model with a multimodal
+projector, it reserves the projector's memory under the wrong device index
+(the backend registry's, which also holds the CPU, instead of the model's
+device list). With the projector on the GPU nothing is reserved for it, so the
+model fills the GPU and encoding an image then needs memory that is not
+there; with the projector on the CPU, about 1.1 GB of VRAM is held back for
+nothing. llama-server is built in Ollama's CPU stage, so `Dockerfile-Ollama`
+copies this folder in before that stage and the HIP patches after it.
 
 The three llama.cpp patches are gfx803-only by construction: each takes
 effect only for `GGML_CUDA_CC_GCN4` and is sized from gfx803 register

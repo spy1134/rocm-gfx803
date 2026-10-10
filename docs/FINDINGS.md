@@ -34,6 +34,7 @@ against a CPU reference, and "it runs" was never taken as evidence.
 | llama.cpp q8_0 generation slows with context | Fixed | `patches/ollama/llama-cpp/102-*` |
 | llama.cpp K-quant generation below memory bandwidth | Fixed | `patches/ollama/llama-cpp/103-*` |
 | Ollama rejects argument-less tools | Fixed (all GPUs) | `patches/ollama/ollama/` |
+| llama.cpp reserves a vision projector's memory on the wrong device | Fixed (all GPUs) | `patches/ollama/llama-cpp-server/` |
 
 Paths in the table are relative to `rocm6.4.4/`.
 
@@ -364,10 +365,21 @@ Upstream llama.cpp has no equivalent of the third fix; issue
 [#27796](https://github.com/ggml-org/llama.cpp/issues/27796) reports the same
 quantized-cache slowdown on RDNA4 and was closed as expected behavior.
 
-Separately, Ollama itself (any GPU) re-encodes a tool with no arguments as
-`"properties": null`, which llama.cpp's server rejects with HTTP 400. Coding
-agents that declare such tools, Qwen Code among them, fail on their first
-request.
+Three more bugs are not specific to gfx803 but matter most on a small card
+that also drives the display:
+
+- **Ollama re-encodes a tool with no arguments** as `"properties": null`, which
+  llama.cpp's server rejects with HTTP 400. Coding agents that declare such
+  tools, Qwen Code among them, fail on their first request.
+- **llama.cpp's server misplaces a vision projector's memory reservation.**
+  When fitting a model it adds the projector's worst-case memory under the
+  backend registry's device index rather than the model's. Ollama loads the
+  CPU backend first, so on a one-GPU machine the reservation is inverted: a
+  projector on the GPU gets none (the model fills the card and image encoding
+  then needs memory that is not free), and a projector on the CPU holds back
+  about 1.1 GB of VRAM for nothing. With Qwen3.5 9B on the RX 590, a 1080p
+  image took the card to 8074 of 8192 MiB; the compositor could no longer pin
+  its framebuffers and applications lost their GPU contexts.
 
 Each patch header in `rocm6.4.4/patches/ollama/` has the full measurements and
 a reproduction.

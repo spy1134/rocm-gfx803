@@ -41,8 +41,13 @@ RUN curl -fsSL "https://go.dev/dl/go$(awk '/^go / { print $2 }' go.mod).linux-am
 ENV PATH=/usr/local/go/bin:$PATH
 
 # The CPU build provides llama-server itself and the CPU backends; the ROCm
-# build adds only the HIP backend module next to them.
+# build adds only the HIP backend module next to them. llama-server's own fixes
+# are therefore copied in before the CPU build, and the HIP ones after it.
+COPY patches/ollama/llama-cpp-server/*.patch llama/compat/gfx803-server/
 RUN cmake -S llama/server --preset cpu \
+    && { grep -q fit_devs \
+             build/llama-server-cpu/_deps/llama_cpp-src/tools/server/server-context.cpp \
+         || { echo "090-mmproj-fit-target-device.patch was not applied" >&2; exit 1; }; } \
     && cmake --build build/llama-server-cpu --parallel "$(nproc)" \
     && cmake --install build/llama-server-cpu --component llama-server --strip
 

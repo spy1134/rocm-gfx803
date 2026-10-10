@@ -1,0 +1,89 @@
+llama.cpp (as fetched by Ollama v0.35.1, llama.cpp b11232): reserve a
+multimodal projector's memory on the device it runs on when fitting the model.
+
+WHY
+---
+When llama-server fits a model to free VRAM (the default), it adds the
+projector's worst-case memory to the free-memory margin it keeps per device.
+It looks the projector's device up in the ggml backend registry and uses that
+registry index as the index into fit_params_target. That vector is indexed by
+the model's device list, which is a different list: the registry also holds
+the CPU, and Ollama loads its backends dynamically with the CPU first. On a
+one-GPU machine the result is inverted:
+
+- projector on the GPU: its memory goes to index 1, which is no device, so
+  nothing is reserved for it and the fit fills the GPU as if the projector
+  were not there. Encoding an image then needs memory that is not free.
+- projector on the CPU (--no-mmproj-offload): its host memory goes to index
+  0, the GPU, so about 1.1 GB of VRAM is held back for nothing.
+
+Seen with Qwen3.5 9B and its 0.9 GB vision projector on an 8 GB RX 590: with
+the projector on the GPU the fit put all layers on the GPU, and a 1080p image
+then took the card to 8074 of 8192 MiB. On a card that also drives the
+desktop, the compositor failed to pin its framebuffers and applications lost
+their GPU contexts. Nothing here is gfx803-specific.
+
+WHAT
+----
+The projector's per-device memory is matched against the model's device list:
+--device when given, otherwise the order the model uses (RPC servers, then
+discrete GPUs, then integrated GPUs only when there is no discrete one).
+Memory on a device outside that list, such as the CPU, has no fit target and
+is not added. Same model and 8k context on the RX 590: projector on the GPU,
+the margin becomes 1024 + 1149 MiB and 30 of 33 layers are offloaded;
+projector on the CPU, the margin stays 1024 MiB and all 33 are offloaded.
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 611e82a..37fd0f1 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1083,16 +1083,42 @@ private:
+                 }
+                 SRV_TRC("[mtmd] estimated worst-case memory usage of mmproj is %.2f MiB (took %.2f ms)\n", total / (1024.0 * 1024.0), t_elapsed / 1000.0);
+                 GGML_ASSERT(!params_base.fit_params_target.empty());
+-                for (auto & [dev, size] : mmproj_mem) {
++                // fit_params_target is indexed by the model's device list, not by the backend
++                // registry: the registry also holds the CPU (first, when backends are loaded
++                // dynamically), and the model puts RPC servers before GPUs and uses integrated
++                // GPUs only when there is no discrete one. Host memory has no fit target.
++                std::vector<ggml_backend_dev_t> fit_devs = params_base.devices;
++                if (fit_devs.empty()) {
++                    std::vector<ggml_backend_dev_t> rpc, gpus, igpus;
+                     for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+-                        if (ggml_backend_dev_get(i) == dev) {
+-                            if (i < params_base.fit_params_target.size()) {
+-                                SRV_DBG("[mtmd] adding %.2f MiB to fit_params_target for device %s\n", size / (1024.0 * 1024.0), ggml_backend_dev_name(dev));
+-                                params_base.fit_params_target[i] += size;
+-                            }
+-                            break;
++                        ggml_backend_dev_t d = ggml_backend_dev_get(i);
++                        switch (ggml_backend_dev_type(d)) {
++                            case GGML_BACKEND_DEVICE_TYPE_GPU:
++                                if (std::string(ggml_backend_reg_name(ggml_backend_dev_backend_reg(d))) == "RPC") {
++                                    rpc.push_back(d);
++                                } else {
++                                    gpus.push_back(d);
++                                }
++                                break;
++                            case GGML_BACKEND_DEVICE_TYPE_IGPU:
++                                igpus.push_back(d);
++                                break;
++                            default:
++                                break;
+                         }
+                     }
++                    fit_devs = rpc;
++                    fit_devs.insert(fit_devs.end(), gpus.begin(), gpus.end());
++                    if (gpus.empty()) {
++                        fit_devs.insert(fit_devs.end(), igpus.begin(), igpus.end());
++                    }
++                }
++                for (auto & [dev, size] : mmproj_mem) {
++                    const size_t i = std::find(fit_devs.begin(), fit_devs.end(), dev) - fit_devs.begin();
++                    if (i < fit_devs.size() && i < params_base.fit_params_target.size()) {
++                        SRV_DBG("[mtmd] adding %.2f MiB to fit_params_target for device %s\n", size / (1024.0 * 1024.0), ggml_backend_dev_name(dev));
++                        params_base.fit_params_target[i] += size;
++                    }
+                 }
+             } else {
+                 SRV_ERR("%s", "[mtmd] failed to get memory usage of mmproj\n");
