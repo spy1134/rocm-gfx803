@@ -7,6 +7,9 @@
 # RUN_AS_ROOT=1 runs the container as root instead of the invoking user.
 # GFX803_COMFYUI_LISTEN=ADDRESS makes ComfyUI reachable beyond this machine
 # (0.0.0.0 for every interface); by default it accepts local connections only.
+# GFX803_RUNTIME=patched loads the patched HSA runtime instead of AMD's stock
+# one, which the images preload by default; the patched one page-faults in some
+# workloads that free and reallocate GPU memory, so it is for comparison only.
 # GFX803_DEBUG=1 serializes kernel launches so a GPU fault points at the kernel
 # that caused it; it slows everything down and can hide timing-dependent bugs,
 # so it is for attributing a fault, not for normal use.
@@ -29,6 +32,11 @@ gfx803_gpu_args() {
   if [ -e /etc/localtime ]; then
     GFX803_ARGS+=(-v "$(readlink -f /etc/localtime):/etc/host-localtime:ro" -e TZ=:/etc/host-localtime)
   fi
+  case "${GFX803_RUNTIME:-stock}" in
+    stock) ;;
+    patched) GFX803_ARGS+=(-e LD_PRELOAD=/opt/rocm/lib/libgfx803_sgemm_shim_batched.so) ;;
+    *) echo "GFX803_RUNTIME must be stock or patched" >&2; return 1 ;;
+  esac
   if [ "${GFX803_DEBUG:-0}" = "1" ]; then
     GFX803_ARGS+=(-e AMD_SERIALIZE_KERNEL=3 -e HIP_LAUNCH_BLOCKING=1)
   fi
@@ -36,7 +44,7 @@ gfx803_gpu_args() {
 
 gfx803_container_args() {
   local dir=$1
-  gfx803_gpu_args
+  gfx803_gpu_args || return 1
 
   # Created here first: a bind-mount source Docker has to create itself ends
   # up owned by root.

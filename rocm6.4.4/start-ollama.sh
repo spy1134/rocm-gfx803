@@ -10,10 +10,10 @@
 #
 # OLLAMA_DATA   models and Ollama's key (default: ollama/ next to this script)
 # OLLAMA_PORT   host port (default 11434)
-# GFX803_RUNTIME=stock  load AMD's unpatched HSA runtime (from
-#               workspace/stock-hsa/extracted) instead of the base image's
-#               patched one, whose va-reuse-defer change faults ("Page not
-#               present") in some workloads that free and reallocate GPU memory
+# GFX803_RUNTIME=patched  load the base image's patched HSA runtime instead of
+#               AMD's stock one (the default); its va-reuse-defer change faults
+#               ("Page not present") in some workloads that free and reallocate
+#               GPU memory, llama-server among them, so it is for comparison only
 # OLLAMA_KV_CACHE_TYPE  default q8_0; f16 for full precision
 # OLLAMA_FLASH_ATTENTION, OLLAMA_CONTEXT_LENGTH, OLLAMA_KEEP_ALIVE
 #               passed to the server when set
@@ -55,14 +55,6 @@ if ! running; then
   # Created here first: a bind-mount source Docker has to create itself ends
   # up owned by root.
   mkdir -p "$DATA"
-  if [ "${GFX803_RUNTIME:-patched}" = stock ]; then
-    hsa=$(find "$SCRIPT_DIR/workspace/stock-hsa/extracted" -name 'libhsa-runtime64.so.1.*' -type f 2>/dev/null | head -n 1)
-    [ -f "$hsa" ] || die "stock libhsa-runtime64 not found under workspace/stock-hsa/extracted"
-    # Preloaded ahead of the shim: a preloaded library wins over the copy in
-    # /opt/rocm that libamdhip64 would otherwise load by name.
-    GFX803_ARGS+=(-v "$hsa:/opt/stock-hsa/libhsa-runtime64.so.1:ro"
-                  -e LD_PRELOAD=/opt/stock-hsa/libhsa-runtime64.so.1:/opt/rocm/lib/libgfx803_sgemm_shim_batched.so)
-  fi
   export OLLAMA_KV_CACHE_TYPE=${OLLAMA_KV_CACHE_TYPE:-q8_0}
   for v in OLLAMA_KV_CACHE_TYPE OLLAMA_FLASH_ATTENTION OLLAMA_CONTEXT_LENGTH OLLAMA_KEEP_ALIVE; do
     [ -n "${!v:-}" ] && GFX803_ARGS+=(-e "$v")

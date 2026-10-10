@@ -456,9 +456,10 @@ setting; the OpenAI-compatible API cannot set a context length per request, so
 a model meant for long contexts needs a Modelfile with `PARAMETER num_ctx`
 (examples in `ollama/import/`).
 
-`GFX803_RUNTIME=stock ./start-ollama.sh` loads AMD's unpatched HSA runtime
-instead of the base image's patched one, like `gfx803-train --runtime stock`.
-All measurements below were taken on the stock runtime.
+The image runs AMD's stock HSA runtime; `GFX803_RUNTIME=patched
+./start-ollama.sh` loads the base image's patched one instead, which crashes
+llama-server with GPU page faults on long prompts. All measurements below were
+taken on the stock runtime.
 
 ### Patches
 
@@ -528,9 +529,10 @@ Qwen3 8B and Qwen2.5-Coder 7B.
   user pages: -1` kernel messages. The model loads and runs correctly; the
   cause is not yet investigated. `llama-bench` on the same image does not
   trigger them.
-- Ollama is tested on the stock HSA runtime. On the base image's patched
-  runtime it has had one short run (same output, no GPU faults). A long
-  serving run under the hang watcher has not been done yet.
+- Ollama is tested on the stock HSA runtime, the image's default. On the
+  patched runtime (`GFX803_RUNTIME=patched`) llama-server crashed with GPU page
+  faults during a 17k-token prompt, and that runtime reports about 860 MiB less
+  free VRAM. A long serving run under the hang watcher has not been done yet.
 - With Qwen Code, Qwen2.5-Coder 7B answers without calling tools, and Qwen3 8B
   calls them but misuses Qwen Code's tool-search bridge: it passes
   `read_file`'s arguments straight to `tool_call` without naming the tool.

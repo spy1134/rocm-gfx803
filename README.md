@@ -88,9 +88,10 @@ the details of every problem, its cause, the fix, and how to check it yourself.
 
 ## Known issues
 
-- ComfyUI has occasionally hit a GPU fault on the second image after switching models. The cause
-  is still being tracked down; the leading suspect is the GPU runtime library the base image
-  ships, and the start scripts can use AMD's stock one instead (`GFX803_RUNTIME=stock`).
+- The patched GPU runtime library from upstream page-faults on this card in some workloads (it
+  crashed Ollama mid-prompt), so the images use AMD's stock one; `GFX803_RUNTIME=patched` selects
+  the patched one for comparison. Why it faults is not yet known. ComfyUI's occasional GPU fault
+  on the second image after switching models may be the same bug.
 - Mining-edition cards often ship with memory clocked above its rating, which causes random GPU
   faults and freezes. If you see those, check your card's memory clock first (see "Host VBIOS
   setting" in [`README-rocm10.md`](README-rocm10.md)).

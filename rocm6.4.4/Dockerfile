@@ -1032,5 +1032,16 @@ COPY runtime/python/ /opt/rocm/lib/
 # GFX803_SGEMM_SHIM_DISABLE=1 at runtime passes every call to stock rocBLAS
 # for A/B testing. Last in the stage, so the build steps above run without it
 # and a shim change rebuilds only these two layers.
+#
+# AMD's stock HSA runtime (libhsa-runtime64.so.1.15.60404, still present from
+# the base image beside the patched .so.1.15.0) is preloaded ahead of the
+# patched one: on gfx803 the patched runtime's va-reuse-defer change makes
+# GPU writes fault ("Page not present", writes from TC) in workloads that free
+# and reallocate memory -- a synthetic GEGLU op test, wide GEMMs followed by a
+# large transposed copy, and a llama-server crash mid-prompt -- where the stock
+# runtime runs clean. The trade is the ORT ReduceSum race the patch exists for
+# (see the rocr-builder stage), which PyTorch, sd-scripts and llama.cpp do not
+# go through. The launchers' GFX803_RUNTIME=patched sets LD_PRELOAD to the shim
+# alone, so the patched runtime loads by its soname.
 COPY --from=sgemm-shim-builder /out/libgfx803_sgemm_shim_batched.so /opt/rocm/lib/
-ENV LD_PRELOAD=/opt/rocm/lib/libgfx803_sgemm_shim_batched.so
+ENV LD_PRELOAD=/opt/rocm/lib/libhsa-runtime64.so.1.15.60404:/opt/rocm/lib/libgfx803_sgemm_shim_batched.so

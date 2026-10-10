@@ -46,7 +46,7 @@ RUNS_DIR=$WORKSPACE/runs
 OUT_ROOT=$WORKSPACE/output
 NEW_SHIM=${NEW_SHIM:-/opt/rocm/lib/libgfx803_sgemm_shim_batched.so}
 ORIG_SHIM=${ORIG_SHIM:-/opt/rocm/lib/libgfx803_sgemm_shim.so}
-STOCK_HSA_DIR=${STOCK_HSA_DIR:-$WORKSPACE/stock-hsa/extracted}
+STOCK_HSA=${STOCK_HSA:-/opt/rocm/lib/libhsa-runtime64.so.1.15.60404}
 VRAM_WARN_MIB=${VRAM_WARN_MIB:-1024}
 
 # Training parameters (saved per run; a resumed run reuses its own values).
@@ -71,7 +71,7 @@ TE_LR=5e-5
 EXTRA_ARGS=()
 
 # Diagnostics (taken from the command line every time, also when resuming).
-RUNTIME=patched
+RUNTIME=stock
 SHIM=new
 NO_BATCHED=0
 DEBUG_KERNELS=0
@@ -137,10 +137,11 @@ Training
       --fresh-latents      delete cached latents and re-encode them
 
 GPU stack and diagnostics
-      --runtime patched|stock
-                           patched: image's libhsa-runtime64 +
-                           HSA_DISABLE_FRAGMENT_ALLOCATOR=0 [default]
-                           stock: AMD's library from $STOCK_HSA_DIR
+      --runtime stock|patched
+                           stock: AMD's libhsa-runtime64 ($STOCK_HSA) [default]
+                           patched: the image's patched one +
+                           HSA_DISABLE_FRAGMENT_ALLOCATOR=0; page-faults in
+                           some workloads, for comparison only
       --shim new|original|none|PATH
                            new: the image's batched shim (correct attention) [default]
                            original: the older shim (wrong attention gradients)
@@ -494,11 +495,9 @@ setup_gpu_env() {  # fills GPU_ENV; applied only to the GPU commands, not this s
     case "$RUNTIME" in
         patched) GPU_ENV+=(HSA_DISABLE_FRAGMENT_ALLOCATOR=0) ;;
         stock)
-            local hsa
-            hsa=$(find "$STOCK_HSA_DIR" -name 'libhsa-runtime64.so.1.*' -type f 2>/dev/null | head -n 1)
-            [ -f "$hsa" ] || die "stock libhsa-runtime64 not found under $STOCK_HSA_DIR"
-            preload+=("$hsa") ;;
-        *) die "--runtime must be patched or stock" ;;
+            [ -f "$STOCK_HSA" ] || die "stock libhsa-runtime64 not found: $STOCK_HSA"
+            preload+=("$STOCK_HSA") ;;
+        *) die "--runtime must be stock or patched" ;;
     esac
     case "$SHIM" in
         new) shim_path=$NEW_SHIM ;;

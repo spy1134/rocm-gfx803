@@ -26,7 +26,7 @@ against a CPU reference, and "it runs" was never taken as evidence.
 | PyTorch int8 matmul fails on every call | Fixed (port of upstream's fix) | `patches/pytorch/` |
 | PyTorch layer_norm wrong | Worked around | `runtime/python/` |
 | torchvision nms has no gfx803 kernel | Worked around (CPU) | `runtime/python/` |
-| Patched HSA runtime page faults | Open; stock runtime selectable | start scripts |
+| Patched HSA runtime page faults | Open; images default to the stock runtime | `Dockerfile`, start scripts |
 | VRAM exhaustion freezes the desktop | Mitigated (VRAM cap) | `training/gfx803-train.sh` |
 | llama.cpp prompt processing 10x slow | Fixed | `patches/ollama/llama-cpp/100-*` |
 | llama.cpp long-context prompts slow | Fixed | `patches/ollama/llama-cpp/101-*` |
@@ -166,12 +166,20 @@ particular patterns: a synthetic GEGLU op test, and wide GEMMs followed by a
 storm of such faults in several processes overflowed the interrupt ring and
 froze the desktop until a reboot.
 
-`start-comfyui.sh`, `start-ollama.sh` and `gfx803-train` can preload the stock
-runtime instead (`GFX803_RUNTIME=stock`, `--runtime stock`). Ollama is
-validated on stock; training has run cleanly on both. ComfyUI has faulted
-twice on the second generation after a model reload, which fits the patched
-runtime's pattern but is not proven. Which runtime the image should default
-to is still open.
+Ollama's llama-server crashed on the same faults mid-prompt (a 17k-token Qwen
+Code request on Qwen3.5 9B: ten `VM fault ... write from 'TC*'` lines, then an
+interrupt ring overflow). ComfyUI has faulted twice on the second generation
+after a model reload, which fits the same pattern but is not proven.
+
+The images therefore preload AMD's stock runtime, which the ROCm base image
+still carries as `libhsa-runtime64.so.1.15.60404` beside the patched
+`.so.1.15.0`. Ollama, SDXL and Qwen-Image generation, fp16 and training are all
+validated on it. `GFX803_RUNTIME=patched` (start scripts, the app's manager)
+and `gfx803-train --runtime patched` load the patched one for comparison. The
+cost is the bug the patch was written for: MIOpen's CK reduction kernels can
+read stale data when freed addresses are reused at once (ONNX Runtime's
+`ReduceSum` test), a path PyTorch, sd-scripts and llama.cpp do not take. What
+in the va-reuse-defer change faults on gfx803 is not investigated yet.
 
 ## 5. PyTorch fixes and workarounds in the base image
 
@@ -325,9 +333,14 @@ a reproduction.
 - Why the binary Winograd kernels fail on gfx803 (they are disabled, not
   fixed). Candidates: their persistent launch, or wrong cache/release fields in
   their converted code-object metadata on gfx8.
-- Whether the patched HSA runtime causes ComfyUI's faults after a model reload.
 - PyTorch's layer_norm and torchvision's nms need source fixes in the PyTorch
   build.
+- Why the patched HSA runtime's va-reuse-defer change page-faults on gfx803
+  (GEGLU op test, wide GEMMs then a transposed copy, llama-server mid-prompt),
+  and whether it causes ComfyUI's faults after a model reload. The images run
+  AMD's stock runtime until this is understood; the reproducers are
+  `gfx803_unet_check.py --only GEGLU` and `workspace/scratch/wide_test.py`, on
+  `GFX803_RUNTIME=patched` with the desktop stopped (a fault storm can freeze it).
 - fp16 over full-length training runs and in ComfyUI (only short runs so far).
 - The `init_user_pages: Failed to get user pages: -1` kernel messages on every
   Ollama model load.
