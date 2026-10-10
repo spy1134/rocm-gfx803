@@ -42,6 +42,26 @@ against a CPU reference, and "it runs" was never taken as evidence.
 
 Paths in the table are relative to `rocm6.4.4/`.
 
+**Speed, start to finish** (RX 590 8 GB; the front page's table):
+
+- **SD 1.5 image, 20 denoising steps at 512 px**, ComfyUI fp32,
+  `--use-split-cross-attention`, classifier-free guidance, timed on a second
+  run in the same process: 1758 ms per step on an image from just after the
+  first shim speed fix (batched GEMMs covered, the coalesced 16x16 kernel,
+  binary Winograd disabled, convolutions on MIOpen's GEMM path), 694 ms now,
+  563 ms with the ComfyUI node (section 5b): 35 s -> 13.9 s / 11.3 s.
+- **SD 1.5 LoRA training step**, 512 px, 4 accumulated images: 12.1 s in the
+  first setup with correct results (extended shim, binary Winograd disabled),
+  about 4.0 s now (section 1). The original stack ran about 8 s per step with
+  wrong attention gradients, GPU hangs and corrupted latents.
+- **Ollama / llama.cpp**, Qwen3 8B Q4_K_M, q8_0 KV cache, flash attention,
+  `llama-bench` on llama.cpp b11232 as Ollama 0.35.1 fetches it, unmodified
+  against patches 100-105: prompt (512 tokens) 14.0 -> 158.6 tokens/s; a
+  12,288-token prompt 11.4 -> 133.2 tokens/s (1074 s -> 92 s); generation
+  (128 tokens, short context) 27.3 -> 30.5 tokens/s. Qwen2.5-Coder 7B Q4_K_M:
+  15.0 -> 163.9 and 29.7 -> 33.2. Generation 8k tokens deep: 20.9 -> 26.5
+  tokens/s (Qwen3 8B, before patch 104).
+
 ## 1. fp32 GEMM: the SGEMM shim and its gaps
 
 **Background.** rocBLAS's Tensile fp32 GEMM kernels return wrong results on

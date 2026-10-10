@@ -5,7 +5,8 @@
 Requires Linux, Docker, and a Polaris (gfx803) GPU such as the RX 470-590.
 
 ```
-cd rocm6.4.4
+git clone https://github.com/spy1134/rocm-gfx803.git
+cd rocm-gfx803/rocm6.4.4
 ./setup.sh                        # verify the system and build the images (several hours on first run)
 ./gfx803                          # launch the app: LoRA training, ComfyUI, dataset tools, GPU monitor
 ./start-ollama.sh run qwen3:8b    # chat with a local language model
@@ -77,6 +78,29 @@ options, ComfyUI and Ollama.
   8 GB card possible (tested in short runs; not yet built into the app).
 - Tested on one RX 590. Other Polaris cards use the same chip design and should behave the same,
   but their clocks, memory and firmware differ.
+
+## How fast is it?
+
+Measured on an RX 590 8 GB. For images and training, "before" is an early setup that already
+computed correct results (the original stack was faster in places, but its results were wrong);
+for Ollama, it is the same llama.cpp version without this project's changes.
+
+| Task | Before | Now | |
+| --- | --- | --- | --- |
+| Generate an SD 1.5 image (20 steps at 512 px) | 35 s | 11 s | 3.1x |
+| One SD 1.5 LoRA training step (4 images, 512 px) | 12.1 s | 4.0 s | 3x |
+| Ollama reads a prompt (Qwen3 8B) | 14 tokens/s | 159 tokens/s | 11x |
+| A coding agent's first request (a 12,000-token prompt) | 18 min | 92 s | 11.6x |
+| Ollama writes text (Qwen3 8B) | 27 tokens/s | 30.5 tokens/s | 1.1x |
+
+Image generation is ComfyUI in fp32 with the optional gfx803 node (13.9 s without it). Writing
+text is limited mostly by how fast the card can read the model's weights, so it had the least
+room to grow; its gain increases with the length of the conversation (20.9 to 26.5 tokens/s with
+8,000 tokens of context). Some changes don't show up as speed at all: half-precision training
+uses 1.7 GB less VRAM, which makes SDXL LoRA training fit on 8 GB, and an 8-bit KV cache keeps a
+16k-context Qwen3 8B entirely on the card. [`docs/FINDINGS.md`](docs/FINDINGS.md) has the
+measurements behind each number, and [`docs/OPTIMIZATION_TARGETS.md`](docs/OPTIMIZATION_TARGETS.md)
+what could still get faster.
 
 ## What was broken, and is fixed here
 
