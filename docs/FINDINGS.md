@@ -395,6 +395,42 @@ this card, so llama.cpp's 1 GiB fitting margin is mostly taken by the desktop
 before a model loads. `start-ollama.sh` sets the margin from amdgpu's in-use
 VRAM counter plus 512 MiB of headroom.
 
+Model choice matters as much as kernels on 8 GB. A hybrid model such as
+Qwen3.5 9B (one full-attention layer in four) runs a 64k context fully on the
+GPU beside a desktop; and some uploads keep the output tensor in bf16, which
+for a 248k-token vocabulary is 2 GB of a 6.4 GB model, read for every token.
+Converting only that tensor to q8_0
+([`rocm6.4.4/ollama-tools/requant-output-head.py`](../rocm6.4.4/ollama-tools/requant-output-head.py))
+freed 0.95 GB and made generation 11% faster, with the same top token as the
+original 98% of the time (KL divergence 0.0014).
+
+A mixture-of-experts model goes further on the same card. Qwen3.6 35B-A3B
+(Q4_K_M, 22 GB) activates about 3B parameters per token: llama.cpp keeps its
+attention, shared weights and a q8_0 KV cache for the full 262k context on
+the GPU and most routed experts in system RAM. On a 5.5k-token prompt it
+reads 189 tok/s and generates 22 tok/s with DDR4-2800 (158 and 19 at 2133).
+What decided those numbers:
+
+- **The bundled MTP draft head costs speed.** Checking a draft runs the
+  experts of every drafted token, and those are read from system RAM, so
+  generation fell from 19.3 to 18.4 tok/s with it on; its f16 draft cache
+  (512 MiB at this context) also took VRAM from the experts.
+- **Batch size trades prompt speed for expert VRAM.** Prompt processing
+  copies the RAM-resident experts to the card once per batch, so 1024-token
+  batches read prompts 31% faster than 512 at a 1% decode cost; at 2048 the
+  compute buffer pushes experts off the card and decode drops to 12 tok/s.
+- **Anonymous memory beats the page cache for the experts.** Loading without
+  mmap made prompt reading 10% faster with generation unchanged.
+- **Threads: one per core.** 16 threads on the 8-core CPU dropped decode to
+  2.7 tok/s.
+
+Generation moves only about 12 GB/s from RAM, well under the memory's
+bandwidth, so the limit is the CPU's expert math and the roughly 80 GPU/CPU
+handoffs per token. Against the CPU backend the model's logits differ by a
+KL divergence of 0.014 (same top token 93.9%), in line with dense models
+that are known to be right on this stack (Qwen3 8B 0.010, Qwen3.5 9B 0.007).
+It is the first local model here that completes Qwen Code's tool-calling
+tasks.
 
 Each patch header in `rocm6.4.4/patches/ollama/` has the full measurements and
 a reproduction.
@@ -419,6 +455,14 @@ a reproduction.
 - fp16 over full-length training runs and in ComfyUI (only short runs so far).
 - The `init_user_pages: Failed to get user pages: -1` kernel messages on every
   Ollama model load.
+- Why images are slow to read: a 1080p image (about 2000 tokens) takes 56 s
+  with Qwen3.5 9B, against about 15 s for 2000 text tokens.
+- llama.cpp's triangular solve (`SOLVE_TRI`) is wrong on the GPU for
+  matrices larger than 64x64 (6-7 of 17 test cases depending on the random
+  inputs, errors up to 20). The
+  64x64-and-smaller kernel passes, and the delta-net layers of Qwen3.5/3.6
+  solve 64x64 chunks, so no current model here hits it. Not yet compared
+  with another architecture.
 
 ## Tools
 

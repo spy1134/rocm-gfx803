@@ -454,7 +454,7 @@ a context fits next to the model at all: Qwen3 8B with a 16k context needs
 f16 from about 4k tokens of context on. Ollama's KV cache type is a server
 setting; the OpenAI-compatible API cannot set a context length per request, so
 a model meant for long contexts needs a Modelfile with `PARAMETER num_ctx`
-(examples in `ollama/import/`).
+(see [Fitting models into 8 GB](#fitting-models-into-8-gb)).
 
 A loaded model stays loaded until you unload it (`OLLAMA_KEEP_ALIVE=-1`;
 `./start-ollama.sh stop MODEL` or the app's Unload frees it). Ollama's own
@@ -555,6 +555,66 @@ kernel 102 replaces on gfx803, unchanged; llama.cpp issue
 quantized-KV generation slowdown with context on RDNA4 and was closed as
 expected behavior.
 
+### Fitting models into 8 GB
+
+A model's context length is part of its Ollama entry. To make a long-context
+entry from a model you already have, write a Modelfile and create it inside the
+container (models live in `ollama/`, mounted at `/home/gfx803/.ollama`):
+
+```
+# ollama/import/Modelfile-mymodel-32k
+FROM qwen3:8b
+PARAMETER num_ctx 32768
+```
+```
+./start-ollama.sh create mymodel:32k -f /home/gfx803/.ollama/import/Modelfile-mymodel-32k
+```
+
+A new entry shares the original's weight files, so it costs no disk space.
+Load it once and check `./start-ollama.sh ps`: the processor column should
+read 100% GPU. Clients such as SillyTavern send their own context size with
+each request, which replaces the entry's; set the client to the same value.
+
+What decides how much context fits, measured on an RX 590 with a desktop
+running:
+
+- **Architecture.** In hybrid models such as Qwen3.5, only every fourth layer
+  keeps a growing KV cache, so context costs about 22 KB per token (q8_0
+  cache, working buffers included) against several times that for Qwen3 8B.
+  Qwen3.5 9B IQ4_XS runs a 64k context fully on the GPU, generating at 31
+  tok/s, and reads prompts at 156 tok/s empty and 120 tok/s 30k tokens deep.
+- **Vision projectors.** A vision model's projector (0.9 GB for Qwen3.5) sits
+  on the GPU, and its worst case while encoding an image (about 1.1 GB) is
+  reserved too. The same model at 16k with the projector reads a 512x512 image
+  in 3.5 s and a 1080p one in 56 s. An entry made from the model's weights
+  alone, without the projector, gets that memory back for context; keep a
+  vision entry for images and a text entry for long conversations.
+- **Full-precision output tensors.** Some uploads keep `output.weight` in bf16,
+  and with a large vocabulary it can be a third of the model (2 GB of 6.4 for
+  that Qwen3.5 9B). Every generated token reads it.
+  [`ollama-tools/requant-output-head.py`](ollama-tools/requant-output-head.py)
+  converts just that tensor to q8_0 and copies the rest unchanged: 0.95 GB
+  less VRAM, generation +11%, the same top token as the original 98% of the
+  time. Import the result with a Modelfile whose `FROM` is the new file.
+- **Mixture-of-experts models.** A MoE far larger than the card still runs:
+  llama.cpp keeps attention, shared weights and the KV cache on the GPU and
+  the routed experts in system RAM. `ollama/import/Modelfile-qwen3.6-35b-256k`
+  runs Qwen3.6 35B-A3B at its full 262k context (189 tok/s prompt, 22 tok/s
+  generation with DDR4-2800, about 20 GB of RAM). Its comments explain the
+  settings: the MTP draft head off, 1024-token batches and `use_mmap false`.
+  Such a model's speed follows system RAM speed and CPU cores.
+  `Modelfile-qwen3-coder-next-heretic-256k` does the same for an 80B-A3B
+  coding model imported from a GGUF (105 tok/s prompt, 18 tok/s generation,
+  about 50 GB of RAM); a raw GGUF needs the `RENDERER`/`PARSER` lines of
+  Ollama's own build of the model, or clients' tool calls are not recognised.
+
+**Thinking.** Ollama turns reasoning on for models that support it unless the
+client sends `"think": false`. SillyTavern's Text Completion mode builds the
+prompt itself (Ollama's raw mode), so there the switch is the reply prefix:
+**Start Reply With** set to `<think>`, a blank line and `</think>` makes Qwen3
+and Qwen3.5 answer directly. SillyTavern's Ollama image captioning sends no
+`think` field, so captions from such a model begin with its reasoning.
+
 ### Verifying on hardware
 
 llama.cpp's own `test-backend-ops` compares each GPU operation with its CPU
@@ -587,6 +647,12 @@ Qwen3 8B and Qwen2.5-Coder 7B.
 - With Qwen Code, Qwen2.5-Coder 7B answers without calling tools, and Qwen3 8B
   calls them but misuses Qwen Code's tool-search bridge: it passes
   `read_file`'s arguments straight to `tool_call` without naming the tool.
+  Qwen3.6 35B-A3B (see Fitting models) reads, edits and runs files correctly.
+- `test-backend-ops` passes everything except `SOLVE_TRI` above 64x64
+  (7 cases); no model used here reaches that path.
+- Images are slow to read: a 1080p image becomes about 2000 tokens and takes
+  56 s with Qwen3.5 9B, where 2000 text tokens take about 15 s. Where the time
+  goes in the vision path is not yet measured.
 - Switching models takes about 8 s longer than Ollama intends, while it
   refreshes free memory (see gpu-refresh-timeout.patch above); the alternative
   was decisions made from stale figures.
