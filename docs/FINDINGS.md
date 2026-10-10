@@ -32,6 +32,7 @@ against a CPU reference, and "it runs" was never taken as evidence.
 | llama.cpp prompt processing 10x slow | Fixed | `patches/ollama/llama-cpp/100-*` |
 | llama.cpp long-context prompts slow | Fixed | `patches/ollama/llama-cpp/101-*` |
 | llama.cpp q8_0 generation slows with context | Fixed | `patches/ollama/llama-cpp/102-*` |
+| llama.cpp K-quant generation below memory bandwidth | Fixed | `patches/ollama/llama-cpp/103-*` |
 | Ollama rejects argument-less tools | Fixed (all GPUs) | `patches/ollama/ollama/` |
 
 Paths in the table are relative to `rocm6.4.4/`.
@@ -320,7 +321,7 @@ Ollama 0.35.1 builds llama.cpp b11232; its HIP backend compiles for gfx803
 with no source changes, and computes correctly (llama.cpp's own operation tests
 pass against its CPU backend). It was slow, for three gfx803-specific reasons
 that share a theme: kernels tuned for GPUs with more instructions spill
-registers on gfx803.
+registers, or run out of instruction throughput, on gfx803.
 
 - **Prompt processing at 15 tok/s** (Qwen3 8B Q4_K_M). The quantized matrix
   multiply used the GCN tile table, sized for GPUs with `v_dot4`. gfx803 has
@@ -347,6 +348,17 @@ registers on gfx803.
   Generation 8k deep: Qwen3 8B 20.9 -> 24.4 tok/s, Qwen2.5-Coder 7B 24.8 ->
   27.2. With it, the 8-bit cache is as fast as f16 or faster from about 4k
   tokens, at half the VRAM, which on 8 GB decides whether a 16k context fits.
+- **Generation below the memory bandwidth for K-quant models.** Generating a
+  token reads every weight once, so it should run at the card's bandwidth, and
+  for q8_0 and f16 weights it does (222-229 GB/s for a single-token matmul).
+  The K-quants that make up a Q4_K_M model reached 127-165 GB/s, with few
+  registers in use (34 VGPRs): without integer dot instructions their dot
+  products are long ALU sequences, and the kernel is instruction-bound. One
+  warp over two rows per block instead of two warps per row halves the per-row
+  reduction and launch overhead: q4_K +11-27%, q3_K +31%, q6_K +9%. q5_K, q8_0,
+  iq4_xs and q5_1 measured slower that way and keep the old shape. Generation:
+  Qwen3 8B 27.9 -> 31.4 tok/s empty and 24.2 -> 26.5 at 8k, Qwen2.5-Coder 7B
+  30.3 -> 34.6 and 27.0 -> 30.1.
 
 Upstream llama.cpp has no equivalent of the third fix; issue
 [#27796](https://github.com/ggml-org/llama.cpp/issues/27796) reports the same

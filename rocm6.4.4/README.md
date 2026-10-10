@@ -488,6 +488,16 @@ measurements and a reproduction. In short:
   a K/V head from one read and stays at 66-104 registers. Generation at
   0 / 4096 / 8192 tokens deep: Qwen3 8B 27.9 / 23.7 / 20.9 -> 28.1 / 26.0 /
   24.4 tok/s, Qwen2.5-Coder 7B 30.1 / 27.1 / 24.8 -> 30.3 / 28.8 / 27.2.
+- **103-gfx803-mmvq-two-rows.patch**: token generation reads every weight once
+  per token, but the K-quant and low-bit IQ matmuls reached only 127-165 GB/s
+  of the card's ~225 (q8_0 and f16 reach it): without integer dot product
+  instructions their dot products are long ALU sequences, so the kernel is
+  instruction-bound. For one token, one warp over two rows per block halves
+  the per-row reduction and launch overhead: q4_K +11-27%, q3_K +31%, q6_K +9%.
+  Types that were already at the bandwidth limit, or measured slower that way
+  (q5_K, q8_0, iq4_xs, q5_1), keep the GCN shape. Generation at 0 / 8192
+  tokens deep: Qwen3 8B 27.9 / 24.2 -> 31.4 / 26.5 tok/s, Qwen2.5-Coder 7B
+  30.3 / 27.0 -> 34.6 / 30.1.
 
 `patches/ollama/ollama/tool-parameters-empty-schema.patch` fixes Ollama
 itself, on every GPU: a tool that takes no arguments is re-encoded with

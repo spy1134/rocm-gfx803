@@ -9,7 +9,8 @@
 # matmul and flash-attention tests pass against the CPU backend and greedy
 # output agrees with a CPU run. patches/ollama/llama-cpp/ takes Qwen3 8B's prompt
 # processing from 15 to 163 tok/s, and 4096 tokens deep from 55 to 143 tok/s;
-# with a q8_0 KV cache, generation 8192 tokens deep goes from 20.9 to 24.4 tok/s.
+# with a q8_0 KV cache, generation goes from 27.9 to 31.4 tok/s, and 8192 tokens
+# deep from 20.9 to 26.5.
 ARG BASE_IMAGE=rocm-gfx803:rocm6.4.4
 # Compiling needs only ROCm's compiler, headers and link libraries, so the build
 # runs on AMD's image (the same one, pinned by digest, that the base is built
@@ -66,6 +67,9 @@ RUN CC=/opt/rocm/llvm/bin/clang CXX=/opt/rocm/llvm/bin/clang++ \
     && { grep -q ggml_cuda_flash_attn_ext_gcn4_decode \
              build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/fattn.cu \
          || { echo "102-gfx803-fattn-decode.patch was not applied" >&2; exit 1; }; } \
+    && { grep -q mmvq_gcn4_two_rows \
+             build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/mmvq.cu \
+         || { echo "103-gfx803-mmvq-two-rows.patch was not applied" >&2; exit 1; }; } \
     && cmake --build build/llama-server-rocm_v7_2 --parallel "$(nproc)" \
     && cmake --install build/llama-server-rocm_v7_2 --component llama-server --strip
 
