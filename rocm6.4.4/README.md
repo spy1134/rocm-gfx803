@@ -525,6 +525,9 @@ measurements and a reproduction. In short:
   compiler's code, which measured faster there. With a 5.2k-token
   context, Qwen3 8B and Qwen2.5-Coder 7B (Q4_K_M) generate 6-7% faster; prompt
   speed and IQ4_XS models are unchanged. Output is bit-identical.
+- **105-gfx803-q5k-decode.patch**: q5_K's decode dot product reads its scales
+  with one 16-byte load instead of four (q5_K matmul about 4% faster with
+  104).
 
 `patches/ollama/llama-cpp-server/090-mmproj-fit-target-device.patch` fixes
 llama.cpp's server, on every GPU. When it fits a model with a multimodal
@@ -536,9 +539,6 @@ there; with the projector on the CPU, about 1.1 GB of VRAM is held back for
 nothing. llama-server is built in Ollama's CPU stage, so `Dockerfile-Ollama`
 copies this folder in before that stage and the HIP patches after it.
 
-The three llama.cpp patches are gfx803-only by construction: each takes
-effect only for `GGML_CUDA_CC_GCN4` and is sized from gfx803 register
-measurements. The Ollama patch fixes a bug that is not specific to any GPU.
 `patches/ollama/ollama/` holds patches to Ollama itself, both for bugs on every
 GPU:
 
@@ -557,6 +557,11 @@ GPU:
   now twice the first discovery's duration, between 3 and 30 s; GPUs that start
   quickly keep 3 s.
 
+The llama.cpp kernel patches 100-104 are gfx803-only by construction: each
+takes effect only for `GGML_CUDA_CC_GCN4` or `__gfx803__` and is sized from
+gfx803 register and bandwidth measurements. 105 changes q5_K's dot product for
+every GPU, with the same arithmetic. 090 and the two Ollama patches fix bugs
+that are not specific to any GPU.
 Upstream llama.cpp master (checked 2026-10-03, b11382) still has the vec
 kernel 102 replaces on gfx803, unchanged; llama.cpp issue
 [#27796](https://github.com/ggml-org/llama.cpp/issues/27796) reports the same

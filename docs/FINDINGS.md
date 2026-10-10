@@ -384,6 +384,9 @@ registers, or run out of instruction throughput, on gfx803.
   output is bit-identical in all three. Where the Q4_K_M generation gain comes
   from is not measured, since their single-token matmuls are unchanged; the
   q8_0 flash-attention kernels losing their spills is the likely candidate.
+  `105-gfx803-q5k-decode.patch` loads q5_K's scales with one 16-byte load
+  instead of four small ones (q5_K decode matmul 233 -> 224 us, measured with
+  104).
 
 Upstream llama.cpp has no equivalent of the third fix; issue
 [#27796](https://github.com/ggml-org/llama.cpp/issues/27796) reports the same
