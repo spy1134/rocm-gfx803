@@ -499,11 +499,6 @@ measurements and a reproduction. In short:
   tokens deep: Qwen3 8B 27.9 / 24.2 -> 31.4 / 26.5 tok/s, Qwen2.5-Coder 7B
   30.3 / 27.0 -> 34.6 / 30.1.
 
-`patches/ollama/ollama/tool-parameters-empty-schema.patch` fixes Ollama
-itself, on every GPU: a tool that takes no arguments is re-encoded with
-`"properties": null`, which llama.cpp's server rejects (HTTP 400), so clients
-that declare such tools (Qwen Code does) fail on their first request. The
-patch encodes the empty schema as `{"type":"object","properties":{}}`.
 `patches/ollama/llama-cpp-server/090-mmproj-fit-target-device.patch` fixes
 llama.cpp's server, on every GPU. When it fits a model with a multimodal
 projector, it reserves the projector's memory under the wrong device index
@@ -517,6 +512,24 @@ copies this folder in before that stage and the HIP patches after it.
 The three llama.cpp patches are gfx803-only by construction: each takes
 effect only for `GGML_CUDA_CC_GCN4` and is sized from gfx803 register
 measurements. The Ollama patch fixes a bug that is not specific to any GPU.
+`patches/ollama/ollama/` holds patches to Ollama itself, both for bugs on every
+GPU:
+
+- **tool-parameters-empty-schema.patch**: a tool that takes no arguments is
+  re-encoded with `"properties": null`, which llama.cpp's server rejects (HTTP
+  400), so clients that declare such tools (Qwen Code does) fail on their first
+  request. The patch encodes the empty schema as
+  `{"type":"object","properties":{}}`.
+- **gpu-refresh-timeout.patch**: before loading a model, Ollama refreshes each
+  GPU's free memory by starting a small llama-server, with a 3-second deadline,
+  and keeps the previous values when it misses. The ROCm library alone takes
+  about 3 s to start on gfx803 and a refresh about 8 s, so every refresh missed
+  and Ollama kept counting the memory of models it had already unloaded. Its
+  decisions then went wrong, for example encoding images on the CPU because a
+  vision projector seemed not to fit on an empty card. The refresh deadline is
+  now twice the first discovery's duration, between 3 and 30 s; GPUs that start
+  quickly keep 3 s.
+
 Upstream llama.cpp master (checked 2026-10-03, b11382) still has the vec
 kernel 102 replaces on gfx803, unchanged; llama.cpp issue
 [#27796](https://github.com/ggml-org/llama.cpp/issues/27796) reports the same
@@ -555,6 +568,9 @@ Qwen3 8B and Qwen2.5-Coder 7B.
 - With Qwen Code, Qwen2.5-Coder 7B answers without calling tools, and Qwen3 8B
   calls them but misuses Qwen Code's tool-search bridge: it passes
   `read_file`'s arguments straight to `tool_call` without naming the tool.
+- Switching models takes about 8 s longer than Ollama intends, while it
+  refreshes free memory (see gpu-refresh-timeout.patch above); the alternative
+  was decisions made from stale figures.
 
 ## Fixed bug case study: ROCMExecutionProvider fused-conv crash (musicnn-class models)
 

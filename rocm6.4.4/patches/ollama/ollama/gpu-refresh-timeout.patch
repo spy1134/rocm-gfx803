@@ -1,0 +1,125 @@
+Ollama v0.35.1 (commit b0c1ca4f): give the free-memory refresh as long as the
+GPU library takes to start, so slow-starting GPUs stop running on stale
+free-memory values.
+
+WHY
+---
+Before loading a model, Ollama refreshes each GPU's free memory. When no loaded
+runner can answer, it starts a new llama-server just to report device memory,
+with a fixed 3-second deadline, and on a miss it keeps the previous values
+("unable to refresh free memory, using old values"). On an RX 590 (gfx803,
+ROCm) the ROCm library alone takes about 3 s to initialize (llama-server
+--list-devices with the HIP backend: 2.8-3.1 s), Ollama's first discovery
+pass takes 8.5-9 s per library, and a refresh run takes about 8 s, so every
+such refresh misses. The old values then do not change: after a model is
+unloaded, Ollama keeps seeing the memory that model held as in use.
+
+Decisions made from those values go wrong. Seen with Qwen3.5 9B and its vision
+projector after unloading another model: the card was empty, Ollama believed
+1.6 GiB was free, decided VRAM was too limited for the projector
+("disabling multimodal projector offload, reason=limited-vram") and encoded
+every image on the CPU, at half the speed. A load straight after start-up, when
+the values were fresh, put the projector on the GPU.
+
+WHAT
+----
+The first discovery pass already starts each GPU library once; it now records
+the longest that took. A refresh that has to start a new runner gets twice
+that, never less than the existing 3 s and at most 30 s. GPUs whose library
+starts quickly keep the 3 s deadline. On the RX 590 the refresh gets 18 s and
+completes in about 8 s: loading the vision model straight after unloading a
+text model now sees 8.0 GiB free and puts the projector on the GPU. (The
+scheduler's separate wait for VRAM to recover after an unload still gives up
+after its own 5 s and falls back to its estimates, as it is designed to.)
+Unit test included; the discover, llm and server package tests pass.
+
+diff --git a/discover/refresh_timeout_test.go b/discover/refresh_timeout_test.go
+new file mode 100644
+index 00000000..d57ef2bc
+--- /dev/null
++++ b/discover/refresh_timeout_test.go
+@@ -0,0 +1,25 @@
++package discover
++
++import (
++	"testing"
++	"time"
++)
++
++func TestRefreshTimeout(t *testing.T) {
++	saved := slowestBootstrap
++	t.Cleanup(func() { slowestBootstrap = saved })
++
++	for _, tt := range []struct {
++		slowest, want time.Duration
++	}{
++		{0, 3 * time.Second},
++		{800 * time.Millisecond, 3 * time.Second},
++		{7 * time.Second, 14 * time.Second},
++		{25 * time.Second, 30 * time.Second},
++	} {
++		slowestBootstrap = tt.slowest
++		if got := refreshTimeout(3 * time.Second); got != tt.want {
++			t.Errorf("slowest bootstrap %v: refresh timeout %v, want %v", tt.slowest, got, tt.want)
++		}
++	}
++}
+diff --git a/discover/runner.go b/discover/runner.go
+index 2c533c33..024db2b3 100644
+--- a/discover/runner.go
++++ b/discover/runner.go
+@@ -26,8 +26,23 @@ var (
+ 	devices      []ml.DeviceInfo
+ 	libDirs      map[string]struct{}
+ 	bootstrapped bool
++
++	// slowestBootstrap is the longest a library directory took to start and report its devices
++	// during the first discovery pass. The free-memory refresh starts the same library again, so
++	// it cannot finish in less time.
++	slowestBootstrap time.Duration
+ )
+ 
++// refreshTimeout is the deadline for a free-memory refresh that has to start a new runner. A
++// refresh that misses it leaves the previous free-memory values in place, and those can date
++// from before a model was unloaded, so a GPU whose library takes longer than the base deadline
++// to start would otherwise never see memory freed: on an RX 590 (gfx803) the ROCm library alone
++// takes about 3 s to initialize. Twice the slowest first-pass discovery, within [base, 30 s],
++// leaves GPUs that start quickly at the base deadline.
++func refreshTimeout(base time.Duration) time.Duration {
++	return min(max(base, 2*slowestBootstrap), 30*time.Second)
++}
++
+ var defaultIntegratedROCmGFXTargets = map[string]struct{}{
+ 	// AMD Radeon 8060S / Ryzen AI Max+ 395.
+ 	"gfx1151": {},
+@@ -115,7 +130,11 @@ func GPUDevices(ctx context.Context, runners []ml.FilteredRunnerDiscovery) []ml.
+ 
+ 			ctx1stPass, cancel := context.WithTimeout(ctx, bootstrapTimeout)
+ 			// For this pass, we retain duplicates in case any are incompatible with some libraries
++			bootstrapStart := time.Now()
+ 			discovered := bootstrapDevicesWithMetalRetry(ctx1stPass, ctx, bootstrapTimeout, dirs, nil)
++			if len(discovered) > 0 {
++				slowestBootstrap = max(slowestBootstrap, time.Since(bootstrapStart))
++			}
+ 			if filepath.Base(dirs[len(dirs)-1]) == "cuda_v12" {
+ 				discovered = filterOldCUDADriver(ctx, discovered)
+ 			}
+@@ -337,7 +356,8 @@ func GPUDevices(ctx context.Context, runners []ml.FilteredRunnerDiscovery) []ml.
+ 
+ 			// Bootstrapping may take longer in some cases (AMD windows), but we
+ 			// would rather use stale free data to get the model running sooner
+-			rctx, cancel := context.WithTimeout(ctx, 3*time.Second)
++			timeout := refreshTimeout(3 * time.Second)
++			rctx, cancel := context.WithTimeout(ctx, timeout)
+ 			defer cancel()
+ 
+ 			// Apply any device filters to avoid re-discovering unsupported devices
+@@ -345,7 +365,7 @@ func GPUDevices(ctx context.Context, runners []ml.FilteredRunnerDiscovery) []ml.
+ 			devFilter := ml.GetDevicesEnv(devices)
+ 
+ 			for dir := range libDirs {
+-				updatedDevices := bootstrapDevicesWithMetalRetry(rctx, ctx, 3*time.Second, []string{ml.LibOllamaPath, dir}, devFilter)
++				updatedDevices := bootstrapDevicesWithMetalRetry(rctx, ctx, timeout, []string{ml.LibOllamaPath, dir}, devFilter)
+ 				for _, u := range updatedDevices {
+ 					for i := range devices {
+ 						if sameRefreshDevice(u, devices[i]) {

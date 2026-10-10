@@ -35,6 +35,7 @@ against a CPU reference, and "it runs" was never taken as evidence.
 | llama.cpp K-quant generation below memory bandwidth | Fixed | `patches/ollama/llama-cpp/103-*` |
 | Ollama rejects argument-less tools | Fixed (all GPUs) | `patches/ollama/ollama/` |
 | llama.cpp reserves a vision projector's memory on the wrong device | Fixed (all GPUs) | `patches/ollama/llama-cpp-server/` |
+| Ollama keeps stale free-memory figures on slow-starting GPUs | Fixed (all GPUs) | `patches/ollama/ollama/` |
 
 Paths in the table are relative to `rocm6.4.4/`.
 
@@ -380,6 +381,14 @@ that also drives the display:
   about 1.1 GB of VRAM for nothing. With Qwen3.5 9B on the RX 590, a 1080p
   image took the card to 8074 of 8192 MiB; the compositor could no longer pin
   its framebuffers and applications lost their GPU contexts.
+- **Ollama keeps stale free-memory figures on GPUs that start slowly.** Its
+  refresh before each load starts a small llama-server with a 3-second
+  deadline and keeps the old values on a miss. The ROCm library takes about
+  3 s to start on gfx803 and a refresh about 8 s, so Ollama kept counting the
+  memory of unloaded models and, for example, put a vision projector on the
+  CPU because it seemed not to fit on an empty card. The deadline is now twice
+  the first discovery's duration (3-30 s).
+
 
 Each patch header in `rocm6.4.4/patches/ollama/` has the full measurements and
 a reproduction.

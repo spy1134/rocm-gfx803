@@ -91,7 +91,9 @@ RUN find dist/lib/ollama/rocm_v7_2 -mindepth 1 ! -name libggml-hip.so -exec rm -
 COPY patches/ollama/ollama/*.patch /tmp/ollama-patches/
 RUN for p in /tmp/ollama-patches/*.patch; do git apply "$p" || exit 1; done \
     && { grep -q 'func (t ToolFunctionParameters) MarshalJSON' api/types.go \
-         || { echo "tool-parameters-empty-schema.patch was not applied" >&2; exit 1; }; }
+         || { echo "tool-parameters-empty-schema.patch was not applied" >&2; exit 1; }; } \
+    && { grep -q 'func refreshTimeout' discover/runner.go \
+         || { echo "gpu-refresh-timeout.patch was not applied" >&2; exit 1; }; }
 
 # The release tag's version, which the binary reports. Declared here, not with
 # OLLAMA_REF, because an ARG is part of the cache key of every RUN after it.
