@@ -75,6 +75,12 @@ RUN CC=/opt/rocm/llvm/bin/clang CXX=/opt/rocm/llvm/bin/clang++ \
     && { grep -q mmvq_gcn4_two_rows \
              build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/mmvq.cu \
          || { echo "103-gfx803-mmvq-two-rows.patch was not applied" >&2; exit 1; }; } \
+    && { grep -q "v_mul_i32_i24 %1, sext(%3), sext(%4)" \
+             build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/common.cuh \
+         || { echo "104-gfx803-sdwa-dp4a.patch was not applied" >&2; exit 1; }; } \
+    && { grep -q "vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMQ, true>" \
+             build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/mmq-vec-dot.cuh \
+         || { echo "104-gfx803-sdwa-dp4a.patch did not reach mmq-vec-dot.cuh" >&2; exit 1; }; } \
     && cmake --build build/llama-server-rocm_v7_2 --parallel "$(nproc)" \
     && cmake --install build/llama-server-rocm_v7_2 --component llama-server --strip
 

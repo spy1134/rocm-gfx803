@@ -33,6 +33,7 @@ against a CPU reference, and "it runs" was never taken as evidence.
 | llama.cpp long-context prompts slow | Fixed | `patches/ollama/llama-cpp/101-*` |
 | llama.cpp q8_0 generation slows with context | Fixed | `patches/ollama/llama-cpp/102-*` |
 | llama.cpp K-quant generation below memory bandwidth | Fixed | `patches/ollama/llama-cpp/103-*` |
+| llama.cpp integer dot products built from byte unpacking | Faster (decode kernels) | `patches/ollama/llama-cpp/104-*`, `105-*` |
 | Ollama rejects argument-less tools | Fixed (all GPUs) | `patches/ollama/ollama/` |
 | llama.cpp reserves a vision projector's memory on the wrong device | Fixed (all GPUs) | `patches/ollama/llama-cpp-server/` |
 | Ollama keeps stale free-memory figures on slow-starting GPUs | Fixed (all GPUs) | `patches/ollama/ollama/` |
@@ -322,7 +323,7 @@ and fp16 only. Prefer fp16 for half precision on this card.
 
 Ollama 0.35.1 builds llama.cpp b11232; its HIP backend compiles for gfx803
 with no source changes, and computes correctly (llama.cpp's own operation tests
-pass against its CPU backend). It was slow, for three gfx803-specific reasons
+pass against its CPU backend). It was slow, for five gfx803-specific reasons
 that share a theme: kernels tuned for GPUs with more instructions spill
 registers, or run out of instruction throughput, on gfx803.
 
@@ -362,6 +363,27 @@ registers, or run out of instruction throughput, on gfx803.
   iq4_xs and q5_1 measured slower that way and keep the old shape. Generation:
   Qwen3 8B 27.9 -> 31.4 tok/s empty and 24.2 -> 26.5 at 8k, Qwen2.5-Coder 7B
   30.3 -> 34.6 and 27.0 -> 30.1.
+- **Integer dot products assembled from unpacked bytes.** Every quantized
+  dot product goes through `ggml_cuda_dp4a`, which newer GPUs run as one
+  instruction. gfx803 has none, so the compiler unpacks four bytes of each
+  operand and multiplies them one at a time; in the decode kernels keeping
+  those bytes live pushes the 2-8 token variants (speculative or parallel
+  decoding) to 120-256 VGPRs, and the q8_0 flash-attention kernels spill.
+  gfx803's SDWA operand selects let `v_mul_i32_i24` multiply byte i of one
+  register by byte i of another directly. `104-gfx803-sdwa-dp4a.patch` uses
+  that in the decode kernels: those above 128 VGPRs go from 56 to 1, spills
+  from 2 to 0, and 4-8 token decode matmuls get up to 1.6x faster. Single
+  tokens are unchanged and 2 tokens lose 1-11%. In the prompt kernels (mmq)
+  and in the dot products whose operand comes from a 16-entry table (IQ4_NL,
+  IQ4_XS, MXFP4, NVFP4) SDWA measured slower (q8_0 prompt tiles 21%, IQ4_XS
+  decode up to 2.6x), so those keep the compiler's code; why SDWA loses there
+  is not known. In Ollama at a 5.2k-token
+  context, Qwen3 8B and Qwen2.5-Coder 7B (Q4_K_M) generate 6-7% faster
+  (24.9 -> 26.6 and 28.4 -> 30.5 tok/s) with prompt speed unchanged, and
+  Qwen3.5 9B IQ4_XS is unchanged (151 tok/s prompt, 29 tok/s generation);
+  output is bit-identical in all three. Where the Q4_K_M generation gain comes
+  from is not measured, since their single-token matmuls are unchanged; the
+  q8_0 flash-attention kernels losing their spills is the likely candidate.
 
 Upstream llama.cpp has no equivalent of the third fix; issue
 [#27796](https://github.com/ggml-org/llama.cpp/issues/27796) reports the same
@@ -452,6 +474,10 @@ a reproduction.
   `GammaBeta1dBackwardCUDAKernel2` reduces a 32-wide tile with shuffles over
   `C10_WARP_SIZE` lanes, which upstream sets to 64 there (section 5). That
   would be an upstream bug; not tested, as there is no gfx9 card here.
+- Why llama.cpp's SDWA dot product (patch 104) is slower than the compiler's
+  code in the prompt kernels, for table-lookup operands and for 2-token decode.
+- Whether the decode kernels (mmvq) beat the prompt kernels (mmq) for 9-16
+  tokens on gfx803; llama.cpp switches at 8.
 - fp16 over full-length training runs and in ComfyUI (only short runs so far).
 - The `init_user_pages: Failed to get user pages: -1` kernel messages on every
   Ollama model load.

@@ -1,0 +1,413 @@
+llama.cpp (as fetched by Ollama v0.35.1, llama.cpp b11232): a 4-byte integer
+dot product for gfx803's decode kernels built from SDWA byte selects.
+
+WHY
+---
+ggml_cuda_dp4a is the inner operation of every quantized dot product. gfx906
+and later have v_dot4_i32_i8; gfx900 and RDNA1 get an inline-assembly
+sequence that ends in v_add3_u32. gfx803 has neither, so it takes the generic
+C++ path, which unpacks both operands into int8x4_t and multiplies byte by
+byte. In the decode kernels keeping the unpacked bytes live costs registers:
+in the stock build 56 of the gfx803 mmvq kernels use more than 128 VGPRs (one
+wave per SIMD) and two spill, mostly the 2-8 column variants that speculative
+and parallel decoding use (q2_K at 4 columns: 198 VGPRs; at 7 columns: 256
+with 10 spilled), and the q8_0 flash-attention vec kernels spill too (D=128,
+2 columns: 256 VGPRs, 46 spilled).
+
+gfx803's VOP2 instructions take SDWA operand selects with sign extension, so
+v_mul_i32_i24 can multiply byte i of one register by byte i of another
+directly: four multiplies and four adds give the exact signed dot product
+with no unpacked copies kept live. K-quant kernels also call
+dp4a(0x01010101, x, c) to sum the four signed bytes of x; for a compile-time
+0x01010101 operand two SDWA adds of byte pairs and one or two plain adds do
+that without multiplies. mmvq kernels above 128 VGPRs drop from 56 to 1,
+spilling ones from 2 to 0, and the flash-attention kernel above to 193 VGPRs
+with no spills.
+
+Everywhere else the compiler's byte-wise code is faster, so it stays there:
+the mmq prompt kernels (with SDWA, q8_0 at 512 columns took 26.3 instead of
+21.7 ms, the IQ types 12% longer, q6_K 5%) and the dot products whose operand
+comes from get_int_from_table_16 (iq4_nl, iq4_xs, mxfp4, nvfp4; iq4_xs
+decode was 1.3-2.6x slower with SDWA). Why SDWA loses there is not known.
+
+test-backend-ops perf on an RX 590, MUL_MAT 4096x14336, us per run for
+1/2/4/8/512 columns, without -> with this patch and 105:
+  q4_K              188/257/445/877/24564 -> 187/261/447/827/24577
+  q5_K              233/287/474/892/29395 -> 224/278/469/849/29471
+  q6_K             269/341/559/1079/27511 -> 268/355/572/957/27426
+  q8_0              283/288/426/591/21608 -> 284/303/347/623/21552
+  q2_K             212/335/731/2137/35882 -> 218/376/669/1324/35869
+  q3_K             257/342/809/1131/29738 -> 247/356/569/1009/29578
+  iq4_xs            152/189/403/809/24475 -> 152/188/402/810/24385
+Decode at 4-8 columns gains up to 1.6x where the old kernels needed more than
+128 VGPRs; one column, plain generation, is unchanged; 2 columns lose 1-11%;
+prompt processing (512 columns) and iq4_xs are unchanged.
+
+Checked against the CPU backend with test-backend-ops: MUL_MAT 1301/1301,
+MUL_MAT_ID 931/931, FLASH_ATTN_EXT 3982/3982.
+
+WHAT
+----
+In ggml/src/ggml-cuda/common.cuh, a gfx803 branch in ggml_cuda_dp4a: when
+either operand is the constant 0x01010101, a sign-extended SDWA byte sum of
+the other operand plus c; otherwise four v_mul_i32_i24 with byte selects
+accumulated with v_add_u32 (both clobber vcc, which the asm declares).
+ggml_cuda_dp4a_plain is the generic byte-wise product on gfx803 and
+ggml_cuda_dp4a elsewhere; ggml_cuda_dp4a_sel<plain> picks one of the two at
+compile time.
+
+In vecdotq.cuh the mmq-only helpers (the *_impl_mmq K-quant functions,
+vec_dot_q8_1_q8_1_impl, vec_dot_q8_0_16_q8_1_impl) and the iq4_nl, iq4_xs,
+mxfp4 and nvfp4 dot products call ggml_cuda_dp4a_plain; the q4_0, q4_1 and
+q8_0 helpers shared by mmq and mmvq take a plain template flag, which
+mmq-vec-dot.cuh sets. Other architectures compile exactly what they did
+before.
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 5363dd0..343f471 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -728,6 +728,75 @@ static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, i
+         : "+v"(c), "=&v"(tmp1), "=&v"(tmp2)
+         : "v"(a), "v"(b)
+     );
++#elif defined(GCN4) || defined(__gfx803__)
++    if (__builtin_constant_p(a) && a == 0x01010101) {
++        if (__builtin_constant_p(c) && c == 0) {
++            int s0, s1, res;
++            asm (
++                "v_add_u32_sdwa %0, vcc, sext(%3), sext(%3) src0_sel:BYTE_0 src1_sel:BYTE_1\n\t"
++                "v_add_u32_sdwa %1, vcc, sext(%3), sext(%3) src0_sel:BYTE_2 src1_sel:BYTE_3\n\t"
++                "v_add_u32_e32  %2, vcc, %0, %1\n\t"
++                : "=&v"(s0), "=&v"(s1), "=v"(res)
++                : "v"(b)
++                : "vcc"
++            );
++            return res;
++        } else {
++            int s0, s1;
++            asm (
++                "v_add_u32_sdwa %0, vcc, sext(%3), sext(%3) src0_sel:BYTE_0 src1_sel:BYTE_1\n\t"
++                "v_add_u32_sdwa %1, vcc, sext(%3), sext(%3) src0_sel:BYTE_2 src1_sel:BYTE_3\n\t"
++                "v_add_u32_e32  %0, vcc, %0, %1\n\t"
++                "v_add_u32_e32  %2, vcc, %0, %2\n\t"
++                : "=&v"(s0), "=&v"(s1), "+v"(c)
++                : "v"(b)
++                : "vcc"
++            );
++            return c;
++        }
++    }
++    if (__builtin_constant_p(b) && b == 0x01010101) {
++        if (__builtin_constant_p(c) && c == 0) {
++            int s0, s1, res;
++            asm (
++                "v_add_u32_sdwa %0, vcc, sext(%3), sext(%3) src0_sel:BYTE_0 src1_sel:BYTE_1\n\t"
++                "v_add_u32_sdwa %1, vcc, sext(%3), sext(%3) src0_sel:BYTE_2 src1_sel:BYTE_3\n\t"
++                "v_add_u32_e32  %2, vcc, %0, %1\n\t"
++                : "=&v"(s0), "=&v"(s1), "=v"(res)
++                : "v"(a)
++                : "vcc"
++            );
++            return res;
++        } else {
++            int s0, s1;
++            asm (
++                "v_add_u32_sdwa %0, vcc, sext(%3), sext(%3) src0_sel:BYTE_0 src1_sel:BYTE_1\n\t"
++                "v_add_u32_sdwa %1, vcc, sext(%3), sext(%3) src0_sel:BYTE_2 src1_sel:BYTE_3\n\t"
++                "v_add_u32_e32  %0, vcc, %0, %1\n\t"
++                "v_add_u32_e32  %2, vcc, %0, %2\n\t"
++                : "=&v"(s0), "=&v"(s1), "+v"(c)
++                : "v"(a)
++                : "vcc"
++            );
++            return c;
++        }
++    }
++    int tmp1;
++    int tmp2;
++    asm("\n \
++        v_mul_i32_i24 %1, sext(%3), sext(%4) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:BYTE_0 \n \
++        v_mul_i32_i24 %2, sext(%3), sext(%4) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:BYTE_1 \n \
++        v_add_u32 %1, vcc, %1, %2 \n \
++        v_mul_i32_i24 %2, sext(%3), sext(%4) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_2 src1_sel:BYTE_2 \n \
++        v_add_u32 %1, vcc, %1, %2 \n \
++        v_mul_i32_i24 %2, sext(%3), sext(%4) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:BYTE_3 \n \
++        v_add_u32 %1, vcc, %1, %2 \n \
++        v_add_u32 %0, vcc, %0, %1 \n \
++        "
++        : "+v"(c), "=&v"(tmp1), "=&v"(tmp2)
++        : "v"(a), "v"(b)
++        : "vcc"
++    );
+ #else
+     const int8x4_t va = reinterpret_cast<const int8x4_t&>(a);
+     const int8x4_t vb = reinterpret_cast<const int8x4_t&>(b);
+@@ -748,6 +817,32 @@ static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, i
+ #endif // defined(GGML_USE_HIP)
+ }
+ 
++// The SDWA sequence above pays off on gfx803 only in the decode kernels (mmvq
++// and flash attention), where not keeping unpacked bytes live keeps them
++// under 128 VGPRs. Elsewhere the compiler's byte-wise code is faster: the mmq
++// prompt kernels ran up to 21% slower with SDWA (q8_0 tiles, which the IQ
++// types also use), and dot products whose operand comes from
++// get_int_from_table_16 (iq4_nl, iq4_xs, mxfp4, nvfp4) up to 2.6x slower.
++// Those call this instead.
++static __device__ __forceinline__ int ggml_cuda_dp4a_plain(const int a, const int b, int c) {
++#if defined(GGML_USE_HIP) && (defined(GCN4) || defined(__gfx803__))
++    const int8x4_t va = reinterpret_cast<const int8x4_t&>(a);
++    const int8x4_t vb = reinterpret_cast<const int8x4_t&>(b);
++    return c + va[0] * vb[0] + va[1] * vb[1] + va[2] * vb[2] + va[3] * vb[3];
++#else
++    return ggml_cuda_dp4a(a, b, c);
++#endif
++}
++
++template <bool plain>
++static __device__ __forceinline__ int ggml_cuda_dp4a_sel(const int a, const int b, int c) {
++    if constexpr (plain) {
++        return ggml_cuda_dp4a_plain(a, b, c);
++    } else {
++        return ggml_cuda_dp4a(a, b, c);
++    }
++}
++
+ static __device__ __forceinline__ void ggml_cuda_mad(float & acc, const float v, const float u) {
+     acc += v*u;
+ }
+diff --git a/ggml/src/ggml-cuda/mmq-vec-dot.cuh b/ggml/src/ggml-cuda/mmq-vec-dot.cuh
+index 4ca6542..9e9fcc1 100644
+--- a/ggml/src/ggml-cuda/mmq-vec-dot.cuh
++++ b/ggml/src/ggml-cuda/mmq-vec-dot.cuh
+@@ -49,7 +49,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+                 u[0]=tmp0[0]; u[2]=tmp0[1]; u[4]=tmp0[2]; u[6]=tmp0[3];
+                 u[1]=tmp1[0]; u[3]=tmp1[1]; u[5]=tmp1[2]; u[7]=tmp1[3];
+ 
+-                sum[j0/nwarps*I/warp_size + i0/warp_size] += vec_dot_q4_0_q8_1_impl<VDR_Q4_0_Q8_1_MMQ>
++                sum[j0/nwarps*I/warp_size + i0/warp_size] += vec_dot_q4_0_q8_1_impl<VDR_Q4_0_Q8_1_MMQ, true>
+                     (&x_qs[i*(MMQ_TILE_NE_K + 1) + k0/QR4_0], u,
+                      x_df[i*(MMQ_TILE_NE_K/QI4_0) + i/QI4_0 + k0/(QR4_0*QI4_0)], y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
+             }
+@@ -99,7 +99,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+                 u[0]=tmp0[0]; u[2]=tmp0[1]; u[4]=tmp0[2]; u[6]=tmp0[3];
+                 u[1]=tmp1[0]; u[3]=tmp1[1]; u[5]=tmp1[2]; u[7]=tmp1[3];
+ 
+-                sum[j0/nwarps*I/warp_size + i0/warp_size] += vec_dot_q4_1_q8_1_impl<VDR_Q4_1_Q8_1_MMQ>
++                sum[j0/nwarps*I/warp_size + i0/warp_size] += vec_dot_q4_1_q8_1_impl<VDR_Q4_1_Q8_1_MMQ, true>
+                     (&x_qs[i*(MMQ_TILE_NE_K + 1) + k0/QR4_1], u,
+                      x_dm[i*(MMQ_TILE_NE_K/QI4_1) + i/QI4_1 + k0/(QR4_1*QI4_1)], y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
+             }
+@@ -131,7 +131,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+             for (int i0 = 0; i0 < I; i0 += warp_size) {
+                 const int i = i0 + threadIdx.x;
+ 
+-                sum[j0/nwarps*I/warp_size + i0/warp_size] += vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMQ>
++                sum[j0/nwarps*I/warp_size + i0/warp_size] += vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMQ, true>
+                     (&x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0], &y_qs[j*MMQ_TILE_Y_K + k0 % MMQ_TILE_NE_K],
+                      x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + k0/QI8_0], y_df[j*MMQ_TILE_Y_K + (k0/QI8_1) % (MMQ_TILE_NE_K/QI8_1)]);
+             }
+diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
+index f2a6f20..b7f4543 100644
+--- a/ggml/src/ggml-cuda/vecdotq.cuh
++++ b/ggml/src/ggml-cuda/vecdotq.cuh
+@@ -115,7 +115,7 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
+ #define VDR_Q4_0_Q8_1_MMVQ 2
+ #define VDR_Q4_0_Q8_1_MMQ  4
+ 
+-template <int vdr> static __device__ __forceinline__ float vec_dot_q4_0_q8_1_impl(
++template <int vdr, bool plain = false> static __device__ __forceinline__ float vec_dot_q4_0_q8_1_impl(
+     const int * v, const int * u, const float & d4, const half2 & ds8) {
+ 
+     int sumi = 0;
+@@ -126,8 +126,8 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q4_0_q8_1_imp
+         const int vi1 = (v[i] >> 4) & 0x0F0F0F0F;
+ 
+         // SIMD dot product of quantized values
+-        sumi = ggml_cuda_dp4a(vi0, u[2*i+0], sumi);
+-        sumi = ggml_cuda_dp4a(vi1, u[2*i+1], sumi);
++        sumi = ggml_cuda_dp4a_sel<plain>(vi0, u[2*i+0], sumi);
++        sumi = ggml_cuda_dp4a_sel<plain>(vi1, u[2*i+1], sumi);
+     }
+ 
+     const float2 ds8f = __half22float2(ds8);
+@@ -139,7 +139,7 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q4_0_q8_1_imp
+ #define VDR_Q4_1_Q8_1_MMVQ 2
+ #define VDR_Q4_1_Q8_1_MMQ  4
+ 
+-template <int vdr> static __device__ __forceinline__ float vec_dot_q4_1_q8_1_impl(
++template <int vdr, bool plain = false> static __device__ __forceinline__ float vec_dot_q4_1_q8_1_impl(
+     const int * v, const int * u, const half2 & dm4, const half2 & ds8) {
+ 
+     int sumi = 0;
+@@ -150,8 +150,8 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q4_1_q8_1_imp
+         const int vi1 = (v[i] >> 4) & 0x0F0F0F0F;
+ 
+         // SIMD dot product of quantized values
+-        sumi = ggml_cuda_dp4a(vi0, u[2*i+0], sumi);
+-        sumi = ggml_cuda_dp4a(vi1, u[2*i+1], sumi);
++        sumi = ggml_cuda_dp4a_sel<plain>(vi0, u[2*i+0], sumi);
++        sumi = ggml_cuda_dp4a_sel<plain>(vi1, u[2*i+1], sumi);
+     }
+ 
+ #ifdef FAST_FP16_AVAILABLE
+@@ -243,7 +243,7 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q5_1_q8_1_imp
+ #define VDR_Q8_0_Q8_1_MMVQ 2
+ #define VDR_Q8_0_Q8_1_MMQ 8
+ 
+-template <typename T, int vdr> static __device__ __forceinline__ T vec_dot_q8_0_q8_1_impl(
++template <typename T, int vdr, bool plain = false> static __device__ __forceinline__ T vec_dot_q8_0_q8_1_impl(
+     const int * v, const int * u, const T & d8_0, const T & d8_1) {
+ 
+     int sumi = 0;
+@@ -251,7 +251,7 @@ template <typename T, int vdr> static __device__ __forceinline__ T vec_dot_q8_0_
+ #pragma unroll
+     for (int i = 0; i < vdr; ++i) {
+         // SIMD dot product of quantized values
+-        sumi = ggml_cuda_dp4a(v[i], u[i], sumi);
++        sumi = ggml_cuda_dp4a_sel<plain>(v[i], u[i], sumi);
+     }
+ 
+     return d8_0*d8_1 * ((T) sumi);
+@@ -265,7 +265,7 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q8_1_q8_1_imp
+ #pragma unroll
+     for (int i = 0; i < vdr; ++i) {
+         // SIMD dot product of quantized values
+-        sumi = ggml_cuda_dp4a(v[i], u[i], sumi);
++        sumi = ggml_cuda_dp4a_plain(v[i], u[i], sumi);
+     }
+ 
+ #ifdef FAST_FP16_AVAILABLE
+@@ -295,7 +295,7 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q8_0_16_q8_1_
+ #pragma unroll
+         for (int i = i0; i < i0 + QI8_0/2; ++i) {
+             // SIMD dot product of quantized values
+-            sumi = ggml_cuda_dp4a(v[i], u[i], sumi);
++            sumi = ggml_cuda_dp4a_plain(v[i], u[i], sumi);
+         }
+ 
+         sumf += d8_0[i0/(QI8_0/2)]*sumi;
+@@ -320,8 +320,8 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
+         const int aux_q4 = get_int_b1(bq4->qs, iqs + l);
+         const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
+ 
+-        sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
+-        sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
++        sumi = ggml_cuda_dp4a_plain(v.x, q8[l + 0], sumi);
++        sumi = ggml_cuda_dp4a_plain(v.y, q8[l + 4], sumi);
+     }
+ 
+     const float d = ggml_cuda_e8m0_to_fp32(bq4->e) * 0.5f * __low2float(bq8_1->ds);
+@@ -349,10 +349,10 @@ static __device__ __forceinline__ float vec_dot_nvfp4_q8_1(
+         const block_q8_1 * bq8 = bq8_1 + (is >> 1);
+         const int32_t i8 = ((is & 1) << 2);
+ 
+-        int sumi = ggml_cuda_dp4a(v0.x, get_int_b4(bq8->qs, i8 + 0), 0);
+-        sumi = ggml_cuda_dp4a(v0.y, get_int_b4(bq8->qs, i8 + 2), sumi);
+-        sumi = ggml_cuda_dp4a(v1.x, get_int_b4(bq8->qs, i8 + 1), sumi);
+-        sumi = ggml_cuda_dp4a(v1.y, get_int_b4(bq8->qs, i8 + 3), sumi);
++        int sumi = ggml_cuda_dp4a_plain(v0.x, get_int_b4(bq8->qs, i8 + 0), 0);
++        sumi = ggml_cuda_dp4a_plain(v0.y, get_int_b4(bq8->qs, i8 + 2), sumi);
++        sumi = ggml_cuda_dp4a_plain(v1.x, get_int_b4(bq8->qs, i8 + 1), sumi);
++        sumi = ggml_cuda_dp4a_plain(v1.y, get_int_b4(bq8->qs, i8 + 3), sumi);
+ 
+         const float d = ggml_cuda_ue4m3_to_fp32(bq4->d[is]) * __low2float(bq8->ds);
+         sum += d * float(sumi);
+@@ -409,13 +409,13 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmq(
+ 
+ #pragma unroll
+         for (int i = i0; i < i0 + QI8_1/2; ++i) {
+-            sumi_d0 = ggml_cuda_dp4a(v[i], u[i], sumi_d0);
++            sumi_d0 = ggml_cuda_dp4a_plain(v[i], u[i], sumi_d0);
+         }
+         sumf_d8 += dm2f0.x * sumi_d0;
+ 
+ #pragma unroll
+         for (int i = i0 + QI8_1/2; i < i0 + QI8_1; ++i) {
+-            sumi_d1 = ggml_cuda_dp4a(v[i], u[i], sumi_d1);
++            sumi_d1 = ggml_cuda_dp4a_plain(v[i], u[i], sumi_d1);
+         }
+         sumf_d8 += dm2f1.x * sumi_d1;
+ 
+@@ -427,14 +427,14 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmq(
+             int sumi_m0 = 0;
+ #pragma unroll
+             for (int i = i0; i < i0 + QI8_1/2; ++i) {
+-                sumi_m0 = ggml_cuda_dp4a(0x01010101, u[i], sumi_m0);
++                sumi_m0 = ggml_cuda_dp4a_plain(0x01010101, u[i], sumi_m0);
+             }
+             sumf_d8 -= dm2f0.y * sumi_m0;
+ 
+             int sumi_m1 = 0;
+ #pragma unroll
+             for (int i = i0 + QI8_1/2; i < i0 + QI8_1; ++i) {
+-                sumi_m1 = ggml_cuda_dp4a(0x01010101, u[i], sumi_m1);
++                sumi_m1 = ggml_cuda_dp4a_plain(0x01010101, u[i], sumi_m1);
+             }
+             sumf_d8 -= dm2f1.y * sumi_m1;
+         }
+@@ -492,7 +492,7 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmq(
+ 
+ #pragma unroll
+         for (int i = i0; i < i0 + QI8_1/2; ++i) {
+-            sumi_sc = ggml_cuda_dp4a(v[i], u[i], sumi_sc); // SIMD dot product
++            sumi_sc = ggml_cuda_dp4a_plain(v[i], u[i], sumi_sc); // SIMD dot product
+         }
+ 
+         sumi += sumi_sc * scales[i0 / (QI8_1/2)];
+@@ -543,7 +543,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_mmq(
+ 
+ #pragma unroll
+         for (int j = 0; j < QI8_1; ++j) {
+-            sumi_d = ggml_cuda_dp4a((v[j] >> (4*i)) & 0x0F0F0F0F, u[i*QI8_1 + j], sumi_d); // SIMD dot product
++            sumi_d = ggml_cuda_dp4a_plain((v[j] >> (4*i)) & 0x0F0F0F0F, u[i*QI8_1 + j], sumi_d); // SIMD dot product
+         }
+ 
+         const float2 ds8f = __half22float2(ds8[i]);
+@@ -606,7 +606,7 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
+ 
+ #pragma unroll
+         for (int j = 0; j < QI8_1; ++j) {
+-            sumi_d = ggml_cuda_dp4a(v[i*QI8_1 + j], u[i*QI8_1 + j], sumi_d); // SIMD dot product
++            sumi_d = ggml_cuda_dp4a_plain(v[i*QI8_1 + j], u[i*QI8_1 + j], sumi_d); // SIMD dot product
+         }
+ 
+         const float2 ds8f = __half22float2(ds8[i]);
+@@ -662,11 +662,11 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmq(
+ 
+ #pragma unroll
+         for (int i = i0; i < i0 + 2; ++i) {
+-            sumi_d.x = ggml_cuda_dp4a(v[2*i+0], u[2*i+0], sumi_d.x); // SIMD dot product
+-            sumi_d.x = ggml_cuda_dp4a(v[2*i+1], u[2*i+1], sumi_d.x); // SIMD dot product
++            sumi_d.x = ggml_cuda_dp4a_plain(v[2*i+0], u[2*i+0], sumi_d.x); // SIMD dot product
++            sumi_d.x = ggml_cuda_dp4a_plain(v[2*i+1], u[2*i+1], sumi_d.x); // SIMD dot product
+ 
+-            sumi_d.y = ggml_cuda_dp4a(v[2*i+4], u[2*i+4], sumi_d.y); // SIMD dot product
+-            sumi_d.y = ggml_cuda_dp4a(v[2*i+5], u[2*i+5], sumi_d.y); // SIMD dot product
++            sumi_d.y = ggml_cuda_dp4a_plain(v[2*i+4], u[2*i+4], sumi_d.y); // SIMD dot product
++            sumi_d.y = ggml_cuda_dp4a_plain(v[2*i+5], u[2*i+5], sumi_d.y); // SIMD dot product
+         }
+ 
+         sumf_d += d8[i0/4] * (sc_reg[i0/2+0]*sumi_d.x + sc_reg[i0/2+1]*sumi_d.y);
+@@ -1343,8 +1343,8 @@ static __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(
+         const int aux_q4 = get_int_b2(bq4->qs, iqs + l);
+         const int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
+ 
+-        sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
+-        sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
++        sumi = ggml_cuda_dp4a_plain(v.x, q8[l + 0], sumi);
++        sumi = ggml_cuda_dp4a_plain(v.y, q8[l + 4], sumi);
+     }
+ 
+     const float d = __half2float(bq4->d) * __low2float(bq8_1->ds);
+@@ -1368,8 +1368,8 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
+         const int u0 = get_int_b4(bq8_1[iqs/4].qs, j + 0);
+         const int u1 = get_int_b4(bq8_1[iqs/4].qs, j + 4);
+ 
+-        sumi = ggml_cuda_dp4a(v.x, u0, sumi);
+-        sumi = ggml_cuda_dp4a(v.y, u1, sumi);
++        sumi = ggml_cuda_dp4a_plain(v.x, u0, sumi);
++        sumi = ggml_cuda_dp4a_plain(v.y, u1, sumi);
+     }
+ 
+     const int ls = ((bq4->scales_l[iqs/8] >> (iqs & 0x04)) & 0x0F) | (((bq4->scales_h >> (iqs/2)) & 0x03) << 4);

@@ -517,6 +517,14 @@ measurements and a reproduction. In short:
   (q5_K, q8_0, iq4_xs, q5_1), keep the GCN shape. Generation at 0 / 8192
   tokens deep: Qwen3 8B 27.9 / 24.2 -> 31.4 / 26.5 tok/s, Qwen2.5-Coder 7B
   30.3 / 27.0 -> 34.6 / 30.1.
+- **104-gfx803-sdwa-dp4a.patch**: in the decode kernels, the 4-byte integer
+  dot product under every quantized matmul is built from SDWA byte-select
+  multiplies instead of unpacked bytes, which frees registers: decode for 2-8
+  tokens no longer spills or drops to one wave, and 4-8 tokens get up to 1.6x
+  faster. Prompt kernels and the IQ4/FP4 table-lookup types keep the
+  compiler's code, which measured faster there. With a 5.2k-token
+  context, Qwen3 8B and Qwen2.5-Coder 7B (Q4_K_M) generate 6-7% faster; prompt
+  speed and IQ4_XS models are unchanged. Output is bit-identical.
 
 `patches/ollama/llama-cpp-server/090-mmproj-fit-target-device.patch` fixes
 llama.cpp's server, on every GPU. When it fits a model with a multimodal
