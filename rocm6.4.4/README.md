@@ -96,8 +96,8 @@ and preloads it for every process (`LD_PRELOAD` in the final stage), so every
 image built on this one inherits it. It replaces `rocblas_sgemm`,
 `rocblas_gemm_ex` and their strided-batched forms (which attention uses) for
 standard-algo fp32 calls, with register-tiled kernels that return correct
-results and run large GEMMs at 2.5-3 TFLOPS on an RX 590, 2-2.6x stock rocBLAS's
-speed. MIOpen's GEMM-based convolutions and the GEMM inside its gfx803 Winograd
+results and run large GEMMs at 3.8-4.8 TFLOPS on an RX 590, 3-4x stock
+rocBLAS's speed. MIOpen's GEMM-based convolutions and the GEMM inside its gfx803 Winograd
 solver also run through it. The original shim in
 [`patches/rocblas/sgemm-shim/`](patches/rocblas/sgemm-shim/) is still built, at
 `/opt/rocm/lib/libgfx803_sgemm_shim.so`, for comparisons only: it does not
@@ -379,7 +379,7 @@ and `vae-ft-mse-840000-ema-pruned` from `ComfyUI/models/vae/`, fp32, AdamW at
 (`--resume-run`); a run whose loss turns NaN stops, drops the NaN checkpoints
 and resumes from the last clean state. A healthy SD 1.5 LoRA loss sits around
 0.1-0.2. On an RX 590, a step (4 accumulated images of up to 512x512) takes
-about 4.3 seconds.
+about 4 seconds.
 
 `gfx803-train` caps PyTorch's VRAM. Uncapped, PyTorch keeps the memory it
 frees and grows until the card is full, whatever training needs: an SD 1.5 run

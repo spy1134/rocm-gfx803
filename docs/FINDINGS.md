@@ -18,6 +18,7 @@ against a CPU reference, and "it runs" was never taken as evidence.
 | --- | --- | --- |
 | Attention gradients wrong (shim missed batched GEMMs) | Fixed | `patches/sgemm-shim-batched/` |
 | Shim GEMMs 20x slow at power-of-two sizes | Fixed | same |
+| Shim large GEMMs at 2.5-3 TFLOPS | Faster (3.8-4.8 TFLOPS, pipelined tiles) | same |
 | Binary Winograd convs corrupt memory and hang the GPU | Fixed (solvers disabled) | `patches/miopen/winograd-bin-gfx803-disable.patch` |
 | No fast 3x3 convolution after that | Fixed (new solver) | `patches/miopen/winograd-f2x3-hip-gfx803.patch` |
 | fp16 3x3 convolutions slow (GEMM only) | Fixed (same solver, fp16) | same |
@@ -64,12 +65,20 @@ attention GEMM went from 214 to 11 ms.
 
 **Speed.** A profile of training put 88% of GPU time in the shim. Register-tiled
 kernels (64x64 and 32x32 output tiles, 4x4 or 2x2 outputs per thread, register
-prefetch of the next K slice) now handle the larger shapes, chosen per shape by
+prefetch of the next K slice) handle the larger shapes, chosen per shape by
 tile count and K; the 16x16 kernel remains for small outputs. Very wide GEMMs
 (more than 65535 column tiles) split across the grid instead of falling back to
-rocBLAS. Large GEMMs run at 2.5-3 TFLOPS, 2-2.6x stock rocBLAS's speed, and an
-SD 1.5 training step went from 7.8 to about 4.3 seconds. All variants are
-bit-identical to the reference kernel.
+rocBLAS. For fp32 with B not transposed, which is most of what PyTorch issues,
+faster variants of the two tiles issue the LDS reads for the next K step
+before the multiply-adds of the current one, so LDS latency overlaps
+arithmetic, and fetch A with float4 or float2 loads. Large GEMMs went from
+2.8-3.3 to 3.9-4.8 TFLOPS (2048^3: 3.3 -> 4.8; SD 1.5's linear layers 2.8 ->
+3.9-4.3; the 1280-channel convolution at 16x16 as a GEMM 2.5 -> 3.6), and
+transposed-B shapes gain 10-25%; LoRA's rank-8 GEMMs and transposed-A shapes
+stay within 5% of before. A 20-step SD 1.5 LoRA training run takes 4.0 s per
+step against about 4.1 before: the GEMMs are no longer most of a step.
+All variants are bit-identical to the reference kernel (46 reference cases and
+300 random GEMMs with odd sizes, leading dimensions and offsets).
 
 fp16 is covered too; see section 7a.
 

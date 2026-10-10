@@ -33,6 +33,9 @@
 //   gfx803_sgemm_tile:      a 16x16 tile of C, one output per thread.
 //   gfx803_sgemm_tile_p<P>: a (16P)x(16P) tile of C, a PxP block of outputs
 //                           per thread; P = 2 and P = 4 are used.
+// gfx803_sgemm_tile_p_fast and gfx803_sgemm_tile_p2_fast are the same 64x64
+// and 32x32 tiles for fp32 with B not transposed, which is most of what
+// PyTorch issues; see the comment at gfx803_sgemm_tile_p_fast.
 // Every output accumulates the same products in the same order in all of
 // them, so they return bit-identical results and gfx803_sgemm_pick_tile picks
 // a tile size on speed alone. Each serves two entry points: a single GEMM,
@@ -46,7 +49,9 @@
 // conv-as-GEMM and linear shapes (512x4608x8192: 33.7 -> 13.1 ms), and the
 // 32x32 tile serves the shapes with too few 64x64 tiles to fill the card
 // (1280-channel convs at the smallest latent size, LoRA's rank-8 GEMMs).
-// Training steps drop from 7.8 to about 4.3 s.
+// Training steps drop from 7.8 to about 4.3 s. The fast variants take the
+// large shapes to 3.8-4.8 TFLOPS (2048^3: 3.3 -> 4.8; 320x4096x2880:
+// 3.0 -> 4.35).
 //
 // Memory access is laid out for the column-major operands rocBLAS passes: see
 // the comment in gfx803_sgemm_tile. Arranged the other way, a leading
@@ -63,6 +68,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <type_traits>
 
 #define GFX803_SGEMM_TILE 16
 #define GFX803_SGEMM_MAX_GRID_YZ 65535
@@ -238,15 +244,22 @@ __device__ __forceinline__ void gfx803_sgemm_tile_p(int M, int N, int K,
         // so their latency hides behind it.
         if (t + 1 < n_tiles) fetch((t + 1) * KT);
 
+        float av[2][P], bv[2][P];
+        gfx803_vec<P>::unpack(*reinterpret_cast<const vec*>(&As[0][tx * P]), av[0]);
+        gfx803_vec<P>::unpack(*reinterpret_cast<const vec*>(&Bs[0][ty * P]), bv[0]);
+
         #pragma unroll
         for (int k = 0; k < KT; k++) {
-            float av[P], bv[P];
-            gfx803_vec<P>::unpack(*reinterpret_cast<const vec*>(&As[k][tx * P]), av);
-            gfx803_vec<P>::unpack(*reinterpret_cast<const vec*>(&Bs[k][ty * P]), bv);
+            int cur = k & 1;
+            int nxt = (k + 1) & 1;
+            if (k + 1 < KT) {
+                gfx803_vec<P>::unpack(*reinterpret_cast<const vec*>(&As[k + 1][tx * P]), av[nxt]);
+                gfx803_vec<P>::unpack(*reinterpret_cast<const vec*>(&Bs[k + 1][ty * P]), bv[nxt]);
+            }
             #pragma unroll
             for (int i = 0; i < P; i++)
                 #pragma unroll
-                for (int j = 0; j < P; j++) acc[i][j] += av[i] * bv[j];
+                for (int j = 0; j < P; j++) acc[i][j] += av[cur][i] * bv[cur][j];
         }
         __syncthreads();
     }
@@ -323,6 +336,318 @@ gfx803_sgemm_p_strided_batched_kernel(int M, int N, int K,
                            C + b * strideC, ldc);
 }
 
+// gfx803_sgemm_tile_p spends part of every K step waiting: each thread reads
+// its next A and B values from LDS and then has nothing to do until they
+// arrive. Here the reads for step k+1 are issued before the multiply-adds of
+// step k (av/bv double-buffered), so the LDS latency overlaps arithmetic.
+// With A not transposed its column is contiguous along M, so a thread fetches
+// four rows with one float4 global load and stores them with one LDS write.
+// B is staged with consecutive lanes on consecutive K, its contiguous
+// dimension when B is not transposed; with B transposed that dimension is N
+// and the same mapping would stride every lane by ldb, so transposed-B calls
+// keep gfx803_sgemm_tile_p. TransA is a template parameter so the fetch has
+// no runtime branch on layout. The float4 path needs no alignment: gfx8 runs
+// in unaligned mode under amdkfd, and edge tiles fall back to guarded scalar
+// loads.
+template <int P, bool TransA, typename E>
+__device__ __forceinline__ void gfx803_sgemm_tile_p_fast(int M, int N, int K,
+                                                          float alpha,
+                                                          const E* __restrict__ A, int lda,
+                                                          const E* __restrict__ B, int ldb,
+                                                          float beta,
+                                                          E* __restrict__ C, int ldc) {
+    constexpr int T = 16 * P, KT = GFX803_SGEMM_BIG_K;
+    typedef typename gfx803_vec<P>::type vec;
+    __shared__ float As[KT][T + 4];
+    __shared__ float Bs[KT][T + 4];
+
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int tid = ty * 16 + tx;
+    const int row0 = blockIdx.x * T;
+    const int col0 = blockIdx.y * T;
+
+    int k_a, r_a, gr_a;
+    if constexpr (!TransA) {
+        k_a = tid >> 4;
+        r_a = (tid & 15) << 2;
+        gr_a = row0 + r_a;
+    } else {
+        r_a = tid >> 2;
+        k_a = (tid & 3) << 2;
+        gr_a = row0 + r_a;
+    }
+
+    const int k_b = tid & 15;
+    const int c_b_base = tid >> 4;
+
+    float4 pa_vec;
+    float pb[4];
+
+    auto fetch = [&](int k0) {
+        int gk_a = k0 + k_a;
+        if constexpr (!TransA) {
+            if (gr_a + 3 < M && gk_a < K) {
+                pa_vec = *reinterpret_cast<const float4*>(&A[(size_t)gk_a * lda + gr_a]);
+            } else {
+                pa_vec = make_float4(
+                    (gr_a + 0 < M && gk_a < K) ? static_cast<float>(A[(size_t)gk_a * lda + gr_a + 0]) : 0.0f,
+                    (gr_a + 1 < M && gk_a < K) ? static_cast<float>(A[(size_t)gk_a * lda + gr_a + 1]) : 0.0f,
+                    (gr_a + 2 < M && gk_a < K) ? static_cast<float>(A[(size_t)gk_a * lda + gr_a + 2]) : 0.0f,
+                    (gr_a + 3 < M && gk_a < K) ? static_cast<float>(A[(size_t)gk_a * lda + gr_a + 3]) : 0.0f
+                );
+            }
+        } else {
+            if (gr_a < M && gk_a + 3 < K) {
+                pa_vec = *reinterpret_cast<const float4*>(&A[(size_t)gr_a * lda + gk_a]);
+            } else {
+                pa_vec = make_float4(
+                    (gr_a < M && gk_a + 0 < K) ? static_cast<float>(A[(size_t)gr_a * lda + gk_a + 0]) : 0.0f,
+                    (gr_a < M && gk_a + 1 < K) ? static_cast<float>(A[(size_t)gr_a * lda + gk_a + 1]) : 0.0f,
+                    (gr_a < M && gk_a + 2 < K) ? static_cast<float>(A[(size_t)gr_a * lda + gk_a + 2]) : 0.0f,
+                    (gr_a < M && gk_a + 3 < K) ? static_cast<float>(A[(size_t)gr_a * lda + gk_a + 3]) : 0.0f
+                );
+            }
+        }
+
+        int gk = k0 + k_b;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int gc = col0 + c_b_base + 16 * i;
+            pb[i] = (gc < N && gk < K) ? static_cast<float>(B[(size_t)gc * ldb + gk]) : 0.0f;
+        }
+    };
+
+    float acc[P][P];
+    #pragma unroll
+    for (int i = 0; i < P; i++)
+        #pragma unroll
+        for (int j = 0; j < P; j++) acc[i][j] = 0.0f;
+
+    const int n_tiles = (K + KT - 1) / KT;
+    fetch(0);
+    for (int t = 0; t < n_tiles; t++) {
+        if constexpr (!TransA) {
+            *reinterpret_cast<float4*>(&As[k_a][r_a]) = pa_vec;
+        } else {
+            As[k_a + 0][r_a] = pa_vec.x;
+            As[k_a + 1][r_a] = pa_vec.y;
+            As[k_a + 2][r_a] = pa_vec.z;
+            As[k_a + 3][r_a] = pa_vec.w;
+        }
+
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            Bs[k_b][c_b_base + 16 * i] = pb[i];
+        }
+
+        __syncthreads();
+        if (t + 1 < n_tiles) fetch((t + 1) * KT);
+
+        float av[2][P], bv[2][P];
+        gfx803_vec<P>::unpack(*reinterpret_cast<const vec*>(&As[0][tx * P]), av[0]);
+        gfx803_vec<P>::unpack(*reinterpret_cast<const vec*>(&Bs[0][ty * P]), bv[0]);
+
+        #pragma unroll
+        for (int k = 0; k < KT; k++) {
+            int cur = k & 1;
+            int nxt = (k + 1) & 1;
+            if (k + 1 < KT) {
+                gfx803_vec<P>::unpack(*reinterpret_cast<const vec*>(&As[k + 1][tx * P]), av[nxt]);
+                gfx803_vec<P>::unpack(*reinterpret_cast<const vec*>(&Bs[k + 1][ty * P]), bv[nxt]);
+            }
+            #pragma unroll
+            for (int i = 0; i < P; i++)
+                #pragma unroll
+                for (int j = 0; j < P; j++) acc[i][j] += av[cur][i] * bv[cur][j];
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int j = 0; j < P; j++) {
+        int col = col0 + ty * P + j;
+        #pragma unroll
+        for (int i = 0; i < P; i++) {
+            int row = row0 + tx * P + i;
+            if (row < M && col < N) {
+                size_t idx = (size_t)col * ldc + row;
+                C[idx] = static_cast<E>(alpha * acc[i][j] + (beta != 0.0f ? beta * static_cast<float>(C[idx]) : 0.0f));
+            }
+        }
+    }
+}
+
+// The 32x32 tile with the scheme of gfx803_sgemm_tile_p_fast. Each thread
+// fetches two values of A and two of B per K slice, so the wide loads are
+// float2.
+template <bool TransA, typename E>
+__device__ __forceinline__ void gfx803_sgemm_tile_p2_fast(int M, int N, int K,
+                                                          float alpha,
+                                                          const E* __restrict__ A, int lda,
+                                                          const E* __restrict__ B, int ldb,
+                                                          float beta,
+                                                          E* __restrict__ C, int ldc) {
+    constexpr int P = 2;
+    constexpr int T = 16 * P, KT = GFX803_SGEMM_BIG_K;
+    typedef typename gfx803_vec<P>::type vec;
+    __shared__ float As[KT][T + 4];
+    __shared__ float Bs[KT][T + 4];
+
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int tid = ty * 16 + tx;
+    const int row0 = blockIdx.x * T;
+    const int col0 = blockIdx.y * T;
+
+    const int r_a = (tid & 15) << 1;
+    const int k_a = tid >> 4;
+    const int gr_a = row0 + r_a;
+
+    const int c_b = tid >> 3;
+    const int k_b = (tid & 7) << 1;
+    const int gc_b = col0 + c_b;
+
+    float2 pa, pb;
+
+    auto fetch = [&](int k0) {
+        int gk_a = k0 + k_a;
+        if constexpr (!TransA) {
+            if (gr_a + 1 < M && gk_a < K) {
+                pa = *reinterpret_cast<const float2*>(&A[(size_t)gk_a * lda + gr_a]);
+            } else {
+                pa = make_float2(
+                    (gr_a + 0 < M && gk_a < K) ? static_cast<float>(A[(size_t)gk_a * lda + gr_a + 0]) : 0.0f,
+                    (gr_a + 1 < M && gk_a < K) ? static_cast<float>(A[(size_t)gk_a * lda + gr_a + 1]) : 0.0f
+                );
+            }
+        } else {
+            pa = make_float2(
+                (gr_a + 0 < M && gk_a < K) ? static_cast<float>(A[(size_t)(gr_a + 0) * lda + gk_a]) : 0.0f,
+                (gr_a + 1 < M && gk_a < K) ? static_cast<float>(A[(size_t)(gr_a + 1) * lda + gk_a]) : 0.0f
+            );
+        }
+
+        int gk_b = k0 + k_b;
+        if (gc_b < N && gk_b + 1 < K) {
+            pb = *reinterpret_cast<const float2*>(&B[(size_t)gc_b * ldb + gk_b]);
+        } else {
+            pb = make_float2(
+                (gc_b < N && gk_b + 0 < K) ? static_cast<float>(B[(size_t)gc_b * ldb + gk_b + 0]) : 0.0f,
+                (gc_b < N && gk_b + 1 < K) ? static_cast<float>(B[(size_t)gc_b * ldb + gk_b + 1]) : 0.0f
+            );
+        }
+    };
+
+    float acc[P][P];
+    #pragma unroll
+    for (int i = 0; i < P; i++)
+        #pragma unroll
+        for (int j = 0; j < P; j++) acc[i][j] = 0.0f;
+
+    const int n_tiles = (K + KT - 1) / KT;
+    fetch(0);
+    for (int t = 0; t < n_tiles; t++) {
+        *reinterpret_cast<float2*>(&As[k_a][r_a]) = pa;
+
+        Bs[k_b + 0][c_b] = pb.x;
+        Bs[k_b + 1][c_b] = pb.y;
+
+        __syncthreads();
+        if (t + 1 < n_tiles) fetch((t + 1) * KT);
+
+        float av[2][P], bv[2][P];
+        gfx803_vec<P>::unpack(*reinterpret_cast<const vec*>(&As[0][tx * P]), av[0]);
+        gfx803_vec<P>::unpack(*reinterpret_cast<const vec*>(&Bs[0][ty * P]), bv[0]);
+
+        #pragma unroll
+        for (int k = 0; k < KT; k++) {
+            int cur = k & 1;
+            int nxt = (k + 1) & 1;
+            if (k + 1 < KT) {
+                gfx803_vec<P>::unpack(*reinterpret_cast<const vec*>(&As[k + 1][tx * P]), av[nxt]);
+                gfx803_vec<P>::unpack(*reinterpret_cast<const vec*>(&Bs[k + 1][ty * P]), bv[nxt]);
+            }
+            #pragma unroll
+            for (int i = 0; i < P; i++)
+                #pragma unroll
+                for (int j = 0; j < P; j++) acc[i][j] += av[cur][i] * bv[cur][j];
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int j = 0; j < P; j++) {
+        int col = col0 + ty * P + j;
+        #pragma unroll
+        for (int i = 0; i < P; i++) {
+            int row = row0 + tx * P + i;
+            if (row < M && col < N) {
+                size_t idx = (size_t)col * ldc + row;
+                C[idx] = static_cast<E>(alpha * acc[i][j] + (beta != 0.0f ? beta * static_cast<float>(C[idx]) : 0.0f));
+            }
+        }
+    }
+}
+
+template <int P, bool TransA, typename T>
+__global__ void __launch_bounds__(256)
+gfx803_sgemm_p_fast_kernel(int M, int N, int K,
+                           float alpha,
+                           const T* __restrict__ A, int lda,
+                           const T* __restrict__ B, int ldb,
+                           float beta,
+                           T* __restrict__ C, int ldc) {
+    gfx803_sgemm_tile_p_fast<P, TransA, T>(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+}
+
+template <int P, bool TransA, typename T>
+__global__ void __launch_bounds__(256)
+gfx803_sgemm_p_strided_batched_fast_kernel(int M, int N, int K,
+                                           float alpha,
+                                           const T* __restrict__ A, int lda,
+                                           int64_t strideA,
+                                           const T* __restrict__ B, int ldb,
+                                           int64_t strideB,
+                                           float beta,
+                                           T* __restrict__ C, int ldc,
+                                           int64_t strideC) {
+    const int64_t b = (int64_t)blockIdx.z;
+    gfx803_sgemm_tile_p_fast<P, TransA, T>(M, N, K, alpha,
+                                          A + b * strideA, lda,
+                                          B + b * strideB, ldb,
+                                          beta,
+                                          C + b * strideC, ldc);
+}
+
+template <bool TransA, typename T>
+__global__ void __launch_bounds__(256)
+gfx803_sgemm_p2_fast_kernel(int M, int N, int K,
+                            float alpha,
+                            const T* __restrict__ A, int lda,
+                            const T* __restrict__ B, int ldb,
+                            float beta,
+                            T* __restrict__ C, int ldc) {
+    gfx803_sgemm_tile_p2_fast<TransA, T>(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+}
+
+template <bool TransA, typename T>
+__global__ void __launch_bounds__(256)
+gfx803_sgemm_p2_strided_batched_fast_kernel(int M, int N, int K,
+                                            float alpha,
+                                            const T* __restrict__ A, int lda,
+                                            int64_t strideA,
+                                            const T* __restrict__ B, int ldb,
+                                            int64_t strideB,
+                                            float beta,
+                                            T* __restrict__ C, int ldc,
+                                            int64_t strideC) {
+    const int64_t b = (int64_t)blockIdx.z;
+    gfx803_sgemm_tile_p2_fast<TransA, T>(M, N, K, alpha,
+                                         A + b * strideA, lda,
+                                         B + b * strideB, ldb,
+                                         beta,
+                                         C + b * strideC, ldc);
+}
+
 static inline long gfx803_sgemm_env_long(const char* name, long fallback) {
     const char* v = getenv(name);
     return v ? atol(v) : fallback;
@@ -396,19 +721,57 @@ inline hipError_t gfx803_gemm_strided_batched(int M, int N, int K,
             const T* As = A + (int64_t)start * strideA;
             const T* Bs = Bc + (int64_t)start * strideB;
             T* Cs = Cc + (int64_t)start * strideC;
-            if (batch_count == 1) {
-                auto kernel = tile == 64 ? gfx803_sgemm_p_kernel<4, T>
-                            : tile == 32 ? gfx803_sgemm_p_kernel<2, T>
-                                         : gfx803_sgemm_kernel<T>;
-                hipLaunchKernelGGL(kernel, grid, block, 0, stream,
-                                   M, cols, K, alpha, As, lda, transA, Bs, ldb, transB, beta, Cs, ldc);
+            if (!transB && tile == 64 && std::is_same_v<T, float>) {
+                if (batch_count == 1) {
+                    if (!transA) {
+                        hipLaunchKernelGGL((gfx803_sgemm_p_fast_kernel<4, false, float>), grid, block, 0, stream,
+                                           M, cols, K, alpha, (const float*)As, lda, (const float*)Bs, ldb, beta, (float*)Cs, ldc);
+                    } else {
+                        hipLaunchKernelGGL((gfx803_sgemm_p_fast_kernel<4, true, float>), grid, block, 0, stream,
+                                           M, cols, K, alpha, (const float*)As, lda, (const float*)Bs, ldb, beta, (float*)Cs, ldc);
+                    }
+                } else {
+                    if (!transA) {
+                        hipLaunchKernelGGL((gfx803_sgemm_p_strided_batched_fast_kernel<4, false, float>), grid, block, 0, stream,
+                                           M, cols, K, alpha, (const float*)As, lda, strideA, (const float*)Bs, ldb, strideB, beta, (float*)Cs, ldc, strideC);
+                    } else {
+                        hipLaunchKernelGGL((gfx803_sgemm_p_strided_batched_fast_kernel<4, true, float>), grid, block, 0, stream,
+                                           M, cols, K, alpha, (const float*)As, lda, strideA, (const float*)Bs, ldb, strideB, beta, (float*)Cs, ldc, strideC);
+                    }
+                }
+            } else if (!transB && tile == 32 && std::is_same_v<T, float>) {
+                if (batch_count == 1) {
+                    if (!transA) {
+                        hipLaunchKernelGGL((gfx803_sgemm_p2_fast_kernel<false, float>), grid, block, 0, stream,
+                                           M, cols, K, alpha, (const float*)As, lda, (const float*)Bs, ldb, beta, (float*)Cs, ldc);
+                    } else {
+                        hipLaunchKernelGGL((gfx803_sgemm_p2_fast_kernel<true, float>), grid, block, 0, stream,
+                                           M, cols, K, alpha, (const float*)As, lda, (const float*)Bs, ldb, beta, (float*)Cs, ldc);
+                    }
+                } else {
+                    if (!transA) {
+                        hipLaunchKernelGGL((gfx803_sgemm_p2_strided_batched_fast_kernel<false, float>), grid, block, 0, stream,
+                                           M, cols, K, alpha, (const float*)As, lda, strideA, (const float*)Bs, ldb, strideB, beta, (float*)Cs, ldc, strideC);
+                    } else {
+                        hipLaunchKernelGGL((gfx803_sgemm_p2_strided_batched_fast_kernel<true, float>), grid, block, 0, stream,
+                                           M, cols, K, alpha, (const float*)As, lda, strideA, (const float*)Bs, ldb, strideB, beta, (float*)Cs, ldc, strideC);
+                    }
+                }
             } else {
-                auto kernel = tile == 64 ? gfx803_sgemm_p_strided_batched_kernel<4, T>
-                            : tile == 32 ? gfx803_sgemm_p_strided_batched_kernel<2, T>
-                                         : gfx803_sgemm_strided_batched_kernel<T>;
-                hipLaunchKernelGGL(kernel, grid, block, 0, stream,
-                                   M, cols, K, alpha, As, lda, strideA, transA, Bs, ldb, strideB, transB,
-                                   beta, Cs, ldc, strideC);
+                if (batch_count == 1) {
+                    auto kernel = tile == 64 ? gfx803_sgemm_p_kernel<4, T>
+                                : tile == 32 ? gfx803_sgemm_p_kernel<2, T>
+                                             : gfx803_sgemm_kernel<T>;
+                    hipLaunchKernelGGL(kernel, grid, block, 0, stream,
+                                       M, cols, K, alpha, As, lda, transA, Bs, ldb, transB, beta, Cs, ldc);
+                } else {
+                    auto kernel = tile == 64 ? gfx803_sgemm_p_strided_batched_kernel<4, T>
+                                : tile == 32 ? gfx803_sgemm_p_strided_batched_kernel<2, T>
+                                             : gfx803_sgemm_strided_batched_kernel<T>;
+                    hipLaunchKernelGGL(kernel, grid, block, 0, stream,
+                                       M, cols, K, alpha, As, lda, strideA, transA, Bs, ldb, strideB, transB,
+                                       beta, Cs, ldc, strideC);
+                }
             }
             hipError_t err = hipGetLastError();
             if (err != hipSuccess) return err;
