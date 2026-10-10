@@ -25,7 +25,7 @@ against a CPU reference, and "it runs" was never taken as evidence.
 | rocBLAS fp16 N/T GEMMs 15-25x slow | Fixed (shim fp16 route) | `patches/sgemm-shim-batched/` |
 | bf16 reported as supported (no bf16 hardware) | Checked: correct; convs 1.7x slower than fp16 | none needed |
 | PyTorch int8 matmul fails on every call | Fixed (port of upstream's fix) | `patches/pytorch/` |
-| PyTorch layer_norm wrong | Worked around | `runtime/python/` |
+| PyTorch layer_norm wrong (warp-size mismatch) | Fixed | `patches/pytorch/` |
 | torchvision nms has no gfx803 kernel | Worked around (CPU) | `runtime/python/` |
 | Patched HSA runtime page faults | Open; images default to the stock runtime | `Dockerfile`, start scripts |
 | VRAM exhaustion freezes the desktop | Mitigated (VRAM cap) | `training/gfx803-train.sh` |
@@ -204,15 +204,38 @@ floating-point GEMMs already do. The fix comes from upstream's ROCm 10 line
 shapes and transpose layouts bit-exact against an int64 CPU product; 4 TOPS at
 2048^3.
 
+**layer_norm.** PyTorch's HIP layer_norm was wrong on gfx803: called
+directly in fp32 (`torch.ops.aten.native_layer_norm`), forward and backward
+disagreed with a float64 CPU reference in 80 of 80 runs across SD 1.5's
+shapes, with forward errors up to 8.5 on unit-scale outputs, and every
+transformer block uses it. The cause is a warp-size mismatch. Device code
+takes its warp size from `C10_WARP_SIZE` in `c10/macros/Macros.h`, which is 64
+only for `__GFX9__` and 32 for every other AMD target, gfx803 included,
+although gfx803 runs 64-lane wavefronts. layer_norm's host code sized launches
+and shared memory with `at::cuda::warp_size()`, the hardware's 64: the
+vectorized forward kernel ran 64-wide rows of threads in which only lanes 0-31
+reached the cross-warp reduction, so the mean and variance left out half of
+each row, and the backward kernel allocated shared memory for 4 warps where
+its block reduction writes 8.
+
+[`gfx803-layer-norm-warp-size.patch`](../rocm6.4.4/patches/pytorch/gfx803-layer-norm-warp-size.patch)
+makes layer_norm's launchers use the warp size the device code was compiled
+with (32 on a 64-lane GPU that is not gfx9). Every kernel in the file is
+correct with 32-wide blocks, because its shuffles stay within 32 lanes. After
+it, native layer_norm matches the CPU in 80 of 80 runs (forward error 2.5e-6,
+backward 2.7e-7), and so do all three gradients over odd sizes and both
+backward kernels. Defining `C10_WARP_SIZE` as 64 for gfx8 instead also fixes
+layer_norm, but it changes every kernel compiled against the macro and some
+depend on 32: group_norm's weight and bias gradients then come out about 100%
+wrong whenever the spatial size is 1 and there are more than 128 rows
+(`GammaBeta1dBackwardCUDAKernel2`, a fixed 32x16 block reduced with
+full-wavefront shuffles). The image used to route GPU layer_norm through
+group_norm with one group; that route is gone.
+
 The workarounds below are loaded into every Python process through `sitecustomize` in the base
 image; the modules are in [`rocm6.4.4/runtime/python/`](../rocm6.4.4/runtime/python/).
 They are workarounds with their source fixes still to do.
 
-- **layer_norm.** PyTorch's HIP layer_norm kernel is wrong on gfx803: called
-  directly in fp32 it disagreed with a float64 CPU reference in 80 of 80 runs
-  across SD 1.5's shapes, with forward errors up to 8.5 on unit-scale outputs.
-  Every transformer block uses it. GPU layer_norm is routed through group_norm
-  with one group, the same operation, which computes correctly.
 - **torchvision nms.** The compiled op has no gfx803 code object ("invalid
   device function"); it runs on the CPU.
 - **accelerate on a build without torch.distributed.** accelerate 1.15 imports
@@ -342,14 +365,18 @@ a reproduction.
 - Why the binary Winograd kernels fail on gfx803 (they are disabled, not
   fixed). Candidates: their persistent launch, or wrong cache/release fields in
   their converted code-object metadata on gfx8.
-- PyTorch's layer_norm and torchvision's nms need source fixes in the PyTorch
-  build.
 - Why the patched HSA runtime's va-reuse-defer change page-faults on gfx803
   (GEGLU op test, wide GEMMs then a transposed copy, llama-server mid-prompt),
   and whether it causes ComfyUI's faults after a model reload. The images run
   AMD's stock runtime until this is understood; the reproducers are
   `gfx803_unet_check.py --only GEGLU` and `workspace/scratch/wide_test.py`, on
   `GFX803_RUNTIME=patched` with the desktop stopped (a fault storm can freeze it).
+- torchvision's nms op needs a source fix or gfx803 kernel target in the PyTorch / torchvision build.
+- Whether PyTorch's group_norm computes wrong weight and bias gradients on
+  gfx9 for a spatial size of 1 and more than 128 rows:
+  `GammaBeta1dBackwardCUDAKernel2` reduces a 32-wide tile with shuffles over
+  `C10_WARP_SIZE` lanes, which upstream sets to 64 there (section 5). That
+  would be an upstream bug; not tested, as there is no gfx9 card here.
 - fp16 over full-length training runs and in ComfyUI (only short runs so far).
 - The `init_user_pages: Failed to get user pages: -1` kernel messages on every
   Ollama model load.

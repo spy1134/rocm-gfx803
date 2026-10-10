@@ -1,0 +1,102 @@
+PyTorch (ROCm/pytorch release/2.8, commit d618db8): size layer_norm's
+launches by the warp size its device code was compiled with.
+
+WHY
+PyTorch's HIP layer_norm is wrong on gfx803. torch.ops.aten.native_layer_norm
+in fp32 disagrees with a float64 CPU reference in every one of 80 runs across
+SD 1.5's shapes ((2, 4096, 320), (2, 77, 768) and others): forward errors up
+to 8.5 on unit-scale outputs, input gradients off by up to 51%. To reproduce,
+compare native_layer_norm and its backward on the GPU with the CPU on random
+fp32 input.
+
+c10/macros/Macros.h sets C10_WARP_SIZE to 64 for gfx9 and to 32 for every
+other AMD target, so gfx803's device code reduces over 32 lanes although the
+hardware runs 64-lane wavefronts. The host side of layer_norm_kernel.cu sizes
+launches and shared memory with at::cuda::warp_size(), the hardware's 64. The
+vectorized forward kernel then runs 64-wide rows of threads in which only
+lanes 0-31 reach the cross-warp reduction, so each row's mean and variance
+leave out half of its elements; the backward input-gradient kernel allocates
+shared memory for 256/64 = 4 warps while BlockReduceSum stores one value for
+each of its 8 32-lane warps.
+
+Making C10_WARP_SIZE 64 for gfx8 instead fixes layer_norm but changes every
+kernel compiled against the macro, and some depend on 32: group_norm's weight
+and bias gradients (GammaBeta1dBackwardCUDAKernel2, a fixed 32x16 block, used
+when the spatial size is 1 and there are more than 128 rows) come out about
+100% wrong. The fix therefore stays inside layer_norm_kernel.cu.
+
+WHAT
+layer_norm_warp_size() returns 32 on a ROCm device whose wavefront is 64 but
+which is not gfx9 (gfx6-8, matching Macros.h), and at::cuda::warp_size()
+everywhere else. The forward and backward launchers use it in place of
+at::cuda::warp_size(). Every kernel in the file is correct with 32-wide
+blocks on 64-lane hardware: their shuffles use offsets and XOR masks below
+32, so each half-wavefront reduces on its own, and their shared memory is
+sized from blockDim. CUDA builds and gfx9 are unchanged.
+
+REAL-HARDWARE VERIFICATION (RX 590, this image)
+native_layer_norm against float64 on the CPU: 0 of 80 runs bad (forward error
+2.5e-6, backward 2.7e-7). F.layer_norm forward and input, weight and bias
+gradients over 11 shapes covering the vectorized and scalar forward kernels,
+both input-gradient kernels (M below and above 32768) and both weight/bias
+paths (M below and above 128): all within 2.1e-7 relative. group_norm's
+gradients unchanged and correct; PyTorch op suite 118 of 118; SD 1.5 UNet
+check (ops forward and backward, full UNet) clean; ComfyUI SD 1.5 txt2img
+within 0.3/255 of a CPU run; 20 LoRA training steps, loss 0.194, no GPU
+faults.
+
+diff --git a/aten/src/ATen/native/cuda/layer_norm_kernel.cu b/aten/src/ATen/native/cuda/layer_norm_kernel.cu
+index aa25ad5..1b247eb 100644
+--- a/aten/src/ATen/native/cuda/layer_norm_kernel.cu
++++ b/aten/src/ATen/native/cuda/layer_norm_kernel.cu
+@@ -1,6 +1,7 @@
+ #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
+ #include <ATen/native/layer_norm.h>
+ 
++#include <cstring>
+ #include <type_traits>
+ 
+ #include <thrust/tuple.h>
+@@ -41,6 +42,24 @@ constexpr unsigned int kWarpSize = C10_WARP_SIZE;
+ #endif
+ constexpr int vec_size = 4; //we could make it dependent on dtype, but that would lead to different results between float and low-p types
+ 
++// GFX803_LAYER_NORM_WARP_SIZE_PATCH: the kernels below reduce over
++// C10_WARP_SIZE lanes, which c10/macros/Macros.h makes 64 only for gfx9 and 32
++// for every other AMD target, while at::cuda::warp_size() reports the
++// hardware's wavefront, 64 on gfx6-8. Sized by the hardware value, blocks and
++// shared memory fit half as many warps as the device code reduces over: the
++// vectorized forward kernel leaves lanes 32-63 of each wavefront out of the row
++// statistics, and the backward kernel's BlockReduceSum writes past its shared
++// buffer. Launches here use the warp size the device code was compiled with.
++int layer_norm_warp_size() {
++#ifdef USE_ROCM
++  const auto* prop = at::cuda::getCurrentDeviceProperties();
++  if (prop->warpSize == 64 && std::strncmp(prop->gcnArchName, "gfx9", 4) != 0) {
++    return 32;
++  }
++#endif
++  return at::cuda::warp_size();
++}
++
+ // aligned vector generates vectorized load/store on CUDA (copy-pasted from MemoryAccess.cuh)
+ template<typename scalar_t, int vec_size>
+ struct alignas(sizeof(scalar_t) * vec_size) aligned_vector {
+@@ -934,7 +953,7 @@ void launch_vectorized_layer_norm_kernel(
+ ) {
+     //constexpr int alignment = 16; //currently unused to make sure float and half results are bw accurate
+     auto stream = at::cuda::getCurrentCUDAStream().stream();
+-    const int warp_size = at::cuda::warp_size();
++    const int warp_size = layer_norm_warp_size();
+     const dim3 threads(warp_size, num_threads() / warp_size, 1);
+     dim3 blocks(M);
+ 
+@@ -1385,7 +1404,7 @@ void LayerNormBackwardKernelImplInternal(
+       gamma.defined() ? gamma.template const_data_ptr<T>() : nullptr;
+   T* dX_data = dX->defined() ? dX->template data_ptr<T>() : nullptr;
+   cudaStream_t cuda_stream = at::cuda::getCurrentCUDAStream();
+-  const int warp_size = at::cuda::warp_size();
++  const int warp_size = layer_norm_warp_size();
+   if (dX_data != nullptr) {
+ #ifdef USE_ROCM
+     if (M >= 32768) {

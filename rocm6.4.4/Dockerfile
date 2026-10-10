@@ -728,10 +728,14 @@ RUN git init -q /pytorch \
     && git -C /pytorch submodule update -q --init --recursive --depth 1
 
 # torch._int_mm reaches hipBLASLt unconditionally, and hipBLASLt has no gfx803
-# kernels, so every int8 matmul fails; the patch routes it to rocBLAS. Applied
-# to the CUDA source, before build_amd.py hipifies it.
+# kernels, so every int8 matmul fails; the first patch routes it to rocBLAS.
+# layer_norm sizes its launches by the hardware's 64-lane wavefront while its
+# kernels reduce over the 32 lanes C10_WARP_SIZE gives gfx803; the second
+# patch sizes them by the compiled value. Applied to the CUDA source, before
+# build_amd.py hipifies it.
 COPY patches/pytorch/ /pytorch-patches/
-RUN sh /pytorch-patches/gfx803-int8-gemm-rocblas.sh /pytorch
+RUN sh /pytorch-patches/gfx803-int8-gemm-rocblas.sh /pytorch \
+    && sh /pytorch-patches/gfx803-layer-norm-warp-size.sh /pytorch
 
 WORKDIR /pytorch
 RUN pip install --no-cache-dir -r requirements.txt
@@ -1019,8 +1023,8 @@ ENV UV_CONSTRAINT=/opt/pip-constraints.txt
 
 ENV PATH="$VIRTUAL_ENV/bin:${PATH}"
 
-# Python-level gfx803 workarounds (PyTorch layer_norm, torchvision nms,
-# accelerate and torch.distributed on a build without distributed support),
+# Python-level gfx803 workarounds (torchvision nms, accelerate and
+# torch.distributed on a build without distributed support),
 # loaded into every Python process through sitecustomize; PYTHONPATH above puts
 # /opt/rocm/lib on the path. Each module's header says what it works around.
 COPY runtime/python/ /opt/rocm/lib/
