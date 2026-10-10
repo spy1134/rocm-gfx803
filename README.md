@@ -82,8 +82,9 @@ options, ComfyUI and Ollama.
 
 In short, out of the box on these cards: training learned from wrong numbers, sustained loads
 could freeze the GPU or the whole machine, a core PyTorch function computed wrong results, and
-Ollama read prompts about ten times slower than it should. Each of these is fixed, and the fixes made
-fp16 and local language models run at full speed. [`docs/FINDINGS.md`](docs/FINDINGS.md) has
+Ollama read prompts about ten times slower than it should, generated text well below what the
+card's memory allows, and could fill the card until the desktop stalled. Each of these is fixed,
+and the fixes made fp16 and local language models run at full speed. [`docs/FINDINGS.md`](docs/FINDINGS.md) has
 the details of every problem, its cause, the fix, and how to check it yourself.
 
 ## Known issues

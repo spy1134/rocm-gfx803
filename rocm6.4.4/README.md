@@ -456,6 +456,25 @@ setting; the OpenAI-compatible API cannot set a context length per request, so
 a model meant for long contexts needs a Modelfile with `PARAMETER num_ctx`
 (examples in `ollama/import/`).
 
+A loaded model stays loaded until you unload it (`OLLAMA_KEEP_ALIVE=-1`;
+`./start-ollama.sh stop MODEL` or the app's Unload frees it). Ollama's own
+default of 5 minutes unloads it between agent sessions, and reloading the large
+models takes tens of seconds to minutes. Set `OLLAMA_KEEP_ALIVE=30m` or similar
+to get a timeout back.
+
+**VRAM margin.** llama.cpp fits each model to the VRAM that ROCm reports free
+and keeps a margin, 1 GiB by default. On this card ROCm's figure leaves out the
+display's framebuffers and other programs' buffers, so with a desktop running
+most of that margin is already gone, and a model plus its working buffers can
+fill the card. When that happens the compositor cannot pin its framebuffers
+("Failed to pin framebuffer with error -12"), windows stop updating and
+applications lose their GPU contexts. `start-ollama.sh` therefore reads the
+card's in-use VRAM from amdgpu (which does count the desktop) when it starts
+the server and sets the margin to that plus `GFX803_OLLAMA_HEADROOM_MIB`
+(default 512). Start the server with your usual programs open; with the display
+manager stopped, the margin shrinks to about the headroom alone and leaves the
+most room for context. `LLAMA_ARG_FIT_TARGET` (MiB) sets the margin outright.
+
 The image runs AMD's stock HSA runtime; `GFX803_RUNTIME=patched
 ./start-ollama.sh` loads the base image's patched one instead, which crashes
 llama-server with GPU page faults on long prompts. All measurements below were

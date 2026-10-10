@@ -15,8 +15,16 @@
 #               ("Page not present") in some workloads that free and reallocate
 #               GPU memory, llama-server among them, so it is for comparison only
 # OLLAMA_KV_CACHE_TYPE  default q8_0; f16 for full precision
-# OLLAMA_FLASH_ATTENTION, OLLAMA_CONTEXT_LENGTH, OLLAMA_KEEP_ALIVE
+# OLLAMA_KEEP_ALIVE  default -1 (a loaded model stays loaded until it is
+#               unloaded with `ollama stop MODEL` or the app's Unload); Ollama's
+#               own 5-minute default drops it between agent sessions, and a
+#               reload costs tens of seconds to minutes for the large models
+# OLLAMA_FLASH_ATTENTION, OLLAMA_CONTEXT_LENGTH, OLLAMA_DEBUG
 #               passed to the server when set
+# GFX803_OLLAMA_HEADROOM_MIB  VRAM kept free for the desktop beyond what it
+#               uses when the server starts (default 512); the card's in-use
+#               VRAM is read at start, so start the server with your usual
+#               programs open. LLAMA_ARG_FIT_TARGET (MiB) overrides the total.
 #
 # The 8-bit KV cache halves the context's VRAM, which on an 8 GB card decides
 # whether a model's context fits beside it at all: Qwen3 8B at 16k needs 2.3 GB
@@ -44,7 +52,7 @@ running() { [ "$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null)" = 
 case "${1:-}" in
   --stop) running && docker stop "$NAME" >/dev/null; exit 0 ;;
   --logs) exec docker logs -f "$NAME" ;;
-  -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  -h|--help) sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 esac
 
 if ! running; then
@@ -56,7 +64,32 @@ if ! running; then
   # up owned by root.
   mkdir -p "$DATA"
   export OLLAMA_KV_CACHE_TYPE=${OLLAMA_KV_CACHE_TYPE:-q8_0}
-  for v in OLLAMA_KV_CACHE_TYPE OLLAMA_FLASH_ATTENTION OLLAMA_CONTEXT_LENGTH OLLAMA_KEEP_ALIVE; do
+  export OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE:--1}
+  # llama.cpp fits each model to the VRAM that ROCm reports free and keeps a
+  # margin (1 GiB by default). On this card ROCm's figure leaves out the
+  # display's framebuffers and other graphics programs' buffers, so with a
+  # desktop running most of that margin is already taken, and a model plus its
+  # working buffers can fill the card; the compositor then cannot pin its
+  # framebuffers and the desktop stalls. amdgpu's own counter does include
+  # them, so the margin becomes what is in use now plus room for the desktop
+  # to grow. Memory held by other ROCm processes (a TTS server, ComfyUI) is
+  # already missing from ROCm's free figure; counting it in the margin too
+  # would keep that much VRAM idle, so it is subtracted (KFD's per-process
+  # counters; this assumes one AMD GPU). With no desktop (display manager
+  # stopped) the margin is close to the headroom alone, which leaves the most
+  # room for context.
+  if [ -z "${LLAMA_ARG_FIT_TARGET:-}" ]; then
+    for used in /sys/class/drm/card*/device/mem_info_vram_used; do
+      [ "$(cat "${used%/*}/vendor" 2>/dev/null)" = 0x1002 ] || continue
+      rocm_bytes=0
+      for f in /sys/class/kfd/kfd/proc/*/vram_*; do
+        [ -r "$f" ] && rocm_bytes=$(( rocm_bytes + $(cat "$f") ))
+      done
+      export LLAMA_ARG_FIT_TARGET=$(( ($(cat "$used") - rocm_bytes) / 1048576 + ${GFX803_OLLAMA_HEADROOM_MIB:-512} ))
+      break
+    done
+  fi
+  for v in OLLAMA_KV_CACHE_TYPE OLLAMA_FLASH_ATTENTION OLLAMA_CONTEXT_LENGTH OLLAMA_KEEP_ALIVE OLLAMA_DEBUG LLAMA_ARG_FIT_TARGET; do
     [ -n "${!v:-}" ] && GFX803_ARGS+=(-e "$v")
   done
   home=/home/gfx803

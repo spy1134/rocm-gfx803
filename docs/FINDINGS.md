@@ -36,6 +36,7 @@ against a CPU reference, and "it runs" was never taken as evidence.
 | Ollama rejects argument-less tools | Fixed (all GPUs) | `patches/ollama/ollama/` |
 | llama.cpp reserves a vision projector's memory on the wrong device | Fixed (all GPUs) | `patches/ollama/llama-cpp-server/` |
 | Ollama keeps stale free-memory figures on slow-starting GPUs | Fixed (all GPUs) | `patches/ollama/ollama/` |
+| Ollama fills VRAM beside a desktop | Mitigated (margin from amdgpu's counter) | `start-ollama.sh` |
 
 Paths in the table are relative to `rocm6.4.4/`.
 
@@ -388,6 +389,11 @@ that also drives the display:
   memory of unloaded models and, for example, put a vision projector on the
   CPU because it seemed not to fit on an empty card. The deadline is now twice
   the first discovery's duration (3-30 s).
+
+ROCm's own free-memory figure also leaves out the display's framebuffers on
+this card, so llama.cpp's 1 GiB fitting margin is mostly taken by the desktop
+before a model loads. `start-ollama.sh` sets the margin from amdgpu's in-use
+VRAM counter plus 512 MiB of headroom.
 
 
 Each patch header in `rocm6.4.4/patches/ollama/` has the full measurements and
