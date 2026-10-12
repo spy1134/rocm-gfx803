@@ -1,54 +1,130 @@
 # Findings: what breaks on gfx803, why, and what this fork does about it
 
-This document collects what this fork found while making SD 1.5 training,
-ComfyUI and Ollama work on a Polaris card. Each section states the symptom,
-the cause as far as it is known, the fix or mitigation and where it lives, and
-how to check it. All measurements are from one RX 590 8 GB (Polaris 20, 36 CUs)
-on a Ryzen 7 2700X host, Arch Linux with the LTS kernel, ROCm 6.4.4 images
-built from `rocm6.4.4/`. Upstream's earlier findings (the rocBLAS Tensile
-bugs, MIOpen's grouped-conv out-of-bounds read, the ROCr allocator fix and
-more) are in [`rocm6.4.4/KERNEL_BUGS.md`](../rocm6.4.4/KERNEL_BUGS.md) and not
-repeated here.
+AMD removed gfx803 (Polaris: RX 470, 480, 570, 580, 590) from ROCm after 6.0.
+The code still compiles for it, but much of the stack no longer produces
+correct results, or runs far below what the hardware can do. This document
+collects what this fork found while making SD 1.5 and SDXL LoRA training,
+ComfyUI and Ollama work on a Polaris card, and what it did about each problem.
 
-A recurring lesson first: on this hardware the common failure is a correct-
-looking run with wrong numbers, not a crash. Every fix below was verified
-against a CPU reference, and "it runs" was never taken as evidence.
+## How to read this document
 
-| Problem | Status | Where |
-| --- | --- | --- |
-| Attention gradients wrong (shim missed batched GEMMs) | Fixed | `patches/sgemm-shim-batched/` |
-| Shim GEMMs 20x slow at power-of-two sizes | Fixed | same |
-| Shim large GEMMs at 2.5-3 TFLOPS | Faster (3.8-4.8 TFLOPS, pipelined tiles) | same |
-| Binary Winograd convs corrupt memory and hang the GPU | Fixed (solvers disabled) | `patches/miopen/winograd-bin-gfx803-disable.patch` |
-| No fast 3x3 convolution after that | Fixed (new solver) | `patches/miopen/winograd-f2x3-hip-gfx803.patch` |
-| fp16 3x3 convolutions slow (GEMM only) | Fixed (same solver, fp16) | same |
-| rocBLAS fp16 N/T GEMMs 15-25x slow | Fixed (shim fp16 route) | `patches/sgemm-shim-batched/` |
-| bf16 reported as supported (no bf16 hardware) | Checked: correct; convs 1.7x slower than fp16 | none needed |
-| PyTorch int8 matmul fails on every call | Fixed (port of upstream's fix) | `patches/pytorch/` |
-| PyTorch layer_norm wrong (warp-size mismatch) | Fixed | `patches/pytorch/` |
-| PyTorch top-k hangs the GPU (warp-size mismatch in its scan) | Fixed | `patches/pytorch/` |
-| PyTorch nonzero, masked indexing, unique, large sorts fail to launch (rocPRIM symbol clash with rocSPARSE) | Fixed | `patches/pytorch/` |
-| PyTorch index_put accumulate drops sums (warp-size mismatch) | Fixed | `patches/pytorch/` |
-| A GPU-side assert resets the whole GPU instead of raising an error | Open (driver/trap handler) | none |
-| torchvision nms has no gfx803 kernel | Worked around (CPU) | `runtime/python/` |
-| No fused attention in PyTorch on gfx803 | ComfyUI node (inference, fp32 kernels) | `tools/ComfyUI-gfx803-attention/` |
-| Patched HSA runtime page faults | Open; images default to the stock runtime | `Dockerfile`, start scripts |
-| VRAM exhaustion freezes the desktop | Mitigated (VRAM cap) | `training/gfx803-train.sh` |
-| llama.cpp prompt processing 10x slow | Fixed | `patches/ollama/llama-cpp/100-*` |
-| llama.cpp long-context prompts slow | Fixed | `patches/ollama/llama-cpp/101-*` |
-| llama.cpp q8_0 generation slows with context | Fixed | `patches/ollama/llama-cpp/102-*` |
-| llama.cpp K-quant generation below memory bandwidth | Fixed | `patches/ollama/llama-cpp/103-*` |
-| llama.cpp integer dot products built from byte unpacking | Faster (decode kernels) | `patches/ollama/llama-cpp/104-*`, `105-*` |
-| llama.cpp prompts on emulated int8 (mmq) | Faster (fp32 GEMMs on the shim) | `patches/ollama/llama-cpp/106-*` |
-| llama.cpp DeltaNet concat reads 32 KiB-strided | Fixed (all GPUs) | `patches/ollama/llama-cpp/107-*` |
-| MoE prompts: the GPU idles while each layer's experts cross PCIe | Fixed (all GPUs; needs SDMA copies on gfx803) | `patches/ollama/llama-cpp/108-*`, `HSA_ENABLE_SDMA=1` in Dockerfile-Ollama |
-| MoE generation: one GPU round trip per tensor handed to the CPU experts | Improved (all GPUs) | `patches/ollama/llama-cpp/109-*` |
-| Ollama rejects argument-less tools | Fixed (all GPUs) | `patches/ollama/ollama/` |
-| llama.cpp reserves a vision projector's memory on the wrong device | Fixed (all GPUs) | `patches/ollama/llama-cpp-server/` |
-| Ollama keeps stale free-memory figures on slow-starting GPUs | Fixed (all GPUs) | `patches/ollama/ollama/` |
-| Ollama fills VRAM beside a desktop | Mitigated (margin from amdgpu's counter) | `start-ollama.sh` |
+**Audience.** People who debug GPU software: you are comfortable with
+kernels, wavefronts, BLAS libraries and driver logs, but you may not know this
+stack's internals. Sections give the background a finding needs and then the
+evidence, so you can follow the reasoning and check it rather than take it on
+trust. The [glossary](#glossary) covers the terms that recur.
+
+**Shape of a finding.** Most sections follow one pattern: *symptom* (what you
+see), *cause* (as far as it is known, and what was ruled out), *fix or
+mitigation* (with the patch or file that holds it), and *check* (how to
+reproduce the problem or confirm the fix, usually against a float64 CPU
+reference). Where the cause is not known the section says so.
+
+**Using it with an AI agent.** The document is written to be searched as well
+as read.
+
+- Start from the index below. Each row is one problem: its status, the section
+  that explains it, and the file that holds the fix. Status words are fixed
+  (see the legend), and a patch or tool is always named in backticks with its
+  path, so `grep` finds both the finding and its code.
+- Paths are relative to `rocm6.4.4/` unless they start with `tools/`, `docs/`
+  or `../`.
+- Treat a finding as a lead, not as a fact about your tree. Read the pinned
+  source before trusting "broken" or "fixed": upstream may have changed the
+  code, and a patch that applies cleanly proves nothing about correctness. The
+  common failure on this hardware is a run that completes with wrong numbers,
+  so every fix here was verified against a CPU reference, and so should yours
+  be.
+- Before writing a gfx803 patch for a bug, check whether another architecture
+  with the same source also fails. If it does, the bug is upstream's, and a
+  gfx803-only patch helps nobody else who hits it. Several rows below are
+  marked "all GPUs" for that reason.
+- Trace before you patch: `MIOPEN_ENABLE_LOGGING_CMD=1 MIOPEN_LOG_LEVEL=6`
+  and `MIGRAPHX_TRACE_COMPILE=1` show which solver and graph really ran, and
+  `AMD_SERIALIZE_KERNEL=3` names the kernel behind a GPU trap.
+- A fix that has been re-diffed but not run on a card should say so in its
+  patch header ("NOT YET RE-VERIFIED ON REAL HARDWARE") until the original
+  reproduction has been run against the new binaries.
+
+**Where the numbers come from.** All measurements are from one RX 590 8 GB
+(Polaris 20, 36 CUs) on a Ryzen 7 2700X host, Arch Linux with the LTS kernel,
+and the ROCm 6.4.4 images built from `rocm6.4.4/`. Other Polaris cards share
+the chip design and should behave alike; their clocks, memory and firmware
+differ, and none has been tested. Upstream's earlier findings (the rocBLAS
+Tensile bugs, MIOpen's grouped-convolution out-of-bounds read, the ROCr
+allocator fix and more) are in
+[`rocm6.4.4/KERNEL_BUGS.md`](../rocm6.4.4/KERNEL_BUGS.md) and not repeated here.
+
+**Status legend.**
+
+| Status | Meaning |
+| --- | --- |
+| Fixed | The cause is addressed in source (a patch, or a changed default) and the check passes. |
+| Faster | Correct before and after; the change is a performance one. |
+| Improved | Partly addressed; the section says what remains. |
+| Mitigated | The damage is contained without removing the cause (a cap, a disabled solver, a margin). |
+| Worked around | Handled outside the faulty code; the source fix is still to do. |
+| Checked | Examined and found correct; nothing was changed. |
+| Open | Not solved, or the cause is not understood. |
+| all GPUs | Not specific to gfx803: the same source fails or is slow on other architectures too. |
+
+A recurring lesson: on this hardware the common failure is a correct-looking
+run with wrong numbers, not a crash. "It runs" was never taken as evidence.
+
+## Index
+
+| Problem | Status | Section | Where |
+| --- | --- | --- | --- |
+| Problem | Status | 9 | Where |
+| Attention gradients wrong (shim missed batched GEMMs) | Fixed | 1 | `patches/sgemm-shim-batched/` |
+| Shim GEMMs 20x slow at power-of-two sizes | Fixed | 1 | same |
+| Shim large GEMMs at 2.5-3 TFLOPS | Faster (3.8-4.8 TFLOPS, pipelined tiles) | 1 | same |
+| Binary Winograd convs corrupt memory and hang the GPU | Fixed (solvers disabled) | 2 | `patches/miopen/winograd-bin-gfx803-disable.patch` |
+| No fast 3x3 convolution after that | Fixed (new solver) | 2 | `patches/miopen/winograd-f2x3-hip-gfx803.patch` |
+| fp16 3x3 convolutions slow (GEMM only) | Fixed (same solver, fp16) | 8 | same |
+| rocBLAS fp16 N/T GEMMs 15-25x slow | Fixed (shim fp16 route) | 8 | `patches/sgemm-shim-batched/` |
+| bf16 reported as supported (no bf16 hardware) | Checked: correct; convs 1.7x slower than fp16 | 8 | none needed |
+| PyTorch int8 matmul fails on every call | Fixed (port of upstream's fix) | 5 | `patches/pytorch/` |
+| PyTorch layer_norm wrong (warp-size mismatch) | Fixed | 5 | `patches/pytorch/` |
+| PyTorch top-k hangs the GPU (warp-size mismatch in its scan) | Fixed | 5 | `patches/pytorch/` |
+| PyTorch nonzero, masked indexing, unique, large sorts fail to launch (rocPRIM symbol clash with rocSPARSE) | Fixed | 5 | `patches/pytorch/` |
+| PyTorch index_put accumulate drops sums (warp-size mismatch) | Fixed | 5 | `patches/pytorch/` |
+| A GPU-side assert resets the whole GPU instead of raising an error | Open (driver/trap handler) | 5 | none |
+| torchvision nms has no gfx803 kernel | Worked around (CPU) | 5 | `runtime/python/` |
+| No fused attention in PyTorch on gfx803 | ComfyUI node (inference, fp32 kernels) | 6 | `tools/ComfyUI-gfx803-attention/` |
+| Patched HSA runtime page faults | Open; images default to the stock runtime | 4 | `Dockerfile`, start scripts |
+| VRAM exhaustion freezes the desktop | Mitigated (VRAM cap) | 7 | `training/gfx803-train.sh` |
+| llama.cpp prompt processing 10x slow | Fixed | 9 | `patches/ollama/llama-cpp/100-*` |
+| llama.cpp long-context prompts slow | Fixed | 9 | `patches/ollama/llama-cpp/101-*` |
+| llama.cpp q8_0 generation slows with context | Fixed | 9 | `patches/ollama/llama-cpp/102-*` |
+| llama.cpp K-quant generation below memory bandwidth | Fixed | 9 | `patches/ollama/llama-cpp/103-*` |
+| llama.cpp integer dot products built from byte unpacking | Faster (decode kernels) | 9 | `patches/ollama/llama-cpp/104-*`, `105-*` |
+| llama.cpp prompts on emulated int8 (mmq) | Faster (fp32 GEMMs on the shim) | 9 | `patches/ollama/llama-cpp/106-*` |
+| llama.cpp DeltaNet concat reads 32 KiB-strided | Fixed (all GPUs) | 9 | `patches/ollama/llama-cpp/107-*` |
+| MoE prompts: the GPU idles while each layer's experts cross PCIe | Fixed (all GPUs; needs SDMA copies on gfx803) | 9 | `patches/ollama/llama-cpp/108-*`, `HSA_ENABLE_SDMA=1` in Dockerfile-Ollama |
+| MoE generation: one GPU round trip per tensor handed to the CPU experts | Improved (all GPUs) | 9 | `patches/ollama/llama-cpp/109-*` |
+| Ollama rejects argument-less tools | Fixed (all GPUs) | 9 | `patches/ollama/ollama/` |
+| llama.cpp reserves a vision projector's memory on the wrong device | Fixed (all GPUs) | 9 | `patches/ollama/llama-cpp-server/` |
+| Ollama keeps stale free-memory figures on slow-starting GPUs | Fixed (all GPUs) | 9 | `patches/ollama/ollama/` |
+| Ollama fills VRAM beside a desktop | Mitigated (margin from amdgpu's counter) | 9 | `start-ollama.sh` |
 
 Paths in the table are relative to `rocm6.4.4/`.
+
+## Glossary
+
+| Term | Meaning here |
+| --- | --- |
+| Wavefront, warp | The group of GPU lanes that execute together. GCN hardware (gfx803 included) runs 64-lane wavefronts; PyTorch's `C10_WARP_SIZE` is 64 only for gfx9 and 32 for other AMD targets, which is the root of several findings in section 5. |
+| LDS | Local data share: the per-workgroup scratch memory on a compute unit (64 KiB on gfx803). |
+| Tensile | rocBLAS's kernel generator. Its fp32 GEMM kernels return wrong results on gfx803. |
+| Shim | `LD_PRELOAD` library that replaces rocBLAS GEMM entry points with gfx803-correct kernels (`patches/sgemm-shim-batched/`). |
+| MIOpen, Find | AMD's convolution library; Find benchmarks solvers for a shape and stores the winner in a find-db. |
+| Winograd | A convolution algorithm that trades multiplications for transforms; the binary (hand-written assembly) variants are what hang gfx803. |
+| mmq, mmvq | llama.cpp's matmul kernels for prompts (quantized matrix times matrix) and for generation (matrix times a few vectors). |
+| dp4a | Integer dot-product instruction; gfx803 has none, so llama.cpp's int8 paths emulate it. |
+| KFD, BACO | The kernel's compute driver interface, and the GPU reset the driver falls back to when a queue cannot be preempted. |
+| SDMA | The GPU's DMA copy engines, which move data without occupying compute units. |
+| HSA runtime | `libhsa-runtime64`, ROCm's user-space runtime beneath HIP; this stack can preload AMD's stock build or a patched one (section 4). |
 
 **Speed, start to finish** (RX 590 8 GB; the front page's table):
 
@@ -57,7 +133,7 @@ Paths in the table are relative to `rocm6.4.4/`.
   run in the same process: 1758 ms per step on an image from just after the
   first shim speed fix (batched GEMMs covered, the coalesced 16x16 kernel,
   binary Winograd disabled, convolutions on MIOpen's GEMM path), 644 ms now,
-  526 ms with the ComfyUI node (section 5b): 35 s -> 12.9 s / 10.5 s.
+  526 ms with the ComfyUI node (section 6): 35 s -> 12.9 s / 10.5 s.
 - **SD 1.5 LoRA training step**, 512 px, 4 accumulated images: 12.1 s in the
   first setup with correct results (extended shim, binary Winograd disabled),
   about 3.4 s now (section 1). The original stack ran about 8 s per step with
@@ -129,9 +205,9 @@ floats) puts every row of a K-contiguous operand in one DRAM channel (2048^3
 with A transposed: 3.4 TFLOPS against 4.95 untransposed). Such shapes keep the
 older kernels, and the fix belongs where the matrix is allocated: padding the
 rows by 16 floats takes them to 3.6-4.1. llama.cpp's prompt path does that
-(section 7).
+(section 9).
 
-fp16 is covered too; see section 7a.
+fp16 is covered too; see section 8.
 
 ## 2. MIOpen's binary Winograd kernels: memory corruption and GPU hangs
 
@@ -361,7 +437,7 @@ They are workarounds with their source fixes still to do.
   `torch.distributed.tensor` unconditionally, which crashes on this
   single-GPU build; the image stubs the check (a model on such a build cannot
   hold distributed tensors).
-## 5b. ComfyUI node with gfx803 kernels for attention, GroupNorm and GEGLU
+## 6. ComfyUI node with gfx803 kernels for attention, GroupNorm and GEGLU
 
 PyTorch has no fused attention on gfx803, so every SD 1.5 attention call
 stores its full score matrix (8 x 4096 x 4096 floats at the 64x64 level).
@@ -394,7 +470,7 @@ The node is not built into the images. `tools/ComfyUI-gfx803-attention/install.s
 compiles the three libraries (with the base image's `hipcc` when the host has
 none) and copies the node into `rocm6.4.4/ComfyUI/custom_nodes/`.
 
-## 6. VRAM on an 8 GB card that also drives a display
+## 7. VRAM on an 8 GB card that also drives a display
 
 Uncapped, PyTorch keeps freed memory and grows until the card is full: an SD
 1.5 run that needs about 6.1 GB took 7.99 of 8 GB. The driver then moves
@@ -407,7 +483,7 @@ desktop's framebuffers). Even capped at 90% training caused brief pin failures
 on a busy desktop, and 512 px SD 1.5 training does not fit beside a typical
 desktop at all, so training needs the display manager stopped.
 
-## 7a. fp16, and what it makes possible (SDXL LoRA training)
+## 8. fp16, and what it makes possible (SDXL LoRA training)
 
 **Correctness.** fp16 computes correctly on this stack: 63 operation cases
 (every GEMM layout, batched, SD1.5's convolutions forward and backward data,
@@ -465,7 +541,7 @@ speed, but 3x3 convolutions take about 1.7x as long (2.54 ms against 1.43 ms
 fp16 for 320 channels at 64x64), because the Winograd solver above covers fp32
 and fp16 only. Prefer fp16 for half precision on this card.
 
-## 7. llama.cpp and Ollama
+## 9. llama.cpp and Ollama
 
 Ollama 0.35.1 builds llama.cpp b11232; its HIP backend compiles for gfx803
 with no source changes, and computes correctly (llama.cpp's own operation tests
@@ -660,7 +736,7 @@ tasks.
 Each patch header in `rocm6.4.4/patches/ollama/` has the full measurements and
 a reproduction.
 
-## 8. Open questions
+## 10. Open questions
 
 - Why the binary Winograd kernels fail on gfx803 (they are disabled, not
   fixed). Candidates: their persistent launch, or wrong cache/release fields in
@@ -703,7 +779,7 @@ a reproduction.
   are active: on this kernel it oopses and turns a GPU hang into a host lockup.
 - [`tools/ComfyUI-gfx803-attention/`](../tools/ComfyUI-gfx803-attention/): the
   optional ComfyUI node with gfx803 attention, GroupNorm and GEGLU kernels
-  (section 5b); its kernel sources are in `tools/`.
+  (section 6); its kernel sources are in `tools/`.
 - [`tools/console-mouse/`](../tools/console-mouse/): mouse support for terminal
   apps on the Linux text console, through gpm.
 - [`rocm6.4.4/training/gfx803_unet_check.py`](../rocm6.4.4/training/gfx803_unet_check.py):

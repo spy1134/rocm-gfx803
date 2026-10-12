@@ -170,7 +170,7 @@ tok/s at batches of 512 / 1024 / 2048.
 - Done: patch 108 copies the next MoE layer's experts into a second device
   slot on a second stream while the current layer computes, with
   `HSA_ENABLE_SDMA=1` so the copy runs on the DMA engine (FINDINGS section
-  7). pp2048 at 512 / 1024 / 2048-token batches: 193 / 250 / 295 -> 243 /
+  9). pp2048 at 512 / 1024 / 2048-token batches: 193 / 250 / 295 -> 243 /
   321 / 367 tok/s, against a 376 tok/s bound with no copies at all. At
   512-token batches the copy is still longer than the compute it hides
   behind (12 GB/s over PCIe).
