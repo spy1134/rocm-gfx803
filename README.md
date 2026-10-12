@@ -87,13 +87,13 @@ for Ollama, it is the same llama.cpp version without this project's changes.
 
 | Task | Before | Now | |
 | --- | --- | --- | --- |
-| Generate an SD 1.5 image (20 steps at 512 px) | 35 s | 11 s | 3.1x |
-| One SD 1.5 LoRA training step (4 images, 512 px) | 12.1 s | 4.0 s | 3x |
-| Ollama reads a prompt (Qwen3 8B) | 14 tokens/s | 159 tokens/s | 11x |
-| A coding agent's first request (a 12,000-token prompt) | 18 min | 92 s | 11.6x |
+| Generate an SD 1.5 image (20 steps at 512 px) | 35 s | 10.5 s | 3.3x |
+| One SD 1.5 LoRA training step (4 images, 512 px) | 12.1 s | 3.4 s | 3.6x |
+| Ollama reads a prompt (Qwen3 8B) | 14 tokens/s | 223 tokens/s | 16x |
+| A coding agent's first request (a 12,000-token prompt) | 18 min | 71 s | 15x |
 | Ollama writes text (Qwen3 8B) | 27 tokens/s | 30.5 tokens/s | 1.1x |
 
-Image generation is ComfyUI in fp32 with the optional gfx803 node (13.9 s without it). Writing
+Image generation is ComfyUI in fp32 with the optional gfx803 node (12.9 s without it). Writing
 text is limited mostly by how fast the card can read the model's weights, so it had the least
 room to grow; its gain increases with the length of the conversation (20.9 to 26.5 tokens/s with
 8,000 tokens of context). Some changes don't show up as speed at all: half-precision training
@@ -105,7 +105,8 @@ what could still get faster.
 ## What was broken, and is fixed here
 
 In short, out of the box on these cards: training learned from wrong numbers, sustained loads
-could freeze the GPU or the whole machine, a core PyTorch function computed wrong results, and
+could freeze the GPU or the whole machine, core PyTorch functions computed wrong results,
+failed to run, or hung the card (layer_norm, top-k sampling, boolean masks, sorting), and
 Ollama read prompts about ten times slower than it should, generated text well below what the
 card's memory allows, and could fill the card until the desktop stalled. Each of these is fixed,
 and the fixes made fp16 and local language models run at full speed. [`docs/FINDINGS.md`](docs/FINDINGS.md) has
@@ -121,6 +122,10 @@ the details of every problem, its cause, the fix, and how to check it yourself.
   faults and freezes. If you see those, check your card's memory clock first (see "Host VBIOS
   setting" in [`README-rocm10.md`](README-rocm10.md)).
 - Linux kernels 6.12 and 6.13 have been reported to crash with these cards.
+- When a GPU program hits a failed safety check (a device-side assert), these cards do not stop
+  the program with an error: the GPU hangs and the driver resets it, which wipes VRAM for every
+  program using it. A desktop on the card usually survives the reset; GPU programs need a
+  restart. The PyTorch bugs that triggered this are fixed, but any new one will look the same.
 
 ## Where this comes from
 

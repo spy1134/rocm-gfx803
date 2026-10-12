@@ -480,10 +480,16 @@ fill the card. When that happens the compositor cannot pin its framebuffers
 ("Failed to pin framebuffer with error -12"), windows stop updating and
 applications lose their GPU contexts. `start-ollama.sh` therefore reads the
 card's in-use VRAM from amdgpu (which does count the desktop) when it starts
-the server and sets the margin to that plus `GFX803_OLLAMA_HEADROOM_MIB`
-(default 512). Start the server with your usual programs open; with the display
-manager stopped, the margin shrinks to about the headroom alone and leaves the
-most room for context. `LLAMA_ARG_FIT_TARGET` (MiB) sets the margin outright.
+the server, subtracts what other ROCm processes hold (a TTS server or ComfyUI;
+ROCm's free figure already leaves that out), and sets the margin to the rest
+plus `GFX803_OLLAMA_HEADROOM_MIB` (default 512). Start the server with your
+usual programs open, and after any other GPU service such as a TTS server;
+with the display manager stopped, the margin shrinks to about the headroom
+alone and leaves the most room for context. `LLAMA_ARG_FIT_TARGET` (MiB) sets
+the margin outright. Measured with Chatterbox TTS (2.9 GB) already running:
+counting its memory in the margin left Qwen3.6 35B-A3B 1.6 GB of the card and
+15 tok/s; subtracting it gives 4.4 GB and 24.6 tok/s, with the card at 7.5 of
+8 GB and speech requests still working.
 
 The image runs AMD's stock HSA runtime; `GFX803_RUNTIME=patched
 ./start-ollama.sh` loads the base image's patched one instead, which crashes

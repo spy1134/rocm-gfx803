@@ -44,9 +44,10 @@ today is the main lever. Today only one GEMM layout gets there.
 ### SD 1.5 inference
 
 One denoising step, fp32, 512 px, classifier-free guidance (batch 2), ComfyUI
-with `--use-split-cross-attention` and the gfx803 node: 566 ms (697 without
+with `--use-split-cross-attention` and the gfx803 node: 526 ms (644 without
 the node). Time per module class, from CUDA events around every UNet module's
-forward:
+forward, measured at 566 ms per step, before BLAS-5 took the linear layers'
+TN GEMMs from ~2.7 to 3.6-4.4 TFLOPS:
 
 | What | Time | How it runs | Efficiency |
 | --- | --- | --- | --- |
@@ -75,7 +76,7 @@ op(B) = not transposed.
 ### SD 1.5 LoRA training
 
 A 20-step fp32 run (34-image set, 512 px buckets, gradient checkpointing,
-batch 1, gradient accumulation 4) takes about 4.0 s per step at steady state.
+batch 1, gradient accumulation 4) takes about 3.4 s per step at steady state.
 GEMM FLOPs by layout for one UNet forward and backward with frozen weights,
 which is what LoRA training's base model does, at 384 px (512 px does not fit
 in 8 GB without gradient checkpointing):
@@ -103,11 +104,12 @@ themselves are at ~80% of the reachable bandwidth (q4_K 4096x14336: 188 us,
 
 ### llama.cpp prompt processing (prefill)
 
-Prompts run through mmq, which emulates int8 dot products: q4_K at 512 tokens,
-4096x14336, takes 24.6 ms, about 2.45 effective TOPS, a third of the fp32 FMA
-rate. Qwen3 8B reads a 5.2k-token prompt at ~149 tok/s and Qwen2.5-Coder 7B at
-~107. A 12,288-token prompt, the size of a coding agent's first request, takes
-92 s (133 tok/s; unmodified llama.cpp took 18 minutes, at 11.4 tok/s).
+Batches of 128 tokens or more run as fp32 GEMMs on the shim (LLM-4); smaller
+ones, and MoE expert matmuls, run through mmq, which emulates int8 dot
+products at about 2.4 effective TOPS. Qwen3 8B reads a 5.2k-token prompt in
+Ollama at ~215 tok/s and Qwen2.5-Coder 7B at ~136. A 12,288-token prompt, the
+size of a coding agent's first request, takes 71 s (173 tok/s; unmodified
+llama.cpp took 18 minutes, at 11.4 tok/s). MoE prompts: LLM-6.
 
 ## Status
 
@@ -115,8 +117,9 @@ Open targets in recommended order, then the rest.
 
 | Target | Area | Expected gain | Status |
 | --- | --- | --- | --- |
-| BLAS-5 | Shim: TN and NT layouts at NN speed | SD inference ~11% per step, training similar; enables LLM-4 | Open, first |
-| LLM-4 | llama.cpp prompts through dequantize + fp32 SGEMM | ~1.5x prompt speed for dense K-quant models (after BLAS-5) | Open |
+| LLM-6 | MoE prompts: expert copies, MUL_MAT_ID, dense parts | expert copies now overlap compute (patch 108: pp2048 295 -> 367 tok/s); MUL_MAT_ID next | Open, first |
+| LLM-8 | MoE generation with experts in system RAM | see LLM-8; 42 ms per token on Qwen3.6 35B-A3B, about 17 ms of it RAM-bound | Open, measured |
+| PT-2 | PyTorch kernels that mix the host's 64-lane warp size with the device's 32 | correctness: wrong results or a GPU reset | Open, audit (no GPU risk) |
 | SD-6 | Register-tiled fused attention (and llama.cpp's fp32 FA tile kernel) | SD inference ~12% per step; deep-context prompts | Open |
 | SD-7 | Fused Winograd F(2x2, 3x3) | SD 30-60 ms per step (5-10%), training too | Open |
 | LLM-5 | The unexplained ~7 ms per decoded token | unknown, up to ~19% generation | Open, measure first |
@@ -125,6 +128,10 @@ Open targets in recommended order, then the rest.
 | SD-8 | Fused attention backward | training attention time and VRAM | Open, large |
 | LLM-3 | mmvq vs mmq for 9-16 tokens | speculative/parallel decoding | Open |
 | LLM-1b | SDWA dot product losses (2-token decode) | 1-11% on 2-token decode | Open, minor |
+| LLM-4 | llama.cpp prompts through dequantize + fp32 SGEMM (patch 106) | Qwen3 8B prompt 149 -> 215 tok/s in Ollama | Done |
+| LLM-7 | DeltaNet conv-input concat (patch 107) | Qwen3.6 35B-A3B pp2048 244 -> 270 tok/s | Done |
+| BLAS-6 | Shim: GEMMs with 1-8 columns (decode-shaped), fp16 and fp32 | Chatterbox TTS token model 88 -> 25.7 ms per token | Done |
+| BLAS-5 | Shim: TN, NT and TT layouts | SD step 557 -> 526 ms, training 3.63 -> 3.37 s/step | Done |
 | BLAS-1, BLAS-2 | Shim: pipelined 64x64 and 32x32 tiles | large NN GEMMs 2.8-3.3 -> 3.9-4.8 TFLOPS | Done |
 | BLAS-4 | Shim: fp16 GEMMs in every layout | slower than rocBLAS | Evaluated, not adopted |
 | SD-3, SD-4, SD-5 | ComfyUI node: fused attention, GroupNorm, GEGLU | SD step 697 -> 567 ms | Done, optional install |
@@ -134,79 +141,186 @@ Open targets in recommended order, then the rest.
 
 ## Open targets
 
-### BLAS-5: shim TN and NT at NN speed
+### LLM-6: MoE prompt processing
 
-**Why.** Every `torch.nn.Linear` reaches the shim as `sgemm` TN: 40% of SD
-inference GEMM FLOPs and 172 ms of a 566 ms step, at ~2.7 TFLOPS. Training
-adds NT (26%) for the backward pass. The pipelined fast tiles (BLAS-1/2) only
-help op(B) = N, and their TransA variant gained nothing (2048^3 with A
-transposed: 2.92 TFLOPS before and after; NN reaches 4.8). NT calls use the
-older `gfx803_sgemm_tile_p` (3.1-3.4 TFLOPS). llama.cpp's fp32 path (LLM-4)
-is TN as well.
+**Why.** The MoE models used most here (Qwen3.6 35B-A3B: 256 experts, top 8,
+18.7 GiB of expert weights; Qwen3-Coder-Next: 512 experts, top 10, 43.6 GiB)
+keep most experts in system RAM. For a batch of 32 tokens or more, llama.cpp
+copies each layer's experts to the GPU (op offload) and runs them there with
+mmq's MUL_MAT_ID kernel. Patch 106 does not apply to the experts: each expert
+sees about batch x top-k / experts tokens (64 at a 2048-token batch), below
+the 128 where fp32 cuBLAS beats mmq.
 
-**Where.** `rocm6.4.4/patches/sgemm-shim-batched/gfx803_sgemm.h`:
-`gfx803_sgemm_tile_p_fast<P, TransA, E>` (its `TransA` branch of `fetch`) and
-the dispatch in `gfx803_gemm_strided_batched`, which sends `transB` calls to
-the old kernel.
+**Where the time goes.** Qwen3.6 35B-A3B Q4_K_M, all experts in RAM
+(`-ncmoe 99`), 2048-token batch, per 2048 tokens (7.6 s at 270 tok/s), from a
+dev-only timer that synchronizes around every CUDA node:
 
-**Approach.** With A transposed, A's contiguous dimension is K. The current
-TransA fetch gives each thread one float4 along K for one row (4 lanes per
-row, rows strided by lda) and then stores it into the M-major LDS tile with
-four scalar writes, which also 2-way bank-conflict (row stride 68 floats).
-Options: stage A in LDS K-major (as it arrives) and read it in the
-multiply-add loop with a layout that keeps the ping-pong prefetch; or
-transpose through registers so the LDS writes stay vectorized. NT is the
-mirror image for B: today's fast B staging walks K, which is B's strided
-dimension when B is transposed, so it needs the same treatment for B. Keep
-the accumulation order identical, so the result stays bit-identical to the
-reference kernel.
+| Part | Time | Notes |
+| --- | --- | --- |
+| Expert copies over PCIe | ~1.8 s | 20 GB at 11.3 GB/s from pinned memory, once per batch |
+| MUL_MAT_ID (experts) | 2.2 s | 1.4-2.0 TFLOPS; q6_K slower than q4_K |
+| Dense MUL_MAT | ~1.5 s | after patch 106 and the shim's alignment rule |
+| Flash attention | 0.2 s | |
+| Everything else | ~1.9 s | CPU-side scheduling and synchronization, not broken down yet |
 
-**Expected gain.** TN at ~4.5 TFLOPS: SD inference 172 -> ~105 ms of linear
-time, about -65 ms per step (~11%). Training gains on its TN and NT half. It
-is also the prerequisite for LLM-4.
+Copy time is per batch, so a larger batch amortizes it: 174 / 224 / 270
+tok/s at batches of 512 / 1024 / 2048.
 
-**Verify.** Bit-identity against the current shim over the reference set and
-a random sweep (every layout, odd sizes and leading dimensions, offsets,
-batched, alpha/beta: see "Verifying a change"); then the SD, training and
-Ollama checks.
+**Options.**
+- Done: patch 108 copies the next MoE layer's experts into a second device
+  slot on a second stream while the current layer computes, with
+  `HSA_ENABLE_SDMA=1` so the copy runs on the DMA engine (FINDINGS section
+  7). pp2048 at 512 / 1024 / 2048-token batches: 193 / 250 / 295 -> 243 /
+  321 / 367 tok/s, against a 376 tok/s bound with no copies at all. At
+  512-token batches the copy is still longer than the compute it hides
+  behind (12 GB/s over PCIe).
+- MUL_MAT_ID tile choice for gfx803: measured, not a lever. Forcing every
+  tile width from 8 to 64 for the expert matmuls (dev-only override) left
+  pp2048 within noise: 171-176 tok/s at 1024-token batches for every width,
+  238-257 at 2048.
+- The PCIe link speed matters as much as any kernel. amdgpu's PCIe DPM can
+  stay at its low level (2.5 GT/s x8) under load: `pp_dpm_pcie` then shows
+  level 0 throughout a copy, a 512 MiB host-to-device copy runs at 3.4
+  instead of 12.3 GB/s, and the same build's pp2048 (2048-token batches)
+  falls from 367 to 247 tok/s. Generation barely changes. Check
+  `current_link_speed` / `pp_dpm_pcie` under load before comparing prompt
+  numbers; switching transparent huge pages off for the process changed
+  nothing.
+- Done for the Qwen3.6 35B text entries: `num_batch` 2048 with patch 108
+  (2k-token prompt 142 -> 198 tok/s, about 2% slower generation). The vision
+  entry stays at 1024 (short image prompts gained nothing; generation 13.4 ->
+  12.2). Qwen3-Coder-Next is unmeasured: it pins 51.5 GiB of RAM and does not
+  fit beside Chatterbox, Open WebUI and a desktop on 64 GB.
 
-### LLM-4: llama.cpp prompts through dequantize + fp32 SGEMM
+**Verify.** test-backend-ops `MUL_MAT_ID` (the dev tree adds perf cases at
+these models' expert shapes); llama-perplexity KL divergence against the CPU
+backend; Ollama greedy output on qwen3.6:35b.
 
-**Why.** Prompt processing is the slowest part of using local coding agents
-here, and it runs on emulated int8 (mmq, ~2.45 effective TOPS). llama.cpp
-also has a path that dequantizes the weights and calls cuBLAS
-(`ggml_cuda_op_mul_mat_cublas` in `ggml-cuda.cu`). Its fp32 branch calls
-`cublasSgemm(CUBLAS_OP_T, CUBLAS_OP_N, ...)`, which hipBLAS sends to
-`rocblas_sgemm` and the image's preloaded shim intercepts (the Ollama image is
-built on the base image and preloads it). This route was measured on
-2026-10-03 at 1.84 TFLOPS and rejected; the shim is faster now, and after
-BLAS-5 it should run at ~4.5.
+### LLM-8: MoE generation with experts in system RAM
 
-**Estimate.** q4_K, 4096x14336, 512 tokens: 60 GFLOP. At 4.5 TFLOPS that is
-~13.4 ms, plus ~2 ms to dequantize the weight to fp32 (235 MB written and
-read), against mmq's 24.6 ms: about 1.5-1.6x. At today's TN speed (2.9) it
-would be ~22.7 ms, barely ahead; this is why BLAS-5 comes first. fp32 GEMMs
-are also more precise than mmq, which quantizes activations to 8 bits.
+**Where the time goes.** Qwen3.6 35B-A3B Q4_K_M, all experts in host memory
+(`-ncmoe 99`), llama-bench tg: 23.7 tok/s, 42 ms per token.
 
-**Approach and pitfalls.**
-- `ggml_cuda_should_use_mmq` (`mmq.cu`) chooses mmq; the build option
-  `GGML_CUDA_FORCE_CUBLAS` turns it off globally, which is enough for a first
-  measurement. A gfx803 rule would route by batch size (mmvq stays for
-  decode).
-- Check which compute type the cuBLAS path picks for quantized weights on
-  gfx803. An earlier trial of this route used fp16 with fp16 accumulation
-  (`CUBLAS_COMPUTE_16F`, +10%, rejected for precision); the target is the fp32
-  branch.
-- The dequantized fp32 copy of the largest weight needs ~235 MB of temporary
-  VRAM (Qwen3 8B's 4096x14336 FFN), which must fit beside the model and KV
-  cache in 8 GB.
-- MoE models go through `MUL_MAT_ID`, a different path; dense models first.
+| Part | Per token | How it was measured |
+| --- | --- | --- |
+| CPU expert matmuls | ~17 ms | GGML_SCHEDTIME split timer; 0.56 GB of Q4_K expert weights per token is ~33 GB/s, the practical limit of dual-channel DDR4-2800 |
+| GPU splits (attention, DeltaNet, router, shared expert, output head) | ~17 ms | split timer minus the hand-off share below; about 600 nodes per token |
+| GPU-CPU hand-offs (two per layer, 80 per token) | ~8 ms | moving 4 layers' experts to the GPU (`-ncmoe 36`) saves 0.53 ms per layer against 0.42 ms of CPU expert time |
 
-**Verify.** test-backend-ops `MUL_MAT` and `MUL_MAT_ID` against the CPU;
-greedy Ollama output against the previous image (tokens may legitimately
-change at near-ties, because fp32 differs from mmq's int8 rounding, so
-compare KL divergence and top-token agreement against the CPU backend
-instead of exact identity); prompt tok/s at 0 and 8k depth.
+What does not change it: CPU threads (4: 21.6, 8: 23.7, 12: 23.0, 16: 18.6
+tok/s), the thread pool's polling (`--poll` 0/50/100), HIP graphs (on: 23.4,
+off: 24.0; they are captured once per split and replayed, 2523 replays to 71
+captures), and `ROC_ACTIVE_WAIT_TIMEOUT` (100 to 10000 us).
+
+**Open questions.** The GPU splits read about 1 GB of weights per token
+(5 ms at 200 GB/s) plus about 600 small kernels, which test-backend-ops runs
+at 6.7 us each back to back (ADD, 4096 floats); 17 ms is about twice that. A
+kernel timeline would settle where the rest goes, but rocprofv3 on this
+stack aborts in its own shutdown before writing the trace (see Timeline
+below for the profiler that works). The per-node timer (GGML_OPTIME) charges fused groups to their
+first node (sigmoid + mul shows as a 43 us SIGMOID), so its per-op numbers
+are not kernel times.
+
+**Timeline.** The legacy `rocprof --hip-trace` works on this stack when
+nothing is preloaded (`unset LD_PRELOAD`, so the image's patched HSA runtime
+loads); rocprofv3 aborts at exit even for a trivial PyTorch script, and
+rocprofv2 has no gfx803 counter definitions. In a 1.5 s window of generation
+(about 30 tokens, slowed to 13 tok/s by the tracing), the GPU runs kernels
+33% of the time and sits in barrier packets (waiting for the CPU) 46%. Per
+token, the host makes about 300 `hipStreamSynchronize` calls: 130 right after
+a `hipMemcpyAsync` (90 of them device-to-device copies into pinned host
+buffers, the GPU results the CPU expert split reads), 128 right after another
+synchronize, and 41 after a graph launch (one per GPU split). The minimum is
+about one wait per GPU-to-CPU hand-off (41). Kernel time per token is
+dominated by `mul_mat_vec_q` (about 270 calls, 32 us mean under tracing).
+
+**GPU kernels by shape.** With `GGML_CUDA_DISABLE_GRAPHS=1` every kernel goes
+through `hipLaunchKernel`, whose trace record carries the template (quant
+type) and grid, so each `mul_mat_vec_q` can be matched to its weight
+(rows = grid x 2 for the two-row kernel). Per generated token:
+
+| Weight | Calls | Each | Effective bandwidth |
+| --- | --- | --- | --- |
+| output head, 248320 x 2048 q6_K | 1 | 2.09 ms | ~200 GB/s |
+| 8192 x 2048 | 43 | 63 us | 150-220 GB/s |
+| 4096 x 2048 | 32 | 37 us | ~130 GB/s |
+| 2048 x 512 (shared-expert down) and 2048 x 4096 | 85 | 22 us | the K=512 ones ~27 GB/s |
+| 512 x 2048 (shared-expert gate, up) | 64 | 15 us | ~40 GB/s |
+| router, 256 x 2048 fp32 (`mul_mat_vec_f`) | 43 | 21 us | ~100 GB/s |
+
+The large weights run near the card's bandwidth; the shared expert's small
+matrices do not: each workgroup has almost nothing to do, so a launch costs
+15-22 us for under 1 MB. A small-matrix variant (more rows per workgroup
+when rows x K is small) or one launch for gate and up would recover most of
+an estimated 1.5-2 ms per token (3-5%); the fp32 router about 0.5 ms more.
+`gated_delta_net` (30 per token, 29 us, ~4 MB of state each) is at about
+140 GB/s.
+
+**Levers.** Done: patch 109 copies a CPU split's GPU inputs with one wait
+instead of one per tensor (tg128 23.8 -> 24.4 tok/s). The back-to-back
+duplicate synchronizations are nearly free (an idle-stream synchronize
+costs about 1 us); a small copy or kernel plus its wait costs 24-29 us.
+Each layer whose experts stay in VRAM saves about 0.53 ms per token, so VRAM
+taken by other programs costs generation speed directly (with Chatterbox
+loaded, Ollama keeps 3.2 instead of 4.4 GiB of this model on the card).
+
+### PT-2: audit PyTorch's warp-size mixing
+
+In gfx8 device code `C10_WARP_SIZE` is 32 (`c10/macros/Macros.h` gives 64 to
+gfx9 only), while the hardware runs 64-lane wavefronts and host code's
+`at::cuda::warp_size()` returns 64. A kernel that is launched or sized by
+one and computes with the other is wrong on gfx803 and correct on every
+architecture upstream tests. Three cases are fixed: layer_norm (PT-1); the
+binary prefix scan behind `torch.topk`
+([`gfx803-topk-scan-warp-size.patch`](../rocm6.4.4/patches/pytorch/gfx803-topk-scan-warp-size.patch)),
+which wrote top-k results to wrong slots and, through its assert, hung the GPU
+until the driver reset it; and index_put with accumulate
+([`gfx803-index-put-warp-size.patch`](../rocm6.4.4/patches/pytorch/gfx803-index-put-warp-size.patch)),
+which dropped half of the repeated indices' sums. group_norm shows the
+opposite dependency: its weight and bias gradients need the 32, so the macro
+itself cannot change. FINDINGS section 5 describes all of them.
+
+At commit d618db8, 21 files under `aten/` use `C10_WARP_SIZE`, and 14 of them
+also call `at::cuda::warp_size()`:
+
+- `aten/src/ATen/native/cuda/block_reduce.cuh`
+- `aten/src/ATen/native/cuda/group_norm_kernel.cu`
+- `aten/src/ATen/native/cuda/Sorting.cu`
+- `aten/src/ATen/native/cuda/Repeat.cu`
+- `aten/src/ATen/native/cuda/PersistentSoftmax.cuh`
+- `aten/src/ATen/native/cuda/TensorTopK.cu`
+- `aten/src/ATen/native/cuda/SoftMax.cu`
+- `aten/src/ATen/native/cuda/Embedding.cu`
+- `aten/src/ATen/native/cuda/DepthwiseConv2d.cu`
+- `aten/src/ATen/native/cuda/Indexing.cu`
+- `aten/src/ATen/native/cuda/layer_norm_kernel.cu`
+- `aten/src/ATen/native/cuda/Normalization.cuh`
+- `aten/src/ATen/native/cuda/EmbeddingBag.cu`
+- `aten/src/ATen/native/cuda/DepthwiseConv3d.cu`
+
+`layer_norm_kernel.cu` and the two index_put launchers in `Indexing.cu` are
+done; `TensorTopK.cu`'s single-block path is done through `ScanUtils.cuh`,
+and its multi-block path (`mbtopk`) is not yet read.
+
+Mixing the two is not a bug by itself: a kernel whose shuffles use offsets
+below 32 and whose shared memory is sized from `blockDim` treats each half of
+a 64-lane wavefront as its own warp and stays correct (layer_norm's kernels
+are like that once launched consistently). The bug is a disagreement inside
+one kernel: a 64-lane ballot or lane-0 store counted with 32-lane warp
+numbers (the top-k scan), a launch or shared-memory size from one value and
+the kernel's indexing from the other (layer_norm), or a fixed block shape
+that assumes 32 lanes per warp. For each file, list every kernel, the warp
+size its launch and shared memory use, and the warp size its device code
+assumes (`C10_WARP_SIZE`, `warpSize`, `__lane_id()`, ballots, shuffle widths),
+and mark the disagreements. Softmax and group_norm already match the CPU in
+the image's op suite, which narrows their part to the paths the suite does
+not reach.
+
+The audit needs no GPU. Each suspect it finds then gets a GPU-against-CPU
+test for the affected op, run headless with `AMD_SERIALIZE_KERNEL=3` so that a
+trapping assert names its kernel and costs one reset. PyTorch's own OpInfo
+tests (about 600 ops, against our suite's 118) run the same way, one op per
+process, would find the cases the audit misses.
 
 ### SD-6: register-tiled fused attention
 
@@ -355,6 +469,145 @@ Measured, and not worth pursuing unless something changes:
 
 ## Done
 
+### LLM-4: prompts through dequantize + fp32 SGEMM
+
+[`106-gfx803-cublas-prompt.patch`](../rocm6.4.4/patches/ollama/llama-cpp/106-gfx803-cublas-prompt.patch)
+sends quantized matmuls with 128 or more columns (prompt batches) to cuBLAS in
+fp32 on gfx803, where the base image's shim runs them, instead of mmq's
+emulated int8. Three things had to change. llama.cpp chose fp16 compute with
+fp16 accumulation for quantized weights on every AMD GPU, which bypasses the
+shim. Weight rows of 4096 or 14336 floats are multiples of 8 KiB, so the
+weights are dequantized straight into rows padded by 16 floats (14336 x 512 x
+4096: 2.8 -> 4.1 TFLOPS). And mmq was chosen before cuBLAS was considered.
+Weights whose fp32 copy would exceed 512 MiB (output heads, which reach this
+path only when every token's logits are computed) keep mmq: a 2.5 GB copy
+next to the model ended in a GPU memory fault.
+
+- Crossover, Qwen3 8B prompt tok/s by batch, cuBLAS vs mmq: 64: 132 vs 146,
+  96: 130 vs 149, 128: 178 vs 154, 512: 222 vs 162.
+- llama-bench pp512: Qwen3 8B 163.5 -> 222.8, Qwen2.5-Coder 7B 166.9 ->
+  230.5; 8192 deep 127.6 -> 158.8 and 57.2 -> 64.1; Qwen3 8B pp12288 135.0 ->
+  172.7.
+- Ollama, ~5.2k-token prompt: Qwen3 8B 149 -> 215 tok/s, Qwen2.5-Coder 7B
+  107 -> 136; generation unchanged.
+- Precision: KL divergence against the CPU backend, Qwen2.5-Coder 7B 0.00152
+  -> 0.00094, Qwen3 8B 0.0103 -> 0.0086. test-backend-ops MUL_MAT 1301/1301,
+  MUL_MAT_ID 931/931, FLASH_ATTN_EXT 3982/3982.
+- MoE models gain only through their dense layers (+4-5% on Qwen3.6
+  35B-A3B); their experts keep mmq (LLM-6).
+
+### LLM-7: DeltaNet conv-input concat
+
+[`107-concat-transposed-src1.patch`](../rocm6.4.4/patches/ollama/llama-cpp/107-concat-transposed-src1.patch)
+gives CONCAT along dim 0 with a transposed second operand (Gated DeltaNet's
+convolution input, in Qwen3.5/3.6 and Qwen3-Next) a tiled kernel. The generic
+kernel read the transposed operand with lanes 32 KiB apart: 27 ms per call,
+0.83 s of a 2048-token batch of Qwen3.6 35B-A3B. Now 1.14 ms; Qwen3.6 pp2048
+244 -> 270 tok/s at a 2048-token batch. Not specific to gfx803.
+
+### BLAS-6: GEMMs with 1-8 columns
+
+A PyTorch model that generates one token at a time multiplies each weight
+matrix by 1 or 2 columns (2 with classifier-free guidance). rocBLAS ran the
+fp16 calls (op(A) = T) on a Tensile kernel with a 128x32 macro tile, and the
+shim ran the fp32 calls on its own tiles; with 2 columns almost all of each
+tile was idle. `gfx803_sgemm_small_n_kernel` handles n <= 8 with op(A) = T
+like a GEMV: each wavefront owns two rows of C, its lanes read K in 16-byte
+loads, all columns' sums stay in registers, and a butterfly reduction ends
+each row. When K is long enough, up to four wavefronts share a row and add
+their sums through LDS, because a 1024-row weight otherwise leaves 3-4
+wavefronts per SIMD. The shim now takes fp16 calls of this shape from
+rocBLAS.
+
+`F.linear` at batch 2 on the RX 590, before and after:
+
+| Weight | fp16 | fp32 |
+| --- | --- | --- |
+| 1024 -> 1024 | 249 -> 14 us | 120 -> 24 us |
+| 1024 -> 4096 | 263 -> 64 us | 261 -> 77 us |
+| 4096 -> 1024 | 987 -> 44 us | 412 -> 82 us |
+| 1024 -> 8194 | 355 -> 92-221 us | 507 -> 148 us |
+
+In Chatterbox's 0.5B token model (30 Llama layers at batch 2), the linear
+layers per token fall from 75.6 to 7.0 ms in fp16 and from 43 to 10.1 ms in
+fp32. A whole token falls from 88 to 25.7 ms, and a 4.4 s sentence from 11.8
+to 4.9 s; the rest is now CPU time, the Python decode loop.
+
+The kernel sums in a different order than the tiles, so its results differ
+from theirs in the last bits. Errors against a float64 CPU reference equal
+the old path's in every layout tested (`linear`, misaligned rows, `addmm`
+with beta, transposed activations, `bmm`; n from 1 to 10, fp16 and fp32).
+Of the shim's 46 reference GEMMs, 44 stay bit-identical; the two with one
+column that now take this kernel differ by 3e-7 relative. Chatterbox's
+token model matches the CPU as before: fp32 logits 8.7e-7, fp16 5.6e-4.
+`GFX803_SGEMM_SMALL_N=0` switches the kernel off.
+
+### BLAS-5: TN, NT and TT layouts
+
+`gfx803_sgemm_tile_g` in
+[`gfx803_sgemm.h`](../rocm6.4.4/patches/sgemm-shim-batched/gfx803_sgemm.h)
+serves the transposed layouts that `torch.nn.Linear` (TN) and its weight
+gradient (NT) produce. NN keeps `gfx803_sgemm_tile_p_fast`. Three changes,
+each measured on its own:
+
+- **Transposed B staged like A in NN.** Four N-contiguous values per float4
+  load and one LDS write, instead of lanes strided by ldb. SD 1.5's weight
+  gradients go from 2.5-3.2 to 3.8-5.3 TFLOPS.
+- **A 32-deep K slice for a transposed A.** Each row of A is then read in
+  128-byte pieces instead of 64. The two other ways of staging a transposed A
+  measured slower: single floats with 16 lanes along K, and the old float4
+  mapping with a 16-deep slice.
+- **Grouped tile order when A is larger than the 2 MiB L2.** Walking row tiles
+  re-reads all of A from DRAM for every column tile. Groups of 8 column tiles
+  that walk the row tiles together read it once per group. Applied to NN, the
+  same grouping made large GEMMs slower, so NN is not grouped.
+
+Which B staging and tile order win depends on how B's rows are aligned. With
+rows at multiples of 256 bytes (nn.Linear's widths), single floats for K >=
+2048 and grouped order measured best. Rows padded off that alignment
+(llama.cpp's prompt GEMMs after LLM-4) measured best with float4 B in
+row-tile order (8192 x 2048 x 2048: 2.1 -> 3.9 TFLOPS). TN GEMMs with A
+within L2, and K <= 64, stay on `gfx803_sgemm_tile_p_fast`, which measured
+the same or faster there.
+
+**Leading dimensions that are multiples of 8 KiB** (2048 or 4096 floats) put
+every row of a K-contiguous operand in one DRAM channel. 2048^3 TN runs at
+3.4 TFLOPS against 4.95 for NN, and llama.cpp's 14336 x 512 x 4096 at 2.85.
+Padding the leading dimension by 16 floats takes the same GEMMs to 3.6 and
+4.1. Grouping made these shapes worse (TN 2048^3 2.9, NT 1.4), so they keep
+the older kernels. The fix for them is a padded layout where the matrix is
+allocated, which is part of LLM-4.
+
+Results:
+
+- **Correctness.** Bit-identical to the previous shim on 3000 random GEMMs
+  (every layout, odd sizes and leading dimensions, offsets, batched,
+  alpha/beta), the 46-case reference set and the 300-case PyTorch sweep
+  (worst error against CPU float64 2.2e-6). A debug build ran the old and new
+  kernels side by side on all 12,000+ GEMM calls of two SD 1.5 runs: 0 differ.
+- **Kernel speed, TFLOPS** (old -> new, best of both measurement orders):
+
+  | shape (M x N x K, layout) | old | new |
+  | --- | --- | --- |
+  | 2560 x 8192 x 320 TN (GEGLU proj) | 3.19 | 4.45 |
+  | 5120 x 2048 x 640 TN | 2.80 | 4.40 |
+  | 640 x 2048 x 2560 TN (feed-forward out) | 2.23 | 3.58 |
+  | 1280 x 512 x 5120 TN | 1.97 | 3.20 |
+  | 10240 x 512 x 1280 TN | 2.72 | 3.56 |
+  | 320 x 2560 x 8192 NT (weight gradient) | 2.73 | 5.04 |
+  | 640 x 5120 x 2048 NT | 2.94 | 5.29 |
+  | 320 x 320 x 8192 NT (32x32 tile) | 1.58 | 2.50 |
+  | 40 x 4096 x 4096 x3 NT (attention backward) | 1.69 | 2.55 |
+  | 1000 x 3000 x 700 TT | 2.90 | 4.38 |
+  | 4096 x 512 x 14336 TN, padded ld | 3.20 | 3.76 |
+
+- **SD 1.5 inference** (ComfyUI, 20 steps, fp32, 512 px): 557 -> 526 ms per
+  step with the node, 675 -> 644 without it. Without the node the latent is
+  bit-identical to the old shim's. With the node it differs by at most 1.1e-4
+  (relative L2 2e-6); see "Measuring" for why that is not a GEMM difference.
+- **Training** (Sherlock, 40 steps, seed 42, shared find-db): 3.63 -> 3.37 s
+  per steady step, avr_loss 0.204 -> 0.203, no GPU faults.
+
 ### BLAS-1, BLAS-2: pipelined 64x64 and 32x32 tiles
 
 [`gfx803_sgemm.h`](../rocm6.4.4/patches/sgemm-shim-batched/gfx803_sgemm.h)
@@ -383,7 +636,7 @@ LDS prefetch.
   | 2048 x 2048 x 2048, B transposed | 6.45 | 5.46 |
 
   These are plain `A @ B` on contiguous tensors, which reach the shim as NN;
-  `torch.nn.Linear` reaches it as TN (see BLAS-5).
+  `torch.nn.Linear` reaches it as TN (BLAS-5).
 - SD 1.5 LoRA training: 4.0 s per step against about 4.1 before.
 
 ### BLAS-4: fp16 GEMMs in every layout (evaluated, not adopted)
@@ -502,6 +755,25 @@ matmul (4096x14336) goes from 233 to 224 us for one column and from 287 to
   forward and backward without gradient checkpointing does not fit in 8 GB.
 - **GEMM speed.** Time `A @ B` with CUDA events after a few warm-up calls;
   build transposed operands as `.t()` views to reach each rocBLAS layout.
+  Two effects of 5-15% hide in back-to-back A/B timing. The variant timed
+  first in each round runs faster on some shapes, whatever its code. Output
+  buffers at different physical addresses also run at different speeds
+  (DRAM channel mapping). Time both variants into the same buffer, in both
+  orders, and keep the best of each.
+- **Which GEMM call differs.** A debug shim that includes the old and new
+  headers in two namespaces runs both kernels on every intercepted fp32
+  call, compares them byte for byte, and prints the parameters of any call
+  that differs. It answers whether an end-to-end difference comes from the
+  shim at all.
+- **ComfyUI end-to-end comparisons.** Compare runs in separate processes. In
+  one process, a second identical sampling differs from the first (latent
+  max 2.4e-3 without the node, 6.4e-3 with it), with either shim. Separate
+  processes with the same binaries are bit-identical. With the node
+  installed, the result also depends on GPU timing. The latent differs by
+  1e-4 when only the GEMMs get faster, even though every GEMM call is
+  bit-identical (debug shim) and each node kernel is deterministic on its
+  own (same inputs, eight different dirty-memory states). The source of this
+  dependence is not found yet.
 - **llama.cpp kernels.** `test-backend-ops perf -o MUL_MAT -b ROCm0 -p
   'type_a=q4_K,.*n=512,'` (the `-p` filter is a regex over the case string).
   To compare two builds fairly, run the same `test-backend-ops` binary against
@@ -579,3 +851,7 @@ Run what the change can affect, on the image's own binaries:
   Quote end-to-end numbers next to kernel numbers.
 - **Plain `A @ B` benchmarks miss the hot layout.** Linear layers are TN;
   benchmark with the layouts the workload's call log shows.
+- **Power-of-two leading dimensions are their own case.** A 2048^3 or
+  4096-wide benchmark measures DRAM channel conflicts, not the kernel. A tile
+  order that won on SD's shapes lost 15-55% on those. Always include padded
+  and real-model leading dimensions next to the square case.

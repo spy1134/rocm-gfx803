@@ -26,6 +26,10 @@ against a CPU reference, and "it runs" was never taken as evidence.
 | bf16 reported as supported (no bf16 hardware) | Checked: correct; convs 1.7x slower than fp16 | none needed |
 | PyTorch int8 matmul fails on every call | Fixed (port of upstream's fix) | `patches/pytorch/` |
 | PyTorch layer_norm wrong (warp-size mismatch) | Fixed | `patches/pytorch/` |
+| PyTorch top-k hangs the GPU (warp-size mismatch in its scan) | Fixed | `patches/pytorch/` |
+| PyTorch nonzero, masked indexing, unique, large sorts fail to launch (rocPRIM symbol clash with rocSPARSE) | Fixed | `patches/pytorch/` |
+| PyTorch index_put accumulate drops sums (warp-size mismatch) | Fixed | `patches/pytorch/` |
+| A GPU-side assert resets the whole GPU instead of raising an error | Open (driver/trap handler) | none |
 | torchvision nms has no gfx803 kernel | Worked around (CPU) | `runtime/python/` |
 | No fused attention in PyTorch on gfx803 | ComfyUI node (inference, fp32 kernels) | `tools/ComfyUI-gfx803-attention/` |
 | Patched HSA runtime page faults | Open; images default to the stock runtime | `Dockerfile`, start scripts |
@@ -35,6 +39,10 @@ against a CPU reference, and "it runs" was never taken as evidence.
 | llama.cpp q8_0 generation slows with context | Fixed | `patches/ollama/llama-cpp/102-*` |
 | llama.cpp K-quant generation below memory bandwidth | Fixed | `patches/ollama/llama-cpp/103-*` |
 | llama.cpp integer dot products built from byte unpacking | Faster (decode kernels) | `patches/ollama/llama-cpp/104-*`, `105-*` |
+| llama.cpp prompts on emulated int8 (mmq) | Faster (fp32 GEMMs on the shim) | `patches/ollama/llama-cpp/106-*` |
+| llama.cpp DeltaNet concat reads 32 KiB-strided | Fixed (all GPUs) | `patches/ollama/llama-cpp/107-*` |
+| MoE prompts: the GPU idles while each layer's experts cross PCIe | Fixed (all GPUs; needs SDMA copies on gfx803) | `patches/ollama/llama-cpp/108-*`, `HSA_ENABLE_SDMA=1` in Dockerfile-Ollama |
+| MoE generation: one GPU round trip per tensor handed to the CPU experts | Improved (all GPUs) | `patches/ollama/llama-cpp/109-*` |
 | Ollama rejects argument-less tools | Fixed (all GPUs) | `patches/ollama/ollama/` |
 | llama.cpp reserves a vision projector's memory on the wrong device | Fixed (all GPUs) | `patches/ollama/llama-cpp-server/` |
 | Ollama keeps stale free-memory figures on slow-starting GPUs | Fixed (all GPUs) | `patches/ollama/ollama/` |
@@ -48,18 +56,18 @@ Paths in the table are relative to `rocm6.4.4/`.
   `--use-split-cross-attention`, classifier-free guidance, timed on a second
   run in the same process: 1758 ms per step on an image from just after the
   first shim speed fix (batched GEMMs covered, the coalesced 16x16 kernel,
-  binary Winograd disabled, convolutions on MIOpen's GEMM path), 694 ms now,
-  563 ms with the ComfyUI node (section 5b): 35 s -> 13.9 s / 11.3 s.
+  binary Winograd disabled, convolutions on MIOpen's GEMM path), 644 ms now,
+  526 ms with the ComfyUI node (section 5b): 35 s -> 12.9 s / 10.5 s.
 - **SD 1.5 LoRA training step**, 512 px, 4 accumulated images: 12.1 s in the
   first setup with correct results (extended shim, binary Winograd disabled),
-  about 4.0 s now (section 1). The original stack ran about 8 s per step with
+  about 3.4 s now (section 1). The original stack ran about 8 s per step with
   wrong attention gradients, GPU hangs and corrupted latents.
 - **Ollama / llama.cpp**, Qwen3 8B Q4_K_M, q8_0 KV cache, flash attention,
   `llama-bench` on llama.cpp b11232 as Ollama 0.35.1 fetches it, unmodified
-  against patches 100-105: prompt (512 tokens) 14.0 -> 158.6 tokens/s; a
-  12,288-token prompt 11.4 -> 133.2 tokens/s (1074 s -> 92 s); generation
+  against patches 100-107: prompt (512 tokens) 14.0 -> 222.8 tokens/s; a
+  12,288-token prompt 11.4 -> 172.7 tokens/s (1074 s -> 71 s); generation
   (128 tokens, short context) 27.3 -> 30.5 tokens/s. Qwen2.5-Coder 7B Q4_K_M:
-  15.0 -> 163.9 and 29.7 -> 33.2. Generation 8k tokens deep: 20.9 -> 26.5
+  15.0 -> 230.5 and 29.7 -> 33.2. Generation 8k tokens deep: 20.9 -> 26.5
   tokens/s (Qwen3 8B, before patch 104).
 
 ## 1. fp32 GEMM: the SGEMM shim and its gaps
@@ -105,6 +113,23 @@ stay within 5% of before. A 20-step SD 1.5 LoRA training run takes 4.0 s per
 step against about 4.1 before: the GEMMs are no longer most of a step.
 All variants are bit-identical to the reference kernel (46 reference cases and
 300 random GEMMs with odd sizes, leading dimensions and offsets).
+
+The transposed layouts got their own tile, `gfx803_sgemm_tile_g`: nn.Linear
+reaches rocBLAS with A transposed (40% of an SD 1.5 step's GEMM FLOPs) and its
+weight gradient with B transposed. Each operand is staged by its contiguous
+index (float4 runs, or single floats where that measured faster), a
+transposed A gets a 32-deep K slice, and when A is larger than the 2 MiB L2
+the tiles go out in groups of 8 column tiles. Linear layers went from 2.2-3.2
+to 3.2-4.5 TFLOPS and weight gradients from 2.5-3.2 to 3.8-5.3. An SD 1.5 step
+with the node went from 557 to 526 ms, and a training step from 3.63 to 3.37 s.
+Results are bit-identical to the previous kernels on 3000 random GEMMs and on
+every one of the 12,000+ GEMM calls of two SD 1.5 runs. One limit the kernel
+cannot remove: a leading dimension that is a multiple of 8 KiB (2048 or 4096
+floats) puts every row of a K-contiguous operand in one DRAM channel (2048^3
+with A transposed: 3.4 TFLOPS against 4.95 untransposed). Such shapes keep the
+older kernels, and the fix belongs where the matrix is allocated: padding the
+rows by 16 floats takes them to 3.6-4.1. llama.cpp's prompt path does that
+(section 7).
 
 fp16 is covered too; see section 7a.
 
@@ -257,6 +282,74 @@ wrong whenever the spatial size is 1 and there are more than 128 rows
 (`GammaBeta1dBackwardCUDAKernel2`, a fixed 32x16 block reduced with
 full-wavefront shuffles). The image used to route GPU layer_norm through
 group_norm with one group; that route is gone.
+
+**top-k.** `torch.topk` hung the GPU on gfx803, and the driver then reset it
+(`SQ instruction intr detected ... trap true`, then `qcm fence wait loop
+timeout`, `Failed to evict process queues`, a BACO reset and `VRAM is lost`).
+Any sampler that filters tokens with top-k or top-p on the GPU hits it on its
+first token; Chatterbox TTS did. With `AMD_SERIALIZE_KERNEL=3` the HIP
+runtime names the kernel (`at::native::sbtopk::gatherTopK`) and reports
+`HSA_STATUS_ERROR_EXCEPTION` before the reset. gatherTopK finds each kept
+element's output slot with a binary prefix scan
+(`aten/src/ATen/cuda/ScanUtils.cuh`) that votes with a 64-bit ballot over the
+whole wavefront and has lane 0 store its count, but numbers warps by
+`C10_WARP_SIZE`. On gfx803 lanes 32-63 form a warp whose count nobody
+writes, thread 0 sums uninitialized shared memory into the offsets, and the
+kernel's `CUDA_KERNEL_ASSERT(writeIndex < outputSliceSize)` executes a trap.
+A trapped wave on gfx803 never finishes, so the queue cannot be preempted and
+the driver resets the GPU instead of the process receiving an error. The scan
+as written gets 100 of 100 random blocks wrong on the card, and 0 with the
+hardware's warp width
+([`tools/correctness-suite/pytorch/`](../tools/correctness-suite/pytorch/)
+holds this reproduction and the checks quoted below).
+[`gfx803-topk-scan-warp-size.patch`](../rocm6.4.4/patches/pytorch/gfx803-topk-scan-warp-size.patch)
+numbers the scan's warps by the hardware wavefront on ROCm. After it, top-k
+matches the CPU in 798 of 798 cases (sizes up to 1M and 152k vocabularies,
+fp32, fp16 and int64, largest and smallest, sorted and unsorted, heavy ties),
+and Hugging Face's top-k, top-p and min-p filters keep the same tokens as on
+the CPU in 150 of 150 trials.
+
+**rocPRIM kernels that would not launch.** `nonzero`, boolean-mask indexing
+(`x[mask]`, `masked_select`), `unique`, `randperm`, the backward of
+`nn.Embedding`, `cumsum` on integers, `searchsorted` and sorts of more than
+4096 elements failed on gfx803 with `HIP error: invalid device function`,
+at any input size. rocPRIM is header-only, so each library built with it
+carries its own copy of every rocPRIM kernel it uses and exports the
+kernel's host-side handle. ROCm's rocSPARSE, which libtorch_hip links,
+exports 31 of the same handles as libtorch_hip. The dynamic linker binds both
+libraries to one address, each library registers that address with its own
+code object, and HIP keeps the first registration, rocSPARSE's. AMD's
+rocSPARSE has no gfx803 code object, so the launch finds no kernel. On GPUs
+rocSPARSE supports, its identical copy runs and nothing is visibly wrong.
+The same kernels work in a standalone gfx803 program, and rocPRIM kernels
+that rocSPARSE does not export work inside torch.
+[`gfx803-rocprim-private-namespace.patch`](../rocm6.4.4/patches/pytorch/gfx803-rocprim-private-namespace.patch)
+compiles torch's HIP code with `-Drocprim=at_hip_rocprim`, the ROCm
+counterpart of the `CUB_WRAPPED_NAMESPACE` that PyTorch uses against the same
+clash with CUDA's CUB; libtorch_hip then exports no rocPRIM symbol and shares
+no kernel name with rocSPARSE. A check of these ops against the CPU went from
+67 to 118 of 118 cases (with the index_put fix below).
+
+**index_put with accumulate.** `index_put_(..., accumulate=True)`, which
+`x[idx] += v`-style scatters and the backward of advanced indexing use,
+returned wrong sums whenever indices repeated: off by up to 4.9 with 1000
+indices into 1000 slots and by 175 with 3 million, against a CPU error below
+3e-4. It is layer_norm's mismatch again: the launcher in `Indexing.cu` sizes
+blocks and grids by `at::cuda::warp_size()` (64) while its kernels index in
+`C10_WARP_SIZE` (32) warps, so half of each block's sorted indices are never
+summed and lanes 32-63 repeat lanes 0-31.
+[`gfx803-index-put-warp-size.patch`](../rocm6.4.4/patches/pytorch/gfx803-index-put-warp-size.patch)
+launches both index_put kernels (plain and quantized) with the compiled warp
+size, as the layer_norm patch does. After it the GPU matches the CPU; at 3
+million indices it is closer to a float64 reference than the CPU is (4e-5
+against 2.5e-4).
+
+These are three instances of one pattern: code that checks for gfx9 when it
+means "64-lane GPU" leaves gfx6-8 with a 32-lane `C10_WARP_SIZE` on 64-lane
+hardware, and a kernel goes wrong wherever it meets a value sized for the
+hardware. Fourteen of the 21 files under `aten/` that use the macro also call
+`at::cuda::warp_size()`; the audit is target PT-2 in
+[`OPTIMIZATION_TARGETS.md`](OPTIMIZATION_TARGETS.md).
 
 The workarounds below are loaded into every Python process through `sitecustomize` in the base
 image; the modules are in [`rocm6.4.4/runtime/python/`](../rocm6.4.4/runtime/python/).
@@ -440,6 +533,60 @@ registers, or run out of instruction throughput, on gfx803.
   `105-gfx803-q5k-decode.patch` loads q5_K's scales with one 16-byte load
   instead of four small ones (q5_K decode matmul 233 -> 224 us, measured with
   104).
+- **Prompts on emulated int8.** Even with the tile table, mmq runs q4_K at
+  about 2.4 effective TOPS, a third of the card's fp32 rate, and rounds the
+  activations to 8 bits. `106-gfx803-cublas-prompt.patch` sends quantized
+  matmuls with 128 or more columns to cuBLAS in fp32, which the base image's
+  SGEMM shim runs. Upstream picks fp16 compute with fp16 accumulation for
+  quantized weights on every AMD GPU, which on gfx803 goes to rocBLAS; the
+  patch uses fp32 there. Weight rows of 4096 or 14336 floats (multiples of
+  8 KiB) put a whole GEMM tile in one DRAM channel, so the weights are
+  dequantized straight into rows padded by 16 floats (14336 x 512 x 4096:
+  2.8 -> 4.1 TFLOPS). Weights whose fp32 copy would exceed 512 MiB keep mmq:
+  an output head over a 152k vocabulary (reached only when every token's
+  logits are computed) needs 2.5 GB, and that run ended in a GPU memory fault
+  on the stock runtime while the SGEMM alone at that shape ran clean. Results:
+  llama-bench pp512 Qwen3 8B 163.5 -> 222.8, Qwen2.5-Coder 7B 166.9 -> 230.5;
+  Ollama with a ~5.2k-token prompt 149 -> 215 and 107 -> 136 tok/s;
+  generation unchanged. KL divergence against the CPU backend drops (Qwen2.5-
+  Coder 0.00152 -> 0.00094, Qwen3 0.0103 -> 0.0086). MoE expert matmuls
+  (MUL_MAT_ID) keep mmq: each expert sees too few tokens per batch.
+- **DeltaNet's convolution input read 32 KiB apart.** Qwen3.5/3.6 and
+  Qwen3-Next build it as concat(conv state, transpose(qkv)), and llama.cpp's
+  generic concat kernel read the transposed operand with every lane one row
+  (32 KiB) from the next: 27 ms per call, 0.83 s of a 2048-token batch of
+  Qwen3.6 35B-A3B. `107-concat-transposed-src1.patch` moves it through 32x32
+  shared-memory tiles (1.14 ms). This is not specific to gfx803. With 106 and
+  107, Qwen3.6 35B-A3B (experts in system RAM) in Ollama reads a ~5.5k-token
+  prompt at 236 tok/s against 189 before, and generates at 23.8 tok/s against
+  22.2.
+- **MoE prompts waited for every layer's expert copy.** With most experts
+  in system RAM, each MoE layer of a prompt batch runs on the GPU after the
+  scheduler copies that layer's experts there, and the GPU sat idle for the
+  whole PCIe transfer: removing the copies (timing only) took Qwen3.6
+  35B-A3B from 295 to 376 tok/s at 2048-token batches and from 167 to 388
+  at 512. `108-moe-expert-prefetch.patch` copies the next MoE layer's
+  experts into a second device slot on a second stream while the current
+  layer computes, for batches large enough that nearly every expert is
+  used. On gfx803 that overlap needs `HSA_ENABLE_SDMA=1`: ROCm's runtime
+  otherwise copies host to device with blit kernels, which serialize with
+  compute (a 512 MiB copy next to a GEMM loop: no overlap at all, against
+  37 ms of 41 hidden with SDMA). Dockerfile-Ollama sets it. llama-bench
+  pp2048 with all experts in RAM: 193 / 250 / 295 -> 243 / 321 / 367 tok/s at
+  512 / 1024 / 2048-token batches. In Ollama with Chatterbox loaded beside
+  it (3.2 GiB of the model on the card), prompts of 2k and 8k tokens went
+  124 -> 144 and 122 -> 135 tok/s. Generation is unchanged. Logits are
+  unchanged too (llama-perplexity with and without: PPL 12.1753, mean KLD
+  0), and 767 GiB of byte-compared SDMA round trips next to running GEMMs
+  found no mismatch.
+- **Each GPU tensor a CPU expert split reads cost a full round trip.** In
+  generation with experts in RAM, every layer hands its hidden state, router
+  weights and expert ids to the CPU, and the scheduler copied each with a
+  synchronous copy: about 25 us per 4 KB copy-and-wait on an RX 590, about
+  130 per token. `109-sched-batched-host-copies.patch` queues those copies
+  and waits once per split: Qwen3.6 35B-A3B tg128 23.8 -> 24.4 tok/s, logits
+  unchanged. The rest of a generated token's time is in
+  docs/OPTIMIZATION_TARGETS.md (LLM-8).
 
 Upstream llama.cpp has no equivalent of the third fix; issue
 [#27796](https://github.com/ggml-org/llama.cpp/issues/27796) reports the same
