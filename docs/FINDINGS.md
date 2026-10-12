@@ -47,7 +47,7 @@ as read.
   reproduction has been run against the new binaries.
 
 **Where the numbers come from.** All measurements are from one RX 590 8 GB
-(Polaris 20, 36 CUs) on a Ryzen 7 2700X host, Arch Linux with the LTS kernel,
+(Polaris 30, 36 CUs) on a Ryzen 7 2700X host, Arch Linux with the LTS kernel,
 and the ROCm 6.4.4 images built from `rocm6.4.4/`. Other Polaris cards share
 the chip design and should behave alike; their clocks, memory and firmware
 differ, and none has been tested. Upstream's earlier findings (the rocBLAS
@@ -356,8 +356,7 @@ layer_norm, but it changes every kernel compiled against the macro and some
 depend on 32: group_norm's weight and bias gradients then come out about 100%
 wrong whenever the spatial size is 1 and there are more than 128 rows
 (`GammaBeta1dBackwardCUDAKernel2`, a fixed 32x16 block reduced with
-full-wavefront shuffles). The image used to route GPU layer_norm through
-group_norm with one group; that route is gone.
+full-wavefront shuffles).
 
 **top-k.** `torch.topk` hung the GPU on gfx803, and the driver then reset it
 (`SQ instruction intr detected ... trap true`, then `qcm fence wait loop
@@ -780,7 +779,5 @@ a reproduction.
 - [`tools/ComfyUI-gfx803-attention/`](../tools/ComfyUI-gfx803-attention/): the
   optional ComfyUI node with gfx803 attention, GroupNorm and GEGLU kernels
   (section 6); its kernel sources are in `tools/`.
-- [`tools/console-mouse/`](../tools/console-mouse/): mouse support for terminal
-  apps on the Linux text console, through gpm.
 - [`rocm6.4.4/training/gfx803_unet_check.py`](../rocm6.4.4/training/gfx803_unet_check.py):
   the op-by-op and whole-UNet check against a float64 CPU reference.

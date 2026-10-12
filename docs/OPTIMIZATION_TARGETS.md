@@ -319,7 +319,7 @@ not reach.
 The audit needs no GPU. Each suspect it finds then gets a GPU-against-CPU
 test for the affected op, run headless with `AMD_SERIALIZE_KERNEL=3` so that a
 trapping assert names its kernel and costs one reset. PyTorch's own OpInfo
-tests (about 600 ops, against our suite's 118) run the same way, one op per
+tests (about 600 ops, against the suite's 118) run the same way, one op per
 process, would find the cases the audit misses.
 
 ### SD-6: register-tiled fused attention
@@ -687,12 +687,11 @@ base image's `hipcc` if the host has none) and copies the node into
 
 PyTorch's HIP layer_norm was wrong on gfx803: its device code reduces over
 32-lane warps (`C10_WARP_SIZE` is 32 for every AMD target except gfx9) while
-the host launched it with 64-wide blocks (`at::cuda::warp_size()`), so the
-image routed layer_norm through group_norm.
+the host launched it with 64-wide blocks (`at::cuda::warp_size()`).
 [`gfx803-layer-norm-warp-size.patch`](../rocm6.4.4/patches/pytorch/gfx803-layer-norm-warp-size.patch)
-sizes layer_norm's launches by the compiled warp size, and the route is gone:
-native layer_norm matches a CPU float64 reference in 80 of 80 runs, all three
-gradients included, and an SD step is ~1% faster than through the route.
+sizes layer_norm's launches by the compiled warp size: native
+layer_norm matches a CPU float64 reference in 80 of 80 runs, all three
+gradients included.
 Redefining `C10_WARP_SIZE` as 64 for gfx8 also fixed layer_norm but broke
 group_norm's weight and bias gradients for more than 128 rows. Details:
 FINDINGS section 5.
