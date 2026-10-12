@@ -84,6 +84,27 @@ done
 
 Expect `ok=true` on all 27. Against an older shim, expect the square cases to match
 and every non-square case to be wrong or to fault.
+
+### pytorch/: top-k, rocPRIM and index_put
+
+Reproductions and checks for the PyTorch fixes in `rocm6.4.4/patches/pytorch/`. Run them in
+any image of the line with the card passed through.
+
+- `scan_repro.hip`: the binary prefix scan behind `torch.topk`, with 32-lane and hardware-wide
+  warp numbering, in random blocks of 64-1024 threads. It cannot trap. On gfx803 the 32-lane
+  version gets every block wrong and the hardware width none:
+  `hipcc -O2 --offload-arch=gfx803 scan_repro.hip -o scan_repro && ./scan_repro`.
+- `rocprim_repro.hip`: rocPRIM's select and transform outside PyTorch. Both work on gfx803,
+  which shows that the "invalid device function" inside torch comes from how the libraries are
+  linked, not from rocPRIM.
+- `rocprim_ops_check.py`: nonzero, masked indexing, unique, sorts and argsorts (fp32, fp16,
+  int64, up to 3M elements), cumsum, top-k, index_put with accumulate, bincount, searchsorted,
+  randperm and embedding backward on the GPU against the CPU. Expect 118 of 118; an image
+  without the rocPRIM and index_put patches gives 67, mostly launch errors.
+- `topk_check.py`: `torch.topk` against the CPU over sizes, k, dtypes and ties, then Hugging
+  Face's top-k, top-p and min-p filters (needs `transformers`). Expect 798 of 798 and 150 of 150.
+  **Do not run it on an image without the top-k patch:** the first case traps a wave and the
+  driver resets the GPU.
 ## Running it
 
 Build inside any container that has `hipcc` and MIOpen installed. Every image

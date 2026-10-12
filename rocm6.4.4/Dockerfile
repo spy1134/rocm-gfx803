@@ -731,11 +731,23 @@ RUN git init -q /pytorch \
 # kernels, so every int8 matmul fails; the first patch routes it to rocBLAS.
 # layer_norm sizes its launches by the hardware's 64-lane wavefront while its
 # kernels reduce over the 32 lanes C10_WARP_SIZE gives gfx803; the second
-# patch sizes them by the compiled value. Applied to the CUDA source, before
-# build_amd.py hipifies it.
+# patch sizes them by the compiled value. The binary prefix scan behind
+# torch.topk votes over the whole 64-lane wavefront but numbers warps by those
+# 32 lanes, so top-k writes to wrong slots and its assert hangs the GPU; the
+# third patch numbers them by the hardware's width. rocSPARSE exports its own
+# copies of rocPRIM kernels under the names torch uses, without gfx803 code,
+# and its registration wins (nonzero, masked indexing, unique and large sorts
+# fail to launch); the fourth gives torch's rocPRIM a private namespace.
+# index_put's accumulate launch has layer_norm's mismatch (64-wide launch,
+# 32-lane kernels) and drops half of the repeated indices; the fifth sizes it
+# like layer_norm.
+# Applied to the CUDA source, before build_amd.py hipifies it.
 COPY patches/pytorch/ /pytorch-patches/
 RUN sh /pytorch-patches/gfx803-int8-gemm-rocblas.sh /pytorch \
-    && sh /pytorch-patches/gfx803-layer-norm-warp-size.sh /pytorch
+    && sh /pytorch-patches/gfx803-layer-norm-warp-size.sh /pytorch \
+    && sh /pytorch-patches/gfx803-topk-scan-warp-size.sh /pytorch \
+    && sh /pytorch-patches/gfx803-rocprim-private-namespace.sh /pytorch \
+    && sh /pytorch-patches/gfx803-index-put-warp-size.sh /pytorch
 
 WORKDIR /pytorch
 RUN pip install --no-cache-dir -r requirements.txt

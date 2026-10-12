@@ -1,0 +1,106 @@
+PyTorch (ROCm/pytorch release/2.8, commit d618db8): number warps by the
+hardware wavefront in the binary prefix scan that torch.topk uses.
+
+WHY
+torch.topk on gfx803 hangs the GPU, and the driver then resets it ("SQ
+instruction intr detected ... trap true", then "qcm fence wait loop timeout",
+"Failed to evict process queues", BACO reset, "VRAM is lost"). Any sampler
+that applies top-k or top-p on the GPU triggers it: Chatterbox TTS's
+token sampling did on the first generated token. With
+AMD_SERIALIZE_KERNEL=3 the HIP runtime names the kernel
+(at::native::sbtopk::gatherTopK<float, unsigned int, 1, false>, slice
+size 8194) and reports HSA_STATUS_ERROR_EXCEPTION before the reset.
+
+gatherTopK finds each kept element's output slot with
+at::cuda::exclusiveBinaryPrefixScan (aten/src/ATen/cuda/ScanUtils.cuh). On
+ROCm the scan votes with a 64-bit ballot over the whole hardware wavefront
+and has lane 0 store the wavefront's count, but it numbers warps as
+threadIdx.x / C10_WARP_SIZE. c10/macros/Macros.h makes C10_WARP_SIZE 64 in
+gfx9 device code and 32 for every other AMD target, so on gfx803's 64-lane
+wavefronts lanes 32-63 form a "warp" whose count nobody writes: thread 0
+sums uninitialized shared memory into the offsets, the slots come out
+wrong, and CUDA_KERNEL_ASSERT(writeIndex < outputSliceSize) executes
+s_trap. On gfx803 the trapped wave never ends, so the queue cannot be
+preempted and the driver resets the GPU instead of the process getting an
+error. Where the assert does not fire, the top-k values are silently
+wrong.
+
+To reproduce without the trap:
+tools/correctness-suite/pytorch/scan_repro.hip runs the scan as written in
+random 64-1024 thread blocks; with a warp width of 32 every block (100 of
+100) gets wrong slots and totals, with the hardware's warpSize none.
+
+Changing C10_WARP_SIZE itself for gfx8 is not an option: other kernels
+depend on its value of 32 there (see gfx803-layer-norm-warp-size.patch:
+group_norm's gradients break). The fix stays in the scan.
+
+WHAT
+binaryScanWarpSize() returns warpSize (the hardware wavefront) on ROCm
+and C10_WARP_SIZE on CUDA; the scan's three warp computations use it.
+CUDA builds and gfx9 (where the two agree) are unchanged. The other
+ballot users were checked: SortingRadixSelect.cuh's countRadixUsingMask
+already counts per hardware wavefront (lane 0 of the ballot, __popcll),
+and Embedding.cu's backward kernel takes its block width from the host's
+warp size (64), consistent with the ballot.
+
+REAL-HARDWARE VERIFICATION (RX 590, this image)
+tools/correctness-suite/pytorch/topk_check.py: torch.topk matches the CPU
+in 798 of 798 cases (sizes 64 to 1M including 8194- and 151936-entry
+vocabularies, fp32, fp16 and int64, k from 1 to the full size, largest and
+smallest, sorted and unsorted, masked logits and all-equal inputs), and
+Hugging Face's top-k, top-p and min-p filters keep the same tokens as on
+the CPU in 150 of 150 trials. Chatterbox TTS, whose sampler trapped on its
+first token, generates speech with no trap or reset. PyTorch op suite 118
+of 118, SD 1.5 UNet check stages 1 and 2, conv checks fp32 and fp16 0 bad,
+20 LoRA training steps (median 4 s/step, loss 0.219), 0 GPU faults.
+
+diff --git a/aten/src/ATen/cuda/ScanUtils.cuh b/aten/src/ATen/cuda/ScanUtils.cuh
+index fd8b9e9..e8f59de 100644
+--- a/aten/src/ATen/cuda/ScanUtils.cuh
++++ b/aten/src/ATen/cuda/ScanUtils.cuh
+@@ -9,6 +9,18 @@
+ 
+ namespace at::cuda {
+ 
++// Width of the lane group that WARP_BALLOT votes over in the scans below. On ROCm the ballot
++// always spans the hardware wavefront, which is 64 lanes on gfx6-8 although C10_WARP_SIZE is 32
++// in their device code (Macros.h gives 64 to gfx9 only); numbering warps by C10_WARP_SIZE there
++// leaves every odd-numbered warp's total unwritten. GFX803_SCAN_WARP_SIZE_PATCH
++__device__ __forceinline__ int binaryScanWarpSize() {
++#if defined(USE_ROCM)
++  return warpSize;
++#else
++  return C10_WARP_SIZE;
++#endif
++}
++
+ // Inclusive prefix sum for binary vars using intra-warp voting +
+ // shared memory
+ template <typename T, bool KillWARDependency, class BinaryFunction>
+@@ -24,7 +36,7 @@ __device__ void inclusiveBinaryPrefixScan(T* smem, bool in, T* out, BinaryFuncti
+   T carry = __popc(vote);
+ #endif
+ 
+-  int warp = threadIdx.x / C10_WARP_SIZE;
++  int warp = threadIdx.x / binaryScanWarpSize();
+ 
+   // Per each warp, write out a value
+   if (getLaneId() == 0) {
+@@ -37,7 +49,7 @@ __device__ void inclusiveBinaryPrefixScan(T* smem, bool in, T* out, BinaryFuncti
+   // warp shuffle scan for CC 3.0+
+   if (threadIdx.x == 0) {
+     int current = 0;
+-    for (int i = 0; i < blockDim.x / C10_WARP_SIZE; ++i) {
++    for (int i = 0; i < blockDim.x / binaryScanWarpSize(); ++i) {
+       T v = smem[i];
+       smem[i] = binop(smem[i], current);
+       current = binop(current, v);
+@@ -68,7 +80,7 @@ __device__ void exclusiveBinaryPrefixScan(T* smem, bool in, T* out, T* carry, Bi
+   *out -= (T) in;
+ 
+   // The outgoing carry for all threads is the last warp's sum
+-  *carry = smem[at::ceil_div<int>(blockDim.x, C10_WARP_SIZE) - 1];
++  *carry = smem[at::ceil_div<int>(blockDim.x, binaryScanWarpSize()) - 1];
+ 
+   if (KillWARDependency) {
+     __syncthreads();

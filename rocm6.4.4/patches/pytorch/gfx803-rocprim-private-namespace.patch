@@ -1,0 +1,72 @@
+PyTorch (ROCm/pytorch release/2.8, commit d618db8): compile torch's HIP
+code with rocPRIM in a private namespace.
+
+WHY
+On gfx803, every torch op built on rocPRIM's lookback scan, radix or merge
+sort, transform or reduce-by-key kernels fails with "HIP error: invalid
+device function": nonzero, boolean-mask indexing (x[mask], masked_select),
+unique, and sort/argsort of more than 4096 elements, at any input size.
+To reproduce: (torch.randn(10, device="cuda") > 0).nonzero().
+
+rocPRIM is header-only, so each library compiled with it carries its own
+copies of the rocPRIM kernels it uses and exports their host-side handles
+with default visibility. ROCm's rocSPARSE, which libtorch_hip links,
+exports 31 of the same kernel handles that libtorch_hip does (nm -D on
+both). The dynamic linker binds both libraries' references to one
+address; each library's fatbin constructor registers that address with
+its own code object, and HIP keeps the first registration. rocSPARSE's
+constructor runs first, and the stock rocSPARSE has no gfx803 code object
+("Cannot find CO in the bundle .../librocsparse.so ... gfx803" at
+AMD_LOG_LEVEL=1), so the launch finds no kernel. The HIP log shows the
+launch returning hipErrorInvalidDeviceFunction after a few microseconds,
+without loading code; dladdr names the handle
+(rocprim::detail::init_lookback_scan_state_kernel<lookback_scan_state<
+unsigned int, false, true>> for nonzero, rocprim::detail::transform_kernel
+<..., float, ..., identity<float>> for sort). The same kernels compiled
+into a standalone gfx803 program
+(tools/correctness-suite/pytorch/rocprim_repro.hip) work, and rocPRIM kernels that
+rocSPARSE does not export (the reduce kernel nonzero launches first) work
+inside torch. On GPUs that rocSPARSE has code for, rocSPARSE's identical
+copy runs instead and nothing is visibly wrong.
+
+PyTorch avoids the same clash for CUDA's CUB with CUB_WRAPPED_NAMESPACE;
+rocPRIM 3.4 has no equivalent option.
+
+WHAT
+cmake/Dependencies.cmake adds -Drocprim=at_hip_rocprim to HIP_CXX_FLAGS,
+so every rocPRIM name compiled into torch (directly, through hipCUB and
+through rocThrust) moves to at_hip_rocprim. Include paths are header-name
+tokens and are not macro-expanded, and torch's own sources never name
+rocprim, so nothing else changes. Kernel handles then no longer collide
+with any other library's. torchvision and torchaudio export no rocPRIM
+symbols.
+
+REAL-HARDWARE VERIFICATION (RX 590, this image)
+libtorch_hip exports no rocprim symbol (5722 at_hip_rocprim) and shares no
+kernel name with librocsparse. tools/correctness-suite/pytorch/
+rocprim_ops_check.py (nonzero, masked indexing, unique, sorts and argsorts
+in fp32, fp16 and int64 up to 3M elements, cumsum, top-k, index_put,
+bincount, searchsorted, randperm, embedding backward) goes from 67 to 118
+of 118 cases against the CPU, together with
+gfx803-index-put-warp-size.patch. PyTorch op suite 118 of 118, SD 1.5 UNet check stages 1 and 2,
+conv checks fp32 and fp16 0 bad, 20 LoRA training steps (median 4 s/step,
+loss 0.219), 0 GPU faults.
+
+diff --git a/cmake/Dependencies.cmake b/cmake/Dependencies.cmake
+index 7838d32..1c98de7 100644
+--- a/cmake/Dependencies.cmake
++++ b/cmake/Dependencies.cmake
+@@ -1014,6 +1014,13 @@ if(USE_ROCM)
+     list(APPEND HIP_CXX_FLAGS -D__HIP_PLATFORM_AMD__=1)
+     list(APPEND HIP_CXX_FLAGS -DCUDA_HAS_FP16=1)
+     list(APPEND HIP_CXX_FLAGS -DUSE_ROCM)
++    # rocPRIM is header-only, so every library built with it exports its own copies of rocPRIM's
++    # kernels under the same names; ROCm's rocSPARSE does. The dynamic linker binds them all to one
++    # address, HIP keeps the first registration for it, and when that library has no code object for
++    # the GPU (stock rocSPARSE on gfx803) torch's launches fail with "invalid device function".
++    # A private namespace keeps torch's copies apart, as CUB_WRAPPED_NAMESPACE does for CUDA.
++    # GFX803_ROCPRIM_PRIVATE_NAMESPACE_PATCH
++    list(APPEND HIP_CXX_FLAGS -Drocprim=at_hip_rocprim)
+     list(APPEND HIP_CXX_FLAGS -D__HIP_NO_HALF_OPERATORS__=1)
+     list(APPEND HIP_CXX_FLAGS -D__HIP_NO_HALF_CONVERSIONS__=1)
+     list(APPEND HIP_CXX_FLAGS -DTORCH_HIP_VERSION=${TORCH_HIP_VERSION})

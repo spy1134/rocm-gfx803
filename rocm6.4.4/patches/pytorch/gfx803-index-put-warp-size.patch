@@ -1,0 +1,95 @@
+PyTorch (ROCm/pytorch release/2.8, commit d618db8): size index_put's
+launches by the warp size its device code was compiled with.
+
+WHY
+index_put_ with accumulate=True (x.index_put_(idx, v, accumulate=True),
+x[idx] += v through torch.Tensor.index_put_, and the backward of advanced
+indexing) returns wrong sums on gfx803 whenever indices repeat: against a
+float64 CPU reference the GPU is off by up to 4.9 with 1000 indices into
+1000 slots and by 175 with 3 million (the CPU's error is below 3e-4). To
+reproduce: idx = torch.randint(0, 997, (1000,)); v = torch.randn(1000);
+compare torch.zeros(1000).index_put_((idx,), v, accumulate=True) on the
+GPU and the CPU.
+
+The launcher in Indexing.cu sizes blocks, grids and shared memory with
+at::cuda::warp_size(), the hardware's 64 on gfx803, while the kernels
+(indexing_backward_kernel, _stride_1, _small_stride and the quantized
+one) index in warps of C10_WARP_SIZE, which c10/macros/Macros.h makes 32
+in device code for every AMD target except gfx9. The ROCm grid assigns
+indices_per_block * 64 sorted indices to each block, but each block's
+warps cover blockIdx.x * blockDim.y * 32 + threadIdx.y * 32 + lane, so
+half of the duplicate runs are never summed and lanes 32-63 repeat the
+work of lanes 0-31. This is the same host/device disagreement as
+gfx803-layer-norm-warp-size.patch, and it is fixed the same way.
+
+WHAT
+index_put_warp_size() returns 32 on a ROCm device whose wavefront is 64
+but which is not gfx9 (gfx6-8, matching Macros.h), and
+at::cuda::warp_size() everywhere else. Both launchers (index_put_ with
+accumulate, and its quantized variant) use it. The kernels are unchanged
+and correct with 32-wide blocks on 64-lane hardware: each half-wavefront
+is one of their warps, their shared memory is indexed by threadIdx.y *
+C10_WARP_SIZE, and their shuffle-down reductions read only the result in
+lane 0, which depends on lanes 0-31 alone. CUDA builds and gfx9 are
+unchanged.
+
+REAL-HARDWARE VERIFICATION (RX 590, this image)
+index_put_ with accumulate against a float64 CPU reference, 1 to 3 million
+repeated indices into 1000 slots: the GPU now agrees with the CPU (largest
+difference 2.5e-4 at 3 million, which is the CPU's own float32 error; the
+GPU's is 4e-5). tools/correctness-suite/pytorch/rocprim_ops_check.py 118 of
+118. PyTorch op suite 118 of 118, SD 1.5 UNet check stages 1 and 2, conv
+checks fp32 and fp16 0 bad, 20 LoRA training steps (median 4 s/step, loss
+0.219), 0 GPU faults.
+
+diff --git a/aten/src/ATen/native/cuda/Indexing.cu b/aten/src/ATen/native/cuda/Indexing.cu
+index dacef18..0e3459b 100644
+--- a/aten/src/ATen/native/cuda/Indexing.cu
++++ b/aten/src/ATen/native/cuda/Indexing.cu
+@@ -42,11 +42,28 @@
+ #include <c10/core/QScheme.h>
+ #include <ATen/native/quantized/AffineQuantizerBase.h>
+ 
++#include <cstring>
+ #include <limits>
+ 
+ #include <c10/macros/Macros.h>
+ 
+ namespace {
++// The index_put kernels below index in warps of C10_WARP_SIZE lanes, which is 32 in device code for
++// every AMD target except gfx9, while at::cuda::warp_size() is the hardware's 64 on gfx6-8. Sizing
++// their launches by the hardware value there leaves half of each block's indices unvisited and makes
++// lanes 32-63 repeat lanes 0-31, so accumulated sums come out wrong. Launch with the compiled
++// width; on 64-lane hardware each half-wavefront then runs as one of the kernels' warps.
++// GFX803_INDEX_PUT_WARP_SIZE_PATCH
++int index_put_warp_size() {
++#ifdef USE_ROCM
++  const auto* prop = at::cuda::getCurrentDeviceProperties();
++  if (prop->warpSize == 64 && std::strncmp(prop->gcnArchName, "gfx9", 4) != 0) {
++    return 32;
++  }
++#endif
++  return at::cuda::warp_size();
++}
++
+ constexpr uint64_t getDefaultMaxThreadsPerBlock() {
+ #ifndef USE_ROCM
+   return 128;
+@@ -703,7 +720,7 @@ void index_put_with_sort_kernel(Tensor & self, const c10::List<std::optional<Ten
+ 
+       const int UNROLL = 4;
+       const int indices_per_block = 4;
+-      const int warp_size = at::cuda::warp_size();
++      const int warp_size = index_put_warp_size();
+       dim3 grid(ceil_div(num_indices, (int64_t) indices_per_block),
+            std::min<int>(at::cuda::getCurrentDeviceProperties()->maxGridSize[1], ceil_div(sliceSize, (int64_t) (warp_size*UNROLL))),
+            std::min(std::max<int>(1,nElemBefore), at::cuda::getCurrentDeviceProperties()->maxGridSize[2]));
+@@ -903,7 +920,7 @@ void index_put_with_sort_quantized(Tensor & self, const c10::List<std::optional<
+           linearIndex.numel()*sliceSize*nElemBefore, " vs ", expandedValue.numel());
+       const int UNROLL = 4;
+       const int indices_per_block = 4;
+-      const int warp_size = at::cuda::warp_size();
++      const int warp_size = index_put_warp_size();
+       dim3 grid(ceil_div(num_indices, (int64_t) indices_per_block),
+            std::min<int>(at::cuda::getCurrentDeviceProperties()->maxGridSize[1], ceil_div(sliceSize, (int64_t) (warp_size*UNROLL))),
+            std::min(std::max<int>(1,nElemBefore), at::cuda::getCurrentDeviceProperties()->maxGridSize[2]));
