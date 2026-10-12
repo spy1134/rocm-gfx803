@@ -27,7 +27,7 @@ images.
 > base on a Sapphire RX 470 8GB with [`verify.py`](#verifying-on-hardware)
 > (MIGraphX EP inference, rocBLAS GEMM, MIOpen convolution); its kernel-level
 > fixes are described in [`KERNEL_BUGS.md`](KERNEL_BUGS.md), and the [fused-conv
-> case study](#fixed-bug-case-study-rocmexecutionprovider-fused-conv-crash-musicnn-class-models)
+> case study](#case-study-rocmexecutionprovider-fused-conv-crash-musicnn-class-models)
 > below shows one of them end to end.
 
 ## Why ROCm 6.4.4
@@ -59,7 +59,7 @@ whole stack from source with the doorbell and other runtime patches.)
 | --- | --- | --- |
 | rocBLAS | `rocm-6.4.4` tag | Dropped gfx803 from its default `TARGET_LIST` at ROCm 6.0, but the gfx803 Tensile logic (`Logic/asm_full/r9nano/*.yaml`) is still in the tree, so `rmake.py -a gfx803` builds it back. The base image's prebuilt copy has no gfx803 code objects. |
 | MIGraphX | `release/rocm-rel-6.4` | Prebuilt for gfx900+ only. |
-| PyTorch | `ROCm/pytorch` `release/2.8` | No gfx803 wheel has ever been published. torchvision and torchaudio are built alongside it. `patches/pytorch/` routes int8 matmul to rocBLAS, since its default hipBLASLt path has no gfx803 kernels, and sizes layer_norm's launches by the 32-lane warp its kernels are compiled for on gfx803 (they were wrong otherwise). |
+| PyTorch | `ROCm/pytorch` `release/2.8` | No gfx803 wheel has ever been published. torchvision and torchaudio are built alongside it. `patches/pytorch/` routes int8 matmul to rocBLAS (its default hipBLASLt path has no gfx803 kernels) and fixes four kernels that mix the 64-lane hardware wavefront with PyTorch's 32-lane `C10_WARP_SIZE` on gfx803 (layer_norm, top-k's scan, index_put) or lose their launch to a rocSPARSE symbol clash (rocPRIM: nonzero, masked indexing, unique, large sorts). Each header gives the cause and the check. |
 | ONNX Runtime | `v1.22.2` | Built against the MIGraphX above. |
 
 **MIOpen is built from source** at tag `rocm-6.4.4` with the patches in
@@ -96,7 +96,7 @@ and preloads it for every process (`LD_PRELOAD` in the final stage), so every
 image built on this one inherits it. It replaces `rocblas_sgemm`,
 `rocblas_gemm_ex` and their strided-batched forms (which attention uses) for
 standard-algo fp32 calls, with register-tiled kernels that return correct
-results and run large GEMMs at 3.8-4.8 TFLOPS on an RX 590, 3-4x stock
+results and run large GEMMs at 3.9-4.8 TFLOPS on an RX 590, 3-4x stock
 rocBLAS's speed. MIOpen's GEMM-based convolutions and the GEMM inside its gfx803 Winograd
 solver also run through it. The original shim in
 [`patches/rocblas/sgemm-shim/`](patches/rocblas/sgemm-shim/) is still built, at
@@ -134,8 +134,8 @@ kernels.
 ## Expectations
 
 Untuned MIOpen convolutions, no kernel fusion (no CK, no MLIR), on hardware
-with no packed-fp16 and no dot-product instructions. This exists to make a
-20-euro card usable, not competitive. For small models it may still beat CPU;
+with no packed-fp16 and no dot-product instructions. This exists to make an
+inexpensive, unsupported card usable, not competitive. For small models it may still beat CPU;
 for anything large, measure before believing.
 
 ## Versions
@@ -250,7 +250,7 @@ base image's `hipcc` when the host has none and copies the node into
 `ComfyUI/custom_nodes/`; restart ComfyUI afterwards. The node acts only on
 inference (calls that need gradients go to PyTorch), so training is
 unaffected. Remove the `ComfyUI/custom_nodes/ComfyUI-gfx803-attention/`
-folder to turn it off. Details: `docs/FINDINGS.md` section 5b.
+folder to turn it off. Details: `docs/FINDINGS.md` section 6.
 
 ### start-comfyui.sh
 
@@ -292,8 +292,7 @@ Run with no options on a terminal, `gfx803-train` opens a menu: start a new run
 limit, all picked with the arrow keys) or resume an unfinished one. It hands its
 choices to the same option parser as the command line and prints the equivalent
 command, so a run set up once in the menu can be repeated from a script.
-`--menu` opens it explicitly; `GFX803_TRAIN_NO_MENU=1` keeps the old
-no-argument behaviour.
+`--menu` opens it explicitly; `GFX803_TRAIN_NO_MENU=1` skips the menu and starts a run with the defaults.
 
 A dataset is a folder under `workspace/training_data/` with sd-scripts'
 `<repeats>_<trigger>/` subfolders of images and `.txt` captions. Images without
@@ -342,7 +341,9 @@ text-console login (Ctrl+Alt+F2) after stopping the display manager
 (`sudo systemctl stop display-manager`); start the desktop again with
 `sudo systemctl start display-manager`.
 
-Only fp32 training is validated on gfx803. To check the card, the image and
+`gfx803-train` trains in fp32, the most thoroughly checked precision on gfx803.
+fp16 training works too (section 8 of `docs/FINDINGS.md` has the measurements:
+1.7 GB less VRAM at similar speed) but is run with sd-scripts directly. To check the card, the image and
 the shim together, `training/gfx803_unet_check.py` compares fp32 attention,
 linear, convolution and normalization (forward and backward) and the whole UNet
 against a float64 CPU reference:
@@ -399,7 +400,7 @@ a model meant for long contexts needs a Modelfile with `PARAMETER num_ctx`
 (see [Fitting models into 8 GB](#fitting-models-into-8-gb)).
 
 A loaded model stays loaded until you unload it (`OLLAMA_KEEP_ALIVE=-1`;
-`./start-ollama.sh stop MODEL` or the app's Unload frees it). Ollama's own
+`./start-ollama.sh stop MODEL` frees it). Ollama's own
 default of 5 minutes unloads it between agent sessions, and reloading the large
 models takes tens of seconds to minutes. Set `OLLAMA_KEEP_ALIVE=30m` or similar
 to get a timeout back.
@@ -476,6 +477,26 @@ measurements and a reproduction. In short:
 - **105-gfx803-q5k-decode.patch**: q5_K's decode dot product reads its scales
   with one 16-byte load instead of four (q5_K matmul about 4% faster with
   104).
+- **106-gfx803-cublas-prompt.patch**: prompt batches of quantized matmuls ran
+  through the int8-emulating mmq path at about a third of the card's fp32 rate.
+  They now dequantize the weights into padded fp32 rows and multiply on the
+  SGEMM shim (padding avoids the DRAM-channel conflict that 8 KiB row strides
+  cause), with a cap on the converted weights' memory. Qwen3 8B pp512
+  163 -> 223 tok/s; a 5.2k-token prompt through Ollama 149 -> 215 tok/s.
+  Results are closer to the CPU backend's (KL divergence 0.0103 -> 0.0086).
+- **107-concat-transposed-src1.patch**: the concat that feeds Gated DeltaNet
+  layers (Qwen3.5/3.6, Qwen3-Next) read its transposed operand with a 32 KiB
+  stride, 27 ms per call. A tiled kernel takes it to 1.14 ms.
+- **108-moe-expert-prefetch.patch**: when a MoE model keeps most experts in
+  system RAM, each layer's experts were copied to the card while the GPU
+  waited. Large batches now prefetch the next layer's experts on a second
+  stream, over the DMA engines (`HSA_ENABLE_SDMA=1`, set in
+  `Dockerfile-Ollama`). Qwen3.6 35B-A3B pp2048 at 512 / 1024 / 2048-token
+  batches: 193 / 250 / 295 -> 243 / 321 / 367 tok/s.
+- **109-sched-batched-host-copies.patch**: during generation a MoE layer's CPU
+  expert split waited for each of its GPU inputs separately, about 130 GPU round
+  trips per token. The copies are now queued and waited for once. Qwen3.6
+  35B-A3B tg128 23.8 -> 24.5 tok/s.
 
 `patches/ollama/llama-cpp-server/090-mmproj-fit-target-device.patch` fixes
 llama.cpp's server, on every GPU. When it fits a model with a multimodal
@@ -505,11 +526,12 @@ GPU:
   now twice the first discovery's duration, between 3 and 30 s; GPUs that start
   quickly keep 3 s.
 
-The llama.cpp kernel patches 100-104 are gfx803-only by construction: each
-takes effect only for `GGML_CUDA_CC_GCN4` or `__gfx803__` and is sized from
+The llama.cpp kernel patches 100-104 and 106 are gfx803-only by construction:
+each takes effect only for `GGML_CUDA_CC_GCN4` or `__gfx803__` and is sized from
 gfx803 register and bandwidth measurements. 105 changes q5_K's dot product for
-every GPU, with the same arithmetic. 090 and the two Ollama patches fix bugs
-that are not specific to any GPU.
+every GPU, with the same arithmetic. 107, 108, 109, 090 and the two Ollama
+patches fix problems that are not specific to any GPU (107-109 were measured
+on gfx803 only).
 Upstream llama.cpp master (checked 2026-10-03, b11382) still has the vec
 kernel 102 replaces on gfx803, unchanged; llama.cpp issue
 [#27796](https://github.com/ggml-org/llama.cpp/issues/27796) reports the same
@@ -618,98 +640,41 @@ Qwen3 8B and Qwen2.5-Coder 7B.
   refreshes free memory (see gpu-refresh-timeout.patch above); the alternative
   was decisions made from stale figures.
 
-## Fixed bug case study: ROCMExecutionProvider fused-conv crash (musicnn-class models)
+## Case study: ROCMExecutionProvider fused-conv crash (musicnn-class models)
 
-**Fixed** -- both root causes are patched (see [`KERNEL_BUGS.md`](KERNEL_BUGS.md)
-for the full record); no workaround is needed anymore. The investigation
-below is kept because it's the reference example for how to chase this class
-of bug in this repo (isolate, rule out empirically, don't assume).
+`ROCMExecutionProvider` (the plain kernel-based HIP execution provider, distinct
+from MIGraphX) is in this image's ONNX Runtime build as a fallback for graphs
+MIGraphX cannot compile; the [AudioMuse-AI ROCm
+plugin](https://github.com/Schaka/audiomuse-rocm-plugin) uses it for CLAP's
+`keep_aspect_ratio_policy` parse failure. On gfx803 it intermittently crashed
+with a memory access fault on any graph where ONNX Runtime fuses
+Conv+Bias+Activation into a `FusedConv` node: constantly on CNN-style models
+such as musicnn, rarely on CLAP, whose small conv stem still reaches the fused
+path. Two separate bugs caused it, both fixed and documented in full in
+[`KERNEL_BUGS.md`](KERNEL_BUGS.md):
 
-`ROCMExecutionProvider` (the plain kernel-based HIP EP, distinct from
-MIGraphX) is present in this image's ONNX Runtime build as a fallback for
-graphs MIGraphX can't compile -- see the [AudioMuse-AI ROCm
-plugin](https://github.com/Schaka/audiomuse-rocm-plugin)'s
-`plugin/rocm_accelerator/README.md` for the CLAP `keep_aspect_ratio_policy`
-parse failure that motivated it. On real gfx803 hardware (Sapphire RX 470
-8GB), that fallback **intermittently SIGSEGVs on any graph where ORT's
-optimizer fuses Conv+Bias+Activation into a FusedConv node** -- constantly on
-CNN-style models (musicnn's embedding/prediction heads), and rarely but
-reproducibly on CLAP, whose conv stem is small next to its transformer body
-but still enough to reach the fused path.
+1. rocBLAS/Tensile's fp32 GEMMs return wrong results. The
+   [SGEMM shim](#the-sgemm-shim) fixes that, which removed CT2's float32 crash
+   but only delayed the fused-conv one.
+2. MIOpen's `ConvOclDirectFwd` solver reads past the end of its weights buffer
+   for grouped and depthwise convolutions. The fused kernels
+   (`MIOpenConvUniBatchNormActiv`, `miopenSp3AsmConvRxSU_CBA`) hit it, and
+   whether the read faults depends on whether the neighbouring page is mapped,
+   which is why the crash looked random. A serialized `AMD_LOG_LEVEL=4` trace
+   puts the fault address exactly on the end of the arena chunk that holds the
+   weights, and `dmesg` shows a read from `TC` (a compute kernel, not a copy
+   engine).
+   [`patches/miopen/conv-direct-fwd-grouped-oob.sh`](patches/miopen/conv-direct-fwd-grouped-oob.sh)
+   makes the solver's applicability check reject grouped convolutions. With
+   `ConvActivationFusion` left enabled, 40 session churns ran clean.
 
-Root cause, isolated via `MIOPEN_ENABLE_LOGGING=1 MIOPEN_LOG_LEVEL=6`: ORT's
-graph optimizer fuses Conv+Bias+Activation into one node, which ONNX
-Runtime's ROCM EP hands to MIOpen's Fusion Plan API rather than three
-separate conv/bias/activation calls. On gfx803 that Fusion Plan path --
-whether it lands on a fused Winograd solver (`ConvBinWinogradRxSFused`) or
-falls through to "No supported fusion solvers found" and a plain-conv
-fallback -- corrupts GPU state and eventually faults
-(`Memory access fault ... Page not present or supervisor privilege`).
-
-What was ruled out, each confirmed on real hardware, not assumed:
-
-- **Not a stale/mismatched find-db.** `/opt/rocm/share/miopen/db/gfx803_*.fdb.txt`
-  ships in 36-CU and 64-CU variants; the RX 470 is 32-CU and correctly falls
-  through to its own per-run user db (`gfx803_32...ufdb.txt`) instead of a
-  mismatched file -- deleting the shipped fdb files entirely made no
-  difference to the crash.
-- **Not a single bad solver.** `MIOPEN_DEBUG_CONV_WINOGRAD=0` (disables the
-  non-fused Winograd solver) didn't help; `MIOPEN_DEBUG_AMD_FUSED_WINOGRAD=0`
-  (disables the fused variant specifically) reduced but did not eliminate the
-  crash -- it still faults on the "no fusion solver found" fallback path for
-  some shapes.
-- **Not a simple async race.** `HIP_LAUNCH_BLOCKING=1` (forces synchronous
-  kernel launches) did not prevent the crash.
-- **Not deterministic.** The exact same command, same audio sample, same
-  shape, same run count crashes on one invocation and completes cleanly on
-  the next. Session churn amplifies it heavily (creating and destroying
-  sessions reshuffles ORT's arena layout), but a first-session crash in a
-  fresh process has been observed too.
-- **Not unstable VRAM.** Tried non-mining BIOS, 1750 Mhz VRAM clock, added tons
-  of extra cooling for stability and saw no difference.
-- **Not SDMA and not an async race** (from the later CLAP investigation):
-  `HSA_ENABLE_SDMA=0` and `AMD_SERIALIZE_KERNEL=3 AMD_SERIALIZE_COPY=3` both
-  still crash, and the serialized `AMD_LOG_LEVEL=4` trace pins the fault on
-  the fused kernels themselves (`miopenSp3AsmConvRxSU_CBA`,
-  `MIOpenConvUniBatchNormActiv`) reading past the end of the arena chunk
-  holding their weights -- the HSA fault address lands exactly on the chunk's
-  end boundary, and dmesg shows `read from 'TC'` (a compute kernel, not a
-  copy engine). Whether the over-read faults depends on whether the
-  neighbouring page happens to be mapped, which is where the non-determinism
-  comes from.
-
-**Update: fixed.** This was not one bug but two, both now fixed and both
-documented in full in [`KERNEL_BUGS.md`](KERNEL_BUGS.md):
-
-1. A pervasive rocBLAS/Tensile fp32 GEMM miscompute, fixed by the SGEMM
-   shim (now [`patches/sgemm-shim-batched/`](patches/sgemm-shim-batched/), see
-   [The SGEMM shim](#the-sgemm-shim)) -- confirmed
-   to fix CT2's float32 crash outright, but only measurably *delayed* (not
-   eliminated) the ConvActivationFusion crash above, which is what confirmed
-   it as a second, separate bug.
-2. The actual ConvActivationFusion crash: MIOpen's `ConvOclDirectFwd` solver
-   (behind the `MIOpenConvUniBatchNormActiv` kernel this section's own
-   investigation already correctly pointed at) has a genuine out-of-bounds
-   weights-buffer read for grouped/depthwise convolutions specifically --
-   confirmed via a minimal, deterministic, standalone repro with nothing but
-   MIOpen involved. Fixed by rebuilding MIOpen from source with
-   [`patches/miopen/conv-direct-fwd-grouped-oob.sh`](patches/miopen/conv-direct-fwd-grouped-oob.sh),
-   which makes MIOpen's own solver-applicability check reject grouped convs
-   outright instead of ever reaching the broken kernel. Confirmed clean over
-   40 session churns with `ConvActivationFusion` left fully enabled -- no
-   workaround needed anymore; the `optimization.disable_specified_optimizers`
-   plugin-side workaround and MIGraphX-instead-of-ROCM routing described
-   above are no longer necessary; that also fixed the non-determinism this
-   section spent a lot of words on: it was never a "sometimes the neighboring
-   page happens to be mapped" thing, it was every grouped-conv dispatch
-   reading out of bounds, with the neighboring memory's contents (whatever
-   happened to be there) determining whether that particular read actually
-   crossed an unmapped page or not.
-
-gfx803 is abandoned upstream with no realistic path to a fix landing there,
-so we are not filing upstream reports for either bug -- `KERNEL_BUGS.md`
-documents the investigation methodology in full so any future bug in this
-class can be chased and patched the same way, in this repo.
+A stale find-db, a single bad solver (`MIOPEN_DEBUG_CONV_WINOGRAD=0`,
+`MIOPEN_DEBUG_AMD_FUSED_WINOGRAD=0`), unstable VRAM clocks, SDMA and an
+asynchronous race (`HIP_LAUNCH_BLOCKING=1`, `HSA_ENABLE_SDMA=0` and serialized
+launches all still crashed) were each ruled out. To chase a similar bug, isolate
+the layer with a standalone MIOpen reproduction, serialize launches, and read
+the fault address against the allocation map; `KERNEL_BUGS.md` describes the
+method.
 
 ## Host-side caveats
 
