@@ -91,22 +91,12 @@ RUN pip check || true
 RUN mkdir -p /home/gfx803 /opt/ComfyUI/temp \
     && chmod 1777 /home/gfx803 /opt/ComfyUI/temp
 
-# The gfx803 terminal UI (gfx803-app): Textual for the interface, plotext
-# through textual-plotext for its graphs, textual-image for image previews
-# (Sixel or the Kitty graphics protocol where the terminal has them, coloured
-# half-blocks otherwise). Before the training/ copy, so editing the scripts
-# does not reinstall them.
-RUN pip install --no-cache-dir textual==8.2.8 textual-plotext==1.0.1 plotext==5.3.2 textual-image==0.14.1
-
-# Training wrapper, queue service, terminal UI and GPU-vs-CPU checks. Last, so
+# Training wrapper and GPU-vs-CPU checks. Last, so
 # editing them rebuilds only this layer.
 COPY training/ /opt/gfx803-training/
 RUN cd /opt/gfx803-training \
-    && chmod +x gfx803-train.sh gfx803_queue.py gfx803_service.py gfx803_app.py \
-    && ln -s /opt/gfx803-training/gfx803-train.sh /usr/local/bin/gfx803-train \
-    && ln -s /opt/gfx803-training/gfx803_queue.py /usr/local/bin/gfx803-queue \
-    && ln -s /opt/gfx803-training/gfx803_service.py /usr/local/bin/gfx803-service \
-    && ln -s /opt/gfx803-training/gfx803_app.py /usr/local/bin/gfx803-app
+    && chmod +x gfx803-train.sh \
+    && ln -s /opt/gfx803-training/gfx803-train.sh /usr/local/bin/gfx803-train
 
 WORKDIR /opt/ComfyUI
 EXPOSE 8188

@@ -67,8 +67,7 @@ gfx803_container_args() {
     -v "$dir/ComfyUI/input:/opt/ComfyUI/input"
     -v "$dir/ComfyUI/user:/opt/ComfyUI/user"
   )
-  # gfx803-service starts ComfyUI with this listen address, and the app shows
-  # the matching URL.
+  # ComfyUI's listen address.
   [ -n "${GFX803_COMFYUI_LISTEN:-}" ] && GFX803_ARGS+=(-e GFX803_COMFYUI_LISTEN)
   return 0
 }

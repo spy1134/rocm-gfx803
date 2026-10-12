@@ -234,7 +234,7 @@ after a model reload, which fits the same pattern but is not proven.
 The images therefore preload AMD's stock runtime, which the ROCm base image
 still carries as `libhsa-runtime64.so.1.15.60404` beside the patched
 `.so.1.15.0`. Ollama, SDXL and Qwen-Image generation, fp16 and training are all
-validated on it. `GFX803_RUNTIME=patched` (start scripts, the app's manager)
+validated on it. `GFX803_RUNTIME=patched` (start scripts)
 and `gfx803-train --runtime patched` load the patched one for comparison. The
 cost is the bug the patch was written for: MIOpen's CK reduction kernels can
 read stale data when freed addresses are reused at once (ONNX Runtime's
@@ -405,7 +405,7 @@ PyTorch at what the card's other users hold at startup plus 1 GB for the HIP
 runtime, measured from amdgpu's own VRAM counter (ROCm's count misses the
 desktop's framebuffers). Even capped at 90% training caused brief pin failures
 on a busy desktop, and 512 px SD 1.5 training does not fit beside a typical
-desktop at all, so the app has a headless mode that stops the display manager.
+desktop at all, so training needs the display manager stopped.
 
 ## 7a. fp16, and what it makes possible (SDXL LoRA training)
 

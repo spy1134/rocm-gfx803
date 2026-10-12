@@ -16,7 +16,7 @@
 #               GPU memory, llama-server among them, so it is for comparison only
 # OLLAMA_KV_CACHE_TYPE  default q8_0; f16 for full precision
 # OLLAMA_KEEP_ALIVE  default -1 (a loaded model stays loaded until it is
-#               unloaded with `ollama stop MODEL` or the app's Unload); Ollama's
+#               unloaded with `ollama stop MODEL`); Ollama's
 #               own 5-minute default drops it between agent sessions, and a
 #               reload costs tens of seconds to minutes for the large models
 # OLLAMA_FLASH_ATTENTION, OLLAMA_CONTEXT_LENGTH, OLLAMA_DEBUG

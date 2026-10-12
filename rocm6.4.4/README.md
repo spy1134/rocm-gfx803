@@ -252,91 +252,16 @@ inference (calls that need gradients go to PyTorch), so training is
 unaffected. Remove the `ComfyUI/custom_nodes/ComfyUI-gfx803-attention/`
 folder to turn it off. Details: `docs/FINDINGS.md` section 5b.
 
-### The gfx803 app
-
-`./gfx803` is the everyday way to use the image: one terminal UI for LoRA
-training and the ComfyUI server.
-
-```
-./gfx803              # start the service if needed and open the UI
-./gfx803 --headless   # from a text console: stop the desktop first, for more VRAM
-GFX803_PIN_MCLK=1 ./gfx803 --headless   # also pin the memory clock (stops multi-monitor flicker)
-./gfx803 --stop       # shut the service down
-./gfx803 --logs       # follow the service's log
-```
-
-It starts a long-lived container named `gfx803` whose main process,
-`gfx803-service`, runs the training queue and ComfyUI; the UI (`gfx803-app`)
-attaches to it with `docker exec`. Quitting the UI stops nothing: training and
-ComfyUI keep going, and `./gfx803` from any terminal, a text console or SSH
-included, reattaches. Its tabs:
-
-- **Overview**: live graphs of GPU load, power, temperature and VRAM, CPU and
-  RAM, plus the current training run (progress, loss, ETA) and ComfyUI's state
-  and address.
-- **Training**: the queue (add runs through a form, reorder, stop, skip, pause,
-  retry, a cool-down between runs) and the run history, with each run's log and
-  a button that copies a chosen checkpoint into ComfyUI's LoRA folders: any
-  subfolder of `models/loras/` (`SD15/` by default) or a new one, under a short
-  editable name such as `MyCharacter-step900.safetensors`, asking before it
-  replaces an existing file.
-- **Datasets**: each dataset's image and caption counts, trigger word, images
-  with transparency, and how many images carry each tag. Tools: WD14 tagging
-  on the CPU (only uncaptioned images, all, or adding to existing captions,
-  with the trigger put first), setting a trigger word in every caption,
-  removing tags (prefilled with those every image has, which the trigger
-  should carry instead), and flattening transparent images onto white, since
-  training's RGB conversion leaves transparent areas whatever color their
-  pixels hold. Flattening also drops the image's cached latents: sd-scripts
-  names them by resolution only, so it would otherwise keep training on the
-  old pixels. Every change is backed up first under
-  `workspace/dataset_backups/` and can be undone step by step. Browse images
-  (or Enter on a dataset, or on a tag to see only the images that have it)
-  shows each image next to its caption for per-image editing and deleting
-  (an image goes into the backups with its caption and cached latents), with a filter
-  (`tag`, `-tag`, `uncaptioned`), and a full-screen view with zoom and pan.
-  Images are drawn with Sixel or the Kitty graphics protocol where the terminal
-  supports one (Konsole, kitty, WezTerm, foot, iTerm2), and as coloured
-  half-blocks otherwise; the Linux text console shows only the coarse
-  half-block version, and no mouse, so image work there is best done over SSH
-  from a graphical terminal. `GFX803_IMAGE_MODE=sixel|tgp|halfcell|unicode`
-  overrides the detection.
-- **ComfyUI**: start and stop the server, its log, and fp32 instead of
-  ComfyUI's default fp16 (fp16 is not validated on gfx803).
-- **System**: per-core CPU, memory, disk and network rates, and the host's top
-  processes.
-
-Queued runs train one after another. A failed run is marked and the queue moves
-on; two failures in a row pause it, since that usually means the GPU or driver
-is in a bad state. Training and ComfyUI never use the GPU at once: an 8 GB card
-cannot hold SD 1.5 training and a loaded ComfyUI model together. Starting
-ComfyUI holds new runs and waits for a run in progress to finish; stopping it
-lets the queue continue. `./gfx803 --stop` (or a host shutdown) interrupts a
-run the way Ctrl+C would, and the next start resumes it from its last
-checkpoint. The queue lives in `workspace/queue/`; `gfx803-queue` inside the
-container lists and edits it from the command line.
-
-The container uses the host's network and process namespaces, so the System
-tab sees the whole host.
-
-ComfyUI is at `http://localhost:8188` and accepts connections from this machine
-only. It has no login, and its Manager can install and run custom code, so
-opening it to other devices is a choice to make knowingly: set
-`GFX803_COMFYUI_LISTEN=0.0.0.0` (in the shell that runs `./gfx803` or
-`./start-comfyui.sh`, or in your shell profile) to make it reachable from the
-LAN at `http://<this machine>:8188`, on a network you trust. The setting takes
-effect the next time the service starts (`./gfx803 --stop`, then `./gfx803`).
-
 ### start-comfyui.sh
 
-`start-comfyui.sh` runs the image without the service, with the GPU passed
-through and all data kept next to the script, in git-ignored folders: `ComfyUI/` (models, custom nodes, inputs,
-outputs), `miopen/` (MIOpen's find database and kernel cache, which saves a long
+`start-comfyui.sh` runs the image with the GPU passed through and all data
+kept next to the script, in git-ignored folders: `ComfyUI/` (models, custom
+nodes, inputs, outputs), `miopen/` (MIOpen's find database and kernel cache, which saves a long
 search and compile in every new container) and `workspace/` (training data, runs
 and LoRA output).
 
 ```
-./start-comfyui.sh          # ComfyUI on http://localhost:8188 (see GFX803_COMFYUI_LISTEN above)
+./start-comfyui.sh          # ComfyUI on http://localhost:8188 (see below for GFX803_COMFYUI_LISTEN)
 ./start-comfyui.sh bash     # a shell in the container instead
 ```
 
@@ -345,6 +270,12 @@ The container runs as the user who starts it (plus the host groups that own
 user. `RUN_AS_ROOT=1 ./start-comfyui.sh` runs it as root. Folders left over from
 running as root need a one-time
 `sudo chown -R "$(id -u):$(id -g)" workspace ComfyUI miopen`.
+
+ComfyUI accepts connections from this machine only. It has no login, and its
+Manager can install and run custom code, so opening it to other devices is a
+choice to make knowingly: set `GFX803_COMFYUI_LISTEN=0.0.0.0` to make it
+reachable from the LAN at `http://<this machine>:8188`, on a network you
+trust.
 
 LoRA training uses the `gfx803-train` wrapper (`training/gfx803-train.sh`),
 inside the container:
@@ -406,9 +337,10 @@ under 3 GB. `--vram-reserve MIB`, `--vram-cap MIB|none` and the
 
 An 8 GB card cannot hold 512x512 SD 1.5 training and a typical desktop at
 once: training needs about 6.6 GB under PyTorch plus about 1 GB of runtime
-overhead, and a desktop holds 300-700 MiB. `./gfx803 --headless`, run from a
-text-console login (Ctrl+Alt+F2), stops the display manager before opening the
-app; start the desktop again with `sudo systemctl start display-manager`.
+overhead, and a desktop holds 300-700 MiB. Train from a
+text-console login (Ctrl+Alt+F2) after stopping the display manager
+(`sudo systemctl stop display-manager`); start the desktop again with
+`sudo systemctl start display-manager`.
 
 Only fp32 training is validated on gfx803. To check the card, the image and
 the shim together, `training/gfx803_unet_check.py` compares fp32 attention,

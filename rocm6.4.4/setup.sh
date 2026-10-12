@@ -151,7 +151,7 @@ if [ "$MODE" = ask ]; then
   echo
   echo "${B}What would you like to set up?${N}"
   echo "  1) Everything (recommended)"
-  echo "  2) Image making and LoRA training (ComfyUI, the gfx803 app)"
+  echo "  2) Image making and LoRA training (ComfyUI, sd-scripts)"
   echo "  3) Local language models (Ollama)"
   case "$(ask 'Choose 1, 2 or 3 [1]:')" in
     2) MODE=comfyui ;; 3) MODE=ollama ;; ""|1) MODE=all ;;
@@ -219,8 +219,8 @@ echo "${G}${B}All set.${N} What to run next, from this folder:"
 for t in "${TARGETS[@]}"; do
   case "$t" in
     comfyui)
-      echo "  ./gfx803                  the app: train LoRAs, run ComfyUI, manage datasets, watch the GPU"
-      echo "                            (start ComfyUI from its tab, then open http://localhost:8188 in a browser)" ;;
+      echo "  ./start-comfyui.sh        start ComfyUI (then open http://localhost:8188 in a browser)"
+      echo "  ./start-comfyui.sh bash   a shell in the container, for gfx803-train (LoRA training)" ;;
     ollama)
       echo "  ./start-ollama.sh         start the language-model server (http://127.0.0.1:11434)"
       echo "  ./start-ollama.sh pull qwen3:8b    download a model (Qwen3 8B fits well in 8 GB)"

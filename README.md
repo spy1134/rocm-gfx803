@@ -8,11 +8,11 @@ Requires Linux, Docker, and a Polaris (gfx803) GPU such as the RX 470-590.
 git clone https://github.com/spy1134/rocm-gfx803.git
 cd rocm-gfx803/rocm6.4.4
 ./setup.sh                        # verify the system and build the images (several hours on first run)
-./gfx803                          # launch the app: LoRA training, ComfyUI, dataset tools, GPU monitor
+./start-comfyui.sh                # ComfyUI for image making and LoRA training
 ./start-ollama.sh run qwen3:8b    # chat with a local language model
 ```
 
-ComfyUI is served at http://localhost:8188 once started from the app. Full documentation follows.
+ComfyUI is served at http://localhost:8188 once started. Full documentation follows.
 
 ---
 
@@ -23,7 +23,7 @@ working, tested setup:
 
 - **Make images** with Stable Diffusion 1.5 in [ComfyUI](https://github.com/comfyanonymous/ComfyUI).
 - **Train your own LoRAs** (small add-on models for a character or style) for SD 1.5, through a
-  terminal app with a training queue, live GPU graphs and a dataset manager.
+  command-line wrapper around sd-scripts (`gfx803-train`).
 - **Chat with local language models** through [Ollama](https://ollama.com), for SillyTavern,
   coding assistants and the like.
 
@@ -59,13 +59,13 @@ but an answer that is silently wrong.
    continues where it stopped.
 3. **Start using it:**
    ```
-   ./gfx803                       # the app: training, ComfyUI, dataset tools, GPU monitor
+   ./start-comfyui.sh             # ComfyUI; `./start-comfyui.sh bash` for LoRA training
    ./start-ollama.sh pull qwen3:8b    # download a language model
    ./start-ollama.sh run qwen3:8b     # chat with it
    ```
-   ComfyUI runs in your browser at http://localhost:8188 once you start it from the app.
+   ComfyUI runs in your browser at http://localhost:8188 once you start it.
 
-[`rocm6.4.4/README.md`](rocm6.4.4/README.md) explains each part in detail: the app, training
+[`rocm6.4.4/README.md`](rocm6.4.4/README.md) explains each part in detail: training
 options, ComfyUI and Ollama.
 
 ## How stable is it?
@@ -75,7 +75,7 @@ options, ComfyUI and Ollama.
 - LoRA training runs for hours without hangs or bad results, and both the Stable Diffusion model
   and Ollama's language models produce the same output on the card as on the CPU.
 - Half-precision (fp16) works too, and frees enough memory to make training SDXL LoRAs on an
-  8 GB card possible (tested in short runs; not yet built into the app).
+  8 GB card possible (tested in short runs with sd-scripts directly).
 - Tested on one RX 590. Other Polaris cards use the same chip design and should behave the same,
   but their clocks, memory and firmware differ.
 
