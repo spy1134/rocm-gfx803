@@ -1,2 +1,5 @@
 # Kernels compiled by ComfyUI-gfx803-attention/install.sh
 *.so
+
+# Built llama.cpp binaries and libraries copied out of the Ollama image
+/ollama_bin/
