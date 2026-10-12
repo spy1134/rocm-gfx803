@@ -4,7 +4,8 @@
 //
 // Intercepted:
 //   rocblas_sgemm
-//   rocblas_gemm_ex                     (all-f32, or all-f16 with op(A)=N op(B)=T;
+//   rocblas_gemm_ex                     (all-f32, or all-f16 with op(A)=N op(B)=T
+//                                        or with op(A)=T and n <= 8;
 //                                        standard algo, C == D)
 //   rocblas_sgemm_strided_batched       (torch.bmm / baddbmm -> attention)
 //   rocblas_gemm_strided_batched_ex     (all-f32 or all-f16, standard algo, C == D)
@@ -22,6 +23,9 @@
 // is taken over, since rocBLAS runs the other three 10-15% faster than these
 // kernels; strided-batched fp16 GEMMs are all taken over, since these kernels
 // are faster than rocBLAS's there in almost every layout and shape measured.
+// fp16 GEMMs with op(A) = T and at most 8 columns of C (nn.Linear in a
+// token-by-token decode loop) are taken over too: rocBLAS runs them 20-25x
+// slower than reading the weight takes, see gfx803_sgemm_small_n_kernel.
 //
 // Everything else (other dtypes, pointer-array batched calls, explicit
 // solution_index requests, non-standard algo, device pointer mode, negative
@@ -45,6 +49,9 @@
 //   GFX803_SGEMM_SHIM_NO_FP16=1     -- pass the fp16 calls to rocBLAS
 //   GFX803_SGEMM_SHIM_VERBOSE=N     -- log the first N calls (taken over or
 //                                      passed through, and why) to stderr
+//   GFX803_SGEMM_SMALL_N=N          -- largest n (columns of C) the few-column
+//                                      kernel takes, default 8, 0 = off; with 0
+//                                      those fp16 calls go to rocBLAS again
 //   GFX803_SGEMM_MIN_TILES64=N      -- use the 64x64 (or 32x32) tile from N
 //   GFX803_SGEMM_MIN_TILES32=N         tiles of C up (0 = always, -1 = never),
 //                                      for benchmarking; see
@@ -250,7 +257,8 @@ extern "C" rocblas_status rocblas_gemm_ex(rocblas_handle handle,
     const char* why = nullptr;
     if (env_shim_disabled()) why = "passthrough (disabled)";
     else if (!all_f32 && !f16) why = "passthrough (not all-f32 or all-f16)";
-    else if (f16 && (is_trans(transA) || !is_trans(transB))) why = "passthrough (fp16, layout rocBLAS runs fast)";
+    else if (f16 && !gfx803_small_n_applies(n, is_trans(transA)) && (is_trans(transA) || !is_trans(transB)))
+        why = "passthrough (fp16, layout rocBLAS runs fast)";
     else if (algo != rocblas_gemm_algo_standard || solution_index != 0) why = "passthrough (explicit algo/solution)";
     // in-place C==D matches this kernel's beta-accumulate semantics
     else if (c != d || ldc != ldd) why = "passthrough (C != D)";
