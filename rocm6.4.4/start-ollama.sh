@@ -6,6 +6,8 @@
 #   ./start-ollama.sh               start the service (does nothing if running)
 #   ./start-ollama.sh --stop        stop it
 #   ./start-ollama.sh --logs        follow its log
+#   ./start-ollama.sh --status      show whether it runs and which model is loaded
+#   ./start-ollama.sh --list        list the installed models (does not start the service)
 #   ./start-ollama.sh pull qwen3:8b any other arguments run the ollama CLI in it
 #
 # OLLAMA_DATA   models and Ollama's key (default: ollama/ next to this script)
@@ -52,7 +54,12 @@ running() { [ "$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null)" = 
 case "${1:-}" in
   --stop) running && docker stop "$NAME" >/dev/null; exit 0 ;;
   --logs) exec docker logs -f "$NAME" ;;
-  -h|--help) sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  --status) . "$SCRIPT_DIR/container-args.sh"
+            gfx803_service_status "$NAME" "http://127.0.0.1:$PORT/api/version" || exit 1
+            docker exec "$NAME" ollama ps 2>/dev/null; exit 0 ;;
+  --list) running || die "the service is not running; start it first"
+          exec docker exec "$NAME" ollama list ;;
+  -h|--help) sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 esac
 
 if ! running; then

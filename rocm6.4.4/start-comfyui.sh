@@ -4,6 +4,7 @@
 #
 #   ./start-comfyui.sh              # start ComfyUI on http://localhost:8188
 #   GFX803_COMFYUI_LISTEN=0.0.0.0 ./start-comfyui.sh   # ...reachable from the LAN too
+#   ./start-comfyui.sh --status     show whether it runs
 #   ./start-comfyui.sh bash         # a shell instead, e.g. for gfx803-train
 #   GFX803_DEBUG=1 ./start-comfyui.sh ...
 #   RUN_AS_ROOT=1 ./start-comfyui.sh ...
@@ -16,6 +17,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=container-args.sh
 . "$SCRIPT_DIR/container-args.sh"
+[ "${1:-}" = --status ] && { gfx803_service_status comfyui "http://127.0.0.1:8188/"; exit; }
 gfx803_container_args "$SCRIPT_DIR"
 
 # The port is published on this machine's loopback address unless

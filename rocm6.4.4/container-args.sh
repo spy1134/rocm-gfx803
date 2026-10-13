@@ -1,4 +1,4 @@
-# Sourced by start-comfyui.sh, gfx803 and start-ollama.sh: the docker run
+# Sourced by start-comfyui.sh, gfx803, start-ollama.sh and start-chatterbox.sh: the docker run
 # arguments they need, so the GPU access, user mapping and data mounts cannot
 # drift apart.
 # gfx803_gpu_args fills the array GFX803_ARGS with GPU access, user mapping and
@@ -68,4 +68,17 @@ gfx803_container_args() {
     -v "$dir/ComfyUI/user:/opt/ComfyUI/user"
   )
   return 0
+}
+
+# gfx803_service_status NAME [URL]: one line for a container (its docker status),
+# plus whether URL answers. Exits non-zero when the container is not running, so
+# a script can use it as a check.
+gfx803_service_status() {
+  local name=$1 url=${2:-} st
+  st=$(docker ps -a --filter "name=^${name}\$" --format '{{.Status}}')
+  if [ -z "$st" ]; then echo "$name: not created"; return 1; fi
+  case $st in Up*) ;; *) echo "$name: stopped ($st)"; return 1 ;; esac
+  if [ -z "$url" ]; then echo "$name: running ($st)"
+  elif curl -fsS -m 3 -o /dev/null "$url" 2>/dev/null; then echo "$name: running ($st), answering at $url"
+  else echo "$name: running ($st), not answering yet at $url"; fi
 }
