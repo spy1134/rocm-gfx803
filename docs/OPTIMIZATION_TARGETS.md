@@ -37,7 +37,9 @@ the data is reused from registers and LDS. Almost everything expensive in
 these workloads is matrix multiplication: linear layers, convolutions (as
 Winograd plus a batched GEMM), attention (two GEMMs around a softmax) and LLM
 prompt processing. Making all of it run like the shim's best GEMM kernel does
-today is the main lever. Today only one GEMM layout gets there.
+is the main lever. The pipelined tiles now cover the NN, TN and NT layouts
+(BLAS-1, BLAS-2, BLAS-5); shapes whose leading dimension is a multiple of
+8 KiB still run on older kernels.
 
 ## Where the time goes
 
@@ -134,7 +136,7 @@ Open targets in recommended order, then the rest.
 | BLAS-5 | Shim: TN, NT and TT layouts | SD step 557 -> 526 ms, training 3.63 -> 3.37 s/step | Done |
 | BLAS-1, BLAS-2 | Shim: pipelined 64x64 and 32x32 tiles | large NN GEMMs 2.8-3.3 -> 3.9-4.8 TFLOPS | Done |
 | BLAS-4 | Shim: fp16 GEMMs in every layout | slower than rocBLAS | Evaluated, not adopted |
-| SD-3, SD-4, SD-5 | ComfyUI node: fused attention, GroupNorm, GEGLU | SD step 697 -> 567 ms | Done, optional install |
+| SD-3, SD-4, SD-5 | ComfyUI node: fused attention, GroupNorm, GEGLU | SD step 644 -> 526 ms | Done, optional install |
 | PT-1 | PyTorch layer_norm without the group_norm route | correctness (and ~1%) | Done |
 | LLM-1 | llama.cpp SDWA dot product in decode kernels (patch 104) | Q4_K_M generation +6-7% | Done |
 | LLM-2 | llama.cpp q5_K decode (patch 105) | q5_K decode ~4% | Done |
@@ -151,20 +153,10 @@ mmq's MUL_MAT_ID kernel. Patch 106 does not apply to the experts: each expert
 sees about batch x top-k / experts tokens (64 at a 2048-token batch), below
 the 128 where fp32 cuBLAS beats mmq.
 
-**Where the time goes.** Qwen3.6 35B-A3B Q4_K_M, all experts in RAM
-(`-ncmoe 99`), 2048-token batch, per 2048 tokens (7.6 s at 270 tok/s), from a
-dev-only timer that synchronizes around every CUDA node:
-
-| Part | Time | Notes |
-| --- | --- | --- |
-| Expert copies over PCIe | ~1.8 s | 20 GB at 11.3 GB/s from pinned memory, once per batch |
-| MUL_MAT_ID (experts) | 2.2 s | 1.4-2.0 TFLOPS; q6_K slower than q4_K |
-| Dense MUL_MAT | ~1.5 s | after patch 106 and the shim's alignment rule |
-| Flash attention | 0.2 s | |
-| Everything else | ~1.9 s | CPU-side scheduling and synchronization, not broken down yet |
-
-Copy time is per batch, so a larger batch amortizes it: 174 / 224 / 270
-tok/s at batches of 512 / 1024 / 2048.
+**Where the time goes.** A batch copies every layer's experts (about 20 GB)
+over PCIe, once per batch, so a larger batch amortizes the copy. The rest is
+the expert matmuls, the dense layers, attention and scheduling; no current
+per-part breakdown is recorded.
 
 **Options.**
 - Done: patch 108 copies the next MoE layer's experts into a second device
@@ -182,7 +174,10 @@ tok/s at batches of 512 / 1024 / 2048.
   stay at its low level (2.5 GT/s x8) under load: `pp_dpm_pcie` then shows
   level 0 throughout a copy, a 512 MiB host-to-device copy runs at 3.4
   instead of 12.3 GB/s, and the same build's pp2048 (2048-token batches)
-  falls from 367 to 247 tok/s. Generation barely changes. Check
+  falls from 367 to 247 tok/s. Generation barely changes. With the BIOS link
+  setting on Auto the driver raises the link to 8.0 GT/s x16 for copy-heavy work
+  (pp2048 at 2048-token batches then measures 364 tok/s) and leaves it at 2.5
+  GT/s during training, which moves little data over the bus. Check
   `current_link_speed` / `pp_dpm_pcie` under load before comparing prompt
   numbers; switching transparent huge pages off for the process changed
   nothing.
@@ -668,7 +663,7 @@ replaces three operations in ComfyUI's SD 1.5 path with HIP kernels from
 Correct against CPU float64 (attention within 3.5e-6 relative, GroupNorm and
 GEGLU within 1e-5, over odd shapes, 2-D/3-D and non-contiguous inputs); a
 full ComfyUI txt2img differs from a CPU run's by at most 0.3/255. An SD 1.5
-fp32 step at 512 px: 697 -> 567 ms. Per call (batch 2, 8 heads), ms:
+fp32 step at 512 px: 644 -> 526 ms. Per call (batch 2, 8 heads), ms:
 
 | | PyTorch SDPA | ComfyUI split | node |
 | --- | --- | --- | --- |

@@ -75,7 +75,6 @@ run with wrong numbers, not a crash. "It runs" was never taken as evidence.
 
 | Problem | Status | Section | Where |
 | --- | --- | --- | --- |
-| Problem | Status | 9 | Where |
 | Attention gradients wrong (shim missed batched GEMMs) | Fixed | 1 | `patches/sgemm-shim-batched/` |
 | Shim GEMMs 20x slow at power-of-two sizes | Fixed | 1 | same |
 | Shim large GEMMs at 2.5-3 TFLOPS | Faster (3.8-4.8 TFLOPS, pipelined tiles) | 1 | same |
@@ -310,7 +309,7 @@ after a model reload, which fits the same pattern but is not proven.
 The images therefore preload AMD's stock runtime, which the ROCm base image
 still carries as `libhsa-runtime64.so.1.15.60404` beside the patched
 `.so.1.15.0`. Ollama, SDXL and Qwen-Image generation, fp16 and training are all
-validated on it. `GFX803_RUNTIME=patched` (start scripts)
+validated on it (one intermittent training fault is listed in section 10). `GFX803_RUNTIME=patched` (start scripts)
 and `gfx803-train --runtime patched` load the patched one for comparison. The
 cost is the bug the patch was written for: MIOpen's CK reduction kernels can
 read stale data when freed addresses are reused at once (ONNX Runtime's
@@ -436,6 +435,7 @@ They are workarounds with their source fixes still to do.
   `torch.distributed.tensor` unconditionally, which crashes on this
   single-GPU build; the image stubs the check (a model on such a build cannot
   hold distributed tensors).
+
 ## 6. ComfyUI node with gfx803 kernels for attention, GroupNorm and GEGLU
 
 PyTorch has no fused attention on gfx803, so every SD 1.5 attention call
@@ -458,7 +458,7 @@ GroupNorm and GEGLU within 1e-5, over odd shapes, 2-D/3-D and non-contiguous
 inputs). A full ComfyUI SD 1.5 fp32 txt2img, 512 px and 20 steps, sent 400
 attention, 320 GEGLU and 1220 GroupNorm calls through the node, and its image
 differs from a CPU run's by at most 0.3/255. With the node, a 512 px fp32
-denoising step takes 567 ms instead of 697. Per call, with classifier-free
+denoising step takes 526 ms instead of 644. Per call, with classifier-free
 guidance (batch 2, 8 heads): self-attention at 64x64 26 ms against 50 ms for
 ComfyUI's split attention and 58 ms for PyTorch's SDPA, which also allocates
 2.3 GB for it (the fused kernel 10 MB); GEGLU 1.6-1.7x faster; GroupNorm
@@ -544,9 +544,10 @@ and fp16 only. Prefer fp16 for half precision on this card.
 
 Ollama 0.35.1 builds llama.cpp b11232; its HIP backend compiles for gfx803
 with no source changes, and computes correctly (llama.cpp's own operation tests
-pass against its CPU backend). It was slow, for five gfx803-specific reasons
+pass against its CPU backend). It was slow for gfx803-specific reasons
 that share a theme: kernels tuned for GPUs with more instructions spill
-registers, or run out of instruction throughput, on gfx803.
+registers, or run out of instruction throughput, on gfx803. The first five
+bullets are the original findings (patches 100-105); the rest build on them.
 
 - **Prompt processing at 15 tok/s** (Qwen3 8B Q4_K_M). The quantized matrix
   multiply used the GCN tile table, sized for GPUs with `v_dot4`. gfx803 has
@@ -707,8 +708,9 @@ original 98% of the time (KL divergence 0.0014).
 A mixture-of-experts model goes further on the same card. Qwen3.6 35B-A3B
 (Q4_K_M, 22 GB) activates about 3B parameters per token: llama.cpp keeps its
 attention, shared weights and a q8_0 KV cache for the full 262k context on
-the GPU and most routed experts in system RAM. On a 5.5k-token prompt it
-reads 189 tok/s and generates 22 tok/s with DDR4-2800 (158 and 19 at 2133).
+the GPU and most routed experts in system RAM. Before patches 106-109, on a
+5.5k-token prompt it read 189 tok/s and generated 22 tok/s with DDR4-2800 (158
+and 19 at 2133); the bullets above give the later figures.
 What decided those numbers:
 
 - **The bundled MTP draft head costs speed.** Checking a draft runs the
@@ -744,7 +746,8 @@ a reproduction.
   (GEGLU op test, wide GEMMs then a transposed copy, llama-server mid-prompt),
   and whether it causes ComfyUI's faults after a model reload. The images run
   AMD's stock runtime until this is understood; the reproducers are
-  `gfx803_unet_check.py --only GEGLU` and `workspace/scratch/wide_test.py`, on
+  `gfx803_unet_check.py --only GEGLU` and the wide-GEMM-then-transposed-copy
+  sequence described in section 4, on
   `GFX803_RUNTIME=patched` with the desktop stopped (a fault storm can freeze it).
 - torchvision's nms op needs a source fix or gfx803 kernel target in the PyTorch / torchvision build.
 - Whether PyTorch's group_norm computes wrong weight and bias gradients on
@@ -757,8 +760,31 @@ a reproduction.
 - Whether the decode kernels (mmvq) beat the prompt kernels (mmq) for 9-16
   tokens on gfx803; llama.cpp switches at 8.
 - fp16 over full-length training runs and in ComfyUI (only short runs so far).
-- The `init_user_pages: Failed to get user pages: -1` kernel messages on every
-  Ollama model load.
+- An intermittent GPU memory fault in SD 1.5 LoRA training on AMD's stock HSA
+  runtime. Two of sixteen runs of 120-300 steps (same image and data) died, at
+  steps 32 and 74, with `Memory access fault ... Page not present` and amdgpu
+  `VM fault ... read from 'TC'` lines, without a GPU reset; the loss was healthy up
+  to that point and nothing was NaN. To reproduce, run a 300-step
+  `gfx803-train` job on the SD 1.5 dataset (about 3.5 s/step, 7.2-7.6 GB peak
+  VRAM) and check `journalctl -k` for `VM fault` afterwards; expect to need
+  several runs.
+  Ruled out or not supported: the card's power mode (one fault in manual mode, one
+  in auto mode, with the PCIe link at 2.5 GT/s during training, which is the
+  driver's choice under low bus traffic); VRAM pressure (three 300-step runs under
+  a 6800 MiB PyTorch cap, which forces the allocator to free cached segments and
+  retry one to three times per run, all completed with no fault). Runs with
+  `AMD_SERIALIZE_KERNEL=3 HIP_LAUNCH_BLOCKING=1`, with full `AMD_LOG_LEVEL=3`
+  logging (both about 6.3 s/step) and with kernel-name-only logging
+  (`AMD_LOG_LEVEL=3 AMD_LOG_MASK=0x80`, 3.9 s/step) also all completed, but they
+  change timing, so they do not show where the fault comes from.
+  What the faults look like: the faulting reads come from several compute units at
+  once, at addresses whose low 36 bits look like one device pointer (in one fault,
+  consecutive pages) while bits 36-39 differ from lane to lane; in the
+  first fault two of the addresses were exactly 8 GiB minus one page apart.
+  That points at a kernel that builds a pointer from a wrongly read or stale
+  upper half, or at a mapping that is briefly absent, and not at a plain
+  out-of-bounds index. The kernel is not identified. Sections 2 and 4 describe
+  the two known sources of faults of this kind on this card.
 - Why images are slow to read: a 1080p image (about 2000 tokens) takes 56 s
   with Qwen3.5 9B, against about 15 s for 2000 text tokens.
 - llama.cpp's triangular solve (`SOLVE_TRI`) is wrong on the GPU for

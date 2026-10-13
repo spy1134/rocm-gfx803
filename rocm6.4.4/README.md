@@ -496,7 +496,7 @@ measurements and a reproduction. In short:
 - **109-sched-batched-host-copies.patch**: during generation a MoE layer's CPU
   expert split waited for each of its GPU inputs separately, about 130 GPU round
   trips per token. The copies are now queued and waited for once. Qwen3.6
-  35B-A3B tg128 23.8 -> 24.5 tok/s.
+  35B-A3B tg128 23.8 -> 24.4 tok/s.
 
 `patches/ollama/llama-cpp-server/090-mmproj-fit-target-device.patch` fixes
 llama.cpp's server, on every GPU. When it fits a model with a multimodal
