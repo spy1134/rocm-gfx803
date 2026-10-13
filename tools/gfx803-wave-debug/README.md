@@ -1,17 +1,12 @@
 # gfx803 wave-state debugging
 
-Reads the GPU's own shader state during a live hang. This is what finally
-localized the silent dispatch hang (RESOLVED_VRAM_MARGINALITY_INVESTIGATION.md problem 1)
-after months of experiments against the queue/doorbell/interrupt layers came
-back negative -- none of those layers can park a wave in `s_waitcnt`, and
-nothing had looked at the shader side.
-
-The localization itself held up: the hang was root-caused to VRAM-clock
-marginality (see RESOLVED_VRAM_MARGINALITY_INVESTIGATION.md's top-of-file summary), and a
-wave stuck in `s_waitcnt vmcnt(0)` -- waiting on a vector-memory op that
-never returns -- is exactly the shader-side signature that condition
-predicts. These tools remain useful for any future gfx803 hang that isn't
-this one.
+Reads the GPU's own shader state during a live hang. Debugging the queue,
+doorbell and interrupt layers cannot explain a dispatch that never completes,
+because none of those layers can park a wave in `s_waitcnt`; the shader side has
+to be read. On one host this localized a silent dispatch hang to VRAM-clock
+marginality: a wave stuck in `s_waitcnt vmcnt(0)` is waiting on a vector-memory
+op that never returns, which is the shader-side signature of that condition.
+The tools apply to any gfx803 hang.
 
 Everything here is read-only against `amdgpu`'s debugfs. It needs root on the
 host (not in a container), and the GPU must still be enumerated.

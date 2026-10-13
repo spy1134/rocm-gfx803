@@ -2,8 +2,8 @@
 
 ## PCIe ASPM disable
 
-See the main `README.md`'s "Host BIOS setting: keep PCIe ASPM off" section
-for why this matters. Short version: on at least one gfx803 host (a
+See the "Host BIOS setting: keep PCIe ASPM off" section of
+`README-rocm10.md` at the repository root for why this matters. Short version: on at least one gfx803 host (a
 Supermicro board whose ACPI FADT declares `the system doesn't support PCIe
 ASPM` and never hands OS-level ASPM control to Linux), enabled ASPM caused
 rare, extremely hard-to-diagnose multi-minute stalls under GPU load.
