@@ -214,7 +214,7 @@ RUN git clone --branch "rocm-${ROCM_VERSION}" --depth 1 \
 # gfx803 libraries, which don't route through the SolutionStructs.py hook that
 # patch targets. Not swapped in until that gap is closed and re-verified
 # against a real build of this line.
-COPY patches/rocblas/ /rocblas-patches/
+COPY patches/rocblas/wgm-miscompute.sh patches/rocblas/small-gemm-assembly-miscompute.patch patches/rocblas/small-gemm-assembly-miscompute.sh /rocblas-patches/
 RUN sh /rocblas-patches/wgm-miscompute.sh /rocblas-src
 
 # Separately: gfx803's tuned Tensile assembly GEMM kernels silently miscompute
@@ -727,6 +727,11 @@ RUN git init -q /pytorch \
     && git -C /pytorch checkout -q FETCH_HEAD \
     && git -C /pytorch submodule update -q --init --recursive --depth 1
 
+# Ahead of the patches, so a patch change does not re-resolve these from the
+# network.
+WORKDIR /pytorch
+RUN pip install --no-cache-dir -r requirements.txt
+
 # torch._int_mm reaches hipBLASLt unconditionally, and hipBLASLt has no gfx803
 # kernels, so every int8 matmul fails; the first patch routes it to rocBLAS.
 # layer_norm sizes its launches by the hardware's 64-lane wavefront while its
@@ -748,9 +753,6 @@ RUN sh /pytorch-patches/gfx803-int8-gemm-rocblas.sh /pytorch \
     && sh /pytorch-patches/gfx803-topk-scan-warp-size.sh /pytorch \
     && sh /pytorch-patches/gfx803-rocprim-private-namespace.sh /pytorch \
     && sh /pytorch-patches/gfx803-index-put-warp-size.sh /pytorch
-
-WORKDIR /pytorch
-RUN pip install --no-cache-dir -r requirements.txt
 
 # setup.py does not hipify CUDA sources itself; build_amd.py has to run first
 # or CMake fails looking for .hip sources that don't exist yet.
