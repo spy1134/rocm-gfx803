@@ -1,0 +1,272 @@
+llama.cpp (as fetched by Ollama v0.35.1, llama.cpp b11232): on gfx803, prompt
+batches of quantized matmuls run as fp32 GEMMs on the image's gfx803 SGEMM,
+with the weights dequantized into padded rows.
+
+WHY
+---
+Prompt processing goes through mmq, which emulates int8 dot products: gfx803
+has no dp4a, and q4_K at 512 tokens (4096x14336) runs at about 2.4 effective
+TOPS, a third of the card's fp32 FMA rate. The base image preloads a gfx803
+SGEMM that reaches 3.6-4.5 TFLOPS on these shapes, so dequantizing a weight
+to fp32 and multiplying it there is faster, and more precise, since mmq also
+quantizes the activations to 8 bits.
+
+Three things stood in the way:
+1. For quantized weights, ggml_cuda_mul_mat_cublas picks fp16 compute on
+   every AMD GPU. On gfx803 that is cuBLAS's fp16 path with fp16
+   accumulation, which goes to rocBLAS rather than the SGEMM.
+2. A weight row of 4096 or 14336 floats is a multiple of 8 KiB. That stride
+   puts every row of a GEMM tile in one DRAM channel: 14336 x 512 x 4096
+   runs at 2.8 TFLOPS with contiguous rows and at 4.1 with 16 floats of
+   padding per row. The same holds for the activations' rows (src1).
+3. mmq is chosen for every quantized type before cuBLAS is considered.
+
+Measured on an RX 590 with the base image's SGEMM, Qwen3 8B Q4_K_M prompt
+tok/s by ubatch, cuBLAS fp32 vs mmq:
+  16: 36 vs 100, 64: 132 vs 146, 96: 130 vs 149, 128: 178 vs 154,
+  256: 210 vs 160, 512: 222 vs 162.
+Ollama, ~5.2k-token prompt: Qwen3 8B 149 -> 215 tok/s, Qwen2.5-Coder 7B
+107 -> 136 tok/s, generation unchanged. KL divergence against the CPU
+backend (llama-perplexity, 8 x 512 tokens): Qwen2.5-Coder 7B 0.00152 (mmq)
+-> 0.00094, same top token 97.6% -> 98.0%; Qwen3 8B 0.0103 -> 0.0086.
+llama-bench, q8_0 KV cache, flash attention, mmq -> this patch:
+  Qwen3 8B Q4_K_M         pp512 163.5 -> 222.8, at 8192 deep 127.6 -> 158.8,
+                          pp12288 135.0 -> 172.7
+  Qwen2.5-Coder 7B Q4_K_M pp512 166.9 -> 230.5, at 8192 deep 57.2 -> 64.1
+Dequantizing into a contiguous buffer and copying it to padded rows instead
+reached 203.5 for Qwen3 8B pp512. Padding only the weight reached 196.8.
+test-backend-ops MUL_MAT 1301/1301 against the CPU backend, both with this
+threshold and with the cuBLAS route forced for every batch above 8.
+Generation is unchanged: single-token and small batches still use mmvq.
+
+Matmuls whose expert weights are selected per token (MUL_MAT_ID, MoE models)
+are not routed here and keep mmq. Neither are weights whose fp32 copy would
+exceed 512 MiB: on an 8 GB card that copy competes with the model for VRAM.
+The largest feed-forward weights take ~270 MB (Qwen2.5 7B), while an output
+head over a 152k vocabulary, which reaches this path only when logits are
+computed for every token (llama-perplexity), would need 2.5 GB. Without the
+cap that perplexity run (Qwen3 8B, -c 512, batch 2048) ended in a GPU memory
+fault ("Page not present", a write) on the stock HSA runtime; with it the run
+completes and its KL divergence against the CPU backend is 0.0086 (mmq:
+0.0103). The SGEMM itself was run alone at that shape (151936 x 2048 x 4096)
+and returned results identical to its reference kernel without a fault, so
+the fault comes from the memory pressure, not from the GEMM.
+
+WHAT
+----
+1. convert.cu/.cuh: ggml_get_to_fp32_ld_cuda(type, ne00) returns a
+   dequantizer that writes rows ld floats apart: one generic kernel for
+   q4_0, q4_1, q5_0, q5_1 and q8_0, and one per QK_K super-block for the
+   K-quants and IQ types (nullptr when QK_K does not divide ne00).
+2. ggml_cuda_mul_mat_cublas: quantized weights on GCN4 use fp32 compute.
+3. ggml_cuda_mul_mat_cublas_impl, fp32 on GCN4 with a single contiguous
+   weight matrix: dequantize into rows of ne00 + 16 floats and give src1 a
+   copy with rows of ne10 + 16 floats.
+4. ggml_cuda_mul_mat: on GCN4, from 128 src1 columns on, matmuls with such a
+   dequantizer and an fp32 copy of at most 512 MiB go to
+   ggml_cuda_mul_mat_cublas before mmq is considered.
+
+diff --git a/ggml/src/ggml-cuda/convert.cu b/ggml/src/ggml-cuda/convert.cu
+index 0619f4760..7b80ef3e2 100644
+--- a/ggml/src/ggml-cuda/convert.cu
++++ b/ggml/src/ggml-cuda/convert.cu
+@@ -661,6 +661,88 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
+     }
+ }
+ 
++template <int qk, int qr, dequantize_kernel_t dequantize_kernel>
++static __global__ void dequantize_block_ld(const void * __restrict__ vx, float * __restrict__ y,
++        const int64_t ne00, const int64_t ne01, const int64_t ld) {
++    const int64_t i00 = 2 * (int64_t(blockDim.x)*blockIdx.x + threadIdx.x);
++
++    if (i00 >= ne00) {
++        return;
++    }
++
++    const int64_t iqs      = (i00%qk)/qr;
++    const int64_t iybs     = i00 - i00%qk;
++    const int64_t y_offset = qr == 1 ? 1 : qk/2;
++
++    for (int64_t i01 = blockIdx.y; i01 < ne01; i01 += gridDim.y) {
++        float2 v;
++        dequantize_kernel(vx, i01*(ne00/qk) + i00/qk, iqs, v);
++
++        y[i01*ld + iybs + iqs + 0]        = v.x;
++        y[i01*ld + iybs + iqs + y_offset] = v.y;
++    }
++}
++
++template <int qk, int qr, dequantize_kernel_t dequantize_kernel>
++static void dequantize_block_ld_cuda(const void * vx, float * y, const int64_t ne00, const int64_t ne01, const int64_t ld,
++        cudaStream_t stream) {
++    const dim3 num_blocks((ne00 + 2*CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / (2*CUDA_DEQUANTIZE_BLOCK_SIZE), (int)std::min(ne01, (int64_t)65535));
++    dequantize_block_ld<qk, qr, dequantize_kernel><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(vx, y, ne00, ne01, ld);
++}
++
++// One QK_K super-block per workgroup, as in the dequantize_row_*_cuda launchers.
++template <int nth, void (*dequantize)(const void *, const int64_t, float *, const int)>
++static __global__ void dequantize_block_k_ld(const void * __restrict__ vx, float * __restrict__ y, const int64_t nb_row, const int64_t ld) {
++    const int64_t i = blockIdx.x;
++    const int64_t r = i / nb_row;
++
++    dequantize(vx, i, y + r*ld + (i - r*nb_row)*QK_K, threadIdx.x);
++}
++
++template <int nth, void (*dequantize)(const void *, const int64_t, float *, const int)>
++static void dequantize_k_ld_cuda(const void * vx, float * y, const int64_t ne00, const int64_t ne01, const int64_t ld,
++        cudaStream_t stream) {
++    const int64_t nb_row = ne00 / QK_K;
++    dequantize_block_k_ld<nth, dequantize><<<nb_row*ne01, nth, 0, stream>>>(vx, y, nb_row, ld);
++}
++
++to_fp32_ld_cuda_t ggml_get_to_fp32_ld_cuda(ggml_type type, int64_t ne00) {
++    switch (type) {
++        case GGML_TYPE_Q4_0:
++            return dequantize_block_ld_cuda<QK4_0, QR4_0, dequantize_q4_0>;
++        case GGML_TYPE_Q4_1:
++            return dequantize_block_ld_cuda<QK4_1, QR4_1, dequantize_q4_1>;
++        case GGML_TYPE_Q5_0:
++            return dequantize_block_ld_cuda<QK5_0, QR5_0, dequantize_q5_0>;
++        case GGML_TYPE_Q5_1:
++            return dequantize_block_ld_cuda<QK5_1, QR5_1, dequantize_q5_1>;
++        case GGML_TYPE_Q8_0:
++            return dequantize_block_ld_cuda<QK8_0, QR8_0, dequantize_q8_0>;
++        default:
++            break;
++    }
++    if (ne00 % QK_K != 0) {
++        return nullptr;
++    }
++    switch (type) {
++        case GGML_TYPE_Q2_K:    return dequantize_k_ld_cuda<64, dequantize_q2_K<float>>;
++        case GGML_TYPE_Q3_K:    return dequantize_k_ld_cuda<64, dequantize_q3_K<float>>;
++        case GGML_TYPE_Q4_K:    return dequantize_k_ld_cuda<32, dequantize_q4_K<float>>;
++        case GGML_TYPE_Q5_K:    return dequantize_k_ld_cuda<64, dequantize_q5_K<float>>;
++        case GGML_TYPE_Q6_K:    return dequantize_k_ld_cuda<64, dequantize_q6_K<float>>;
++        case GGML_TYPE_IQ2_XXS: return dequantize_k_ld_cuda<32, dequantize_iq2_xxs<float>>;
++        case GGML_TYPE_IQ2_XS:  return dequantize_k_ld_cuda<32, dequantize_iq2_xs<float>>;
++        case GGML_TYPE_IQ2_S:   return dequantize_k_ld_cuda<32, dequantize_iq2_s<float>>;
++        case GGML_TYPE_IQ3_XXS: return dequantize_k_ld_cuda<32, dequantize_iq3_xxs<float>>;
++        case GGML_TYPE_IQ3_S:   return dequantize_k_ld_cuda<32, dequantize_iq3_s<float>>;
++        case GGML_TYPE_IQ1_S:   return dequantize_k_ld_cuda<32, dequantize_iq1_s<float>>;
++        case GGML_TYPE_IQ1_M:   return dequantize_k_ld_cuda<32, dequantize_iq1_m<float>>;
++        case GGML_TYPE_IQ4_NL:  return dequantize_k_ld_cuda<32, dequantize_iq4_nl<float>>;
++        case GGML_TYPE_IQ4_XS:  return dequantize_k_ld_cuda<32, dequantize_iq4_xs<float>>;
++        default:                return nullptr;
++    }
++}
++
+ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
+     switch (type) {
+         case GGML_TYPE_F32:
+diff --git a/ggml/src/ggml-cuda/convert.cuh b/ggml/src/ggml-cuda/convert.cuh
+index f5d37c7b9..730aa0562 100644
+--- a/ggml/src/ggml-cuda/convert.cuh
++++ b/ggml/src/ggml-cuda/convert.cuh
+@@ -28,6 +28,12 @@ typedef to_t_nc_cuda_t<half> to_fp16_nc_cuda_t;
+ typedef to_t_nc_cuda_t<nv_bfloat16> to_bf16_nc_cuda_t;
+ 
+ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type);
++
++// Dequantizes a contiguous ne00 x ne01 matrix into rows ld floats apart.
++typedef void (*to_fp32_ld_cuda_t)(const void * x, float * y, int64_t ne00, int64_t ne01, int64_t ld, cudaStream_t stream);
++
++// nullptr if the type has no such kernel or its blocks do not divide ne00.
++to_fp32_ld_cuda_t ggml_get_to_fp32_ld_cuda(ggml_type type, int64_t ne00);
+ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type);
+ to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(ggml_type type);
+ 
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index b50d05d5f..be3b1e5bd 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1439,8 +1439,31 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+     bool is_src0_cont_2 = ggml_is_contiguous_2(src0);
+     bool is_src1_cont_2 = ggml_is_contiguous_2(src1);
+ 
++    // On gfx803 a row stride that is a multiple of 8 KiB (4096 or 14336
++    // floats) puts every row of a GEMM tile in one DRAM channel: 14336 x 512
++    // x 4096 runs at 2.8 TFLOPS with such strides and 4.1 with 16 floats of
++    // padding. Weights are dequantized straight into padded rows; src1 gets
++    // a padded copy, which costs little next to the weight.
++    to_fp32_ld_cuda_t gcn4_to_fp32_ld = nullptr;
++    ggml_cuda_pool_alloc<cuda_t> src1_pad(ctx.pool());
++    if constexpr (compute_type == GGML_TYPE_F32) {
++        if (ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_GCN4 && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
++                ggml_is_contiguous(src0)) {
++            gcn4_to_fp32_ld = ggml_get_to_fp32_ld_cuda(src0->type, ne00);
++        }
++    }
++
+     if (src0->type == compute_type) {
+         src0_ptr = (const cuda_t *) src0->data;
++    } else if (gcn4_to_fp32_ld != nullptr) {
++        const int64_t ld = ne00 + 16;
++        src0_alloc.alloc(ld*ne01);
++        gcn4_to_fp32_ld(src0->data, (float *) src0_alloc.get(), ne00, ne01, ld, main_stream);
++        CUDA_CHECK(cudaGetLastError());
++        s01 = ld;
++        s02 = ld*ne01;
++        s03 = s02;
++        src0_ptr = src0_alloc.get();
+     } else {
+         src0_alloc.alloc(ggml_nelements(src0));
+ 
+@@ -1489,6 +1512,15 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+         src1_ptr = src1_alloc.get();
+     }
+ 
++    if (gcn4_to_fp32_ld != nullptr && ne11 > 1) {
++        const int64_t ld = ne10 + 16;
++        src1_pad.alloc(ld*ne11);
++        CUDA_CHECK(cudaMemcpy2DAsync(src1_pad.get(), ld*sizeof(cuda_t), src1_ptr, s11*sizeof(cuda_t), ne10*sizeof(cuda_t), ne11,
++            cudaMemcpyDeviceToDevice, main_stream));
++        src1_ptr = src1_pad.get();
++        s11 = ld;
++    }
++
+     ggml_cuda_pool_alloc<cuda_t> dst_temp(ctx.pool());
+     char * dst_ptr;
+     size_t nbd2 = dst->nb[2];
+@@ -1618,7 +1650,9 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
+     const int cc = ggml_cuda_info().devices[ctx.device].cc;
+     ggml_type compute_type = src0->type;
+     if (ggml_is_quantized(compute_type)) {
+-        compute_type = fast_fp16_hardware_available(cc) ? GGML_TYPE_F16 : GGML_TYPE_F32;
++        // gfx803 has no packed fp16 math, and the fp16 path here accumulates
++        // in fp16; fp32 runs on the gfx803 SGEMM that the image preloads.
++        compute_type = fast_fp16_hardware_available(cc) && cc != GGML_CUDA_CC_GCN4 ? GGML_TYPE_F16 : GGML_TYPE_F32;
+     } else if (compute_type == GGML_TYPE_F16 && !fast_fp16_hardware_available(cc)) {
+         compute_type = GGML_TYPE_F32;
+     } else if (compute_type == GGML_TYPE_BF16 && !fast_bf16_hardware_available(cc)) {
+@@ -1815,6 +1849,17 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+     return use_mul_mat_vec_q;
+ }
+ 
++// From this many src1 columns on, gfx803 runs quantized matmuls as fp32 GEMMs
++// through cuBLAS (the gfx803 SGEMM the image preloads) instead of mmq. Qwen3 8B
++// Q4_K_M prompt tok/s by ubatch, cuBLAS vs mmq: 64: 132 vs 146, 96: 130 vs 149,
++// 128: 178 vs 154, 512: 222 vs 162.
++#define GCN4_CUBLAS_MIN_BATCH 128
++
++// The fp32 copy of the weight is temporary VRAM next to the model, on an 8 GB
++// card. Feed-forward weights take up to ~270 MB (Qwen2.5 7B, 3584x18944); an
++// output head over a 152k vocabulary would take 2.5 GB and keeps mmq.
++#define GCN4_CUBLAS_MAX_SRC0_BYTES (512ull << 20)
++
+ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     GGML_TENSOR_BINARY_OP_LOCALS
+ 
+@@ -1863,6 +1908,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+         return;
+     }
++    if (cc == GGML_CUDA_CC_GCN4 && ne11 >= GCN4_CUBLAS_MIN_BATCH && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
++            (uint64_t) (ne00 + 16) * ne01 * sizeof(float) <= GCN4_CUBLAS_MAX_SRC0_BYTES &&
++            ggml_is_contiguous(src0) && ggml_get_to_fp32_ld_cuda(src0->type, ne00) != nullptr) {
++        ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
++        return;
++    }
+     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
+         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+         return;

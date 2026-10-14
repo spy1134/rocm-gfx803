@@ -8,7 +8,7 @@
 # Verified on an RX 590 with Qwen2.5-Coder 7B and Qwen3 8B (Q4_K_M): llama.cpp's
 # matmul and flash-attention tests pass against the CPU backend and greedy
 # output agrees with a CPU run. patches/ollama/llama-cpp/ takes Qwen3 8B's prompt
-# processing from 15 to 163 tok/s, and 4096 tokens deep from 55 to 143 tok/s;
+# processing from 14 to 223 tok/s, and 4096 tokens deep from 55 to 143 tok/s;
 # with a q8_0 KV cache, generation goes from 27.9 to 31.4 tok/s, and 8192 tokens
 # deep from 20.9 to 26.5.
 ARG BASE_IMAGE=rocm-gfx803:rocm6.4.4
@@ -84,6 +84,9 @@ RUN CC=/opt/rocm/llvm/bin/clang CXX=/opt/rocm/llvm/bin/clang++ \
     && { grep -q "meta = \*(const int4 \* __restrict__)bq5_K" \
              build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/vecdotq.cuh \
          || { echo "105-gfx803-q5k-decode.patch was not applied" >&2; exit 1; }; } \
+    && { grep -q ggml_get_to_fp32_ld_cuda \
+             build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/ggml-cuda.cu \
+         || { echo "106-gfx803-cublas-prompt.patch was not applied" >&2; exit 1; }; } \
     && cmake --build build/llama-server-rocm_v7_2 --parallel "$(nproc)" \
     && cmake --install build/llama-server-rocm_v7_2 --component llama-server --strip
 
