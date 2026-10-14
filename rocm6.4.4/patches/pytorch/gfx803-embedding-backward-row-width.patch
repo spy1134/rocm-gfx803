@@ -1,0 +1,77 @@
+PyTorch (ROCm/pytorch release/2.8, commit d618db8): size
+embedding_backward_feature_kernel's shared-memory rows by the width it
+is launched with.
+
+WHY
+The backward of torch.nn.functional.embedding (and nn.Embedding) with at
+most 3072 indices and scale_grad_by_freq=False returns wrong weight
+gradients on gfx803, and with some shapes reads out of bounds and kills
+the process with a GPU memory access fault. Against a float64 CPU
+reference the fp32 gradient is off by 2.7 (512 indices, 128 rows, dim 32)
+to 26 (dim 128). 31 indices with dim 64 faults ("Memory access fault by
+GPU ... Page not present", VM_CONTEXT1_PROTECTION_FAULT in the kernel
+log). To reproduce: idx = torch.randint(0, 128, (512,)); w =
+torch.randn(128, 64, requires_grad=True); F.embedding(idx, w).backward(
+torch.randn(512, 64)); compare w.grad on the GPU and the CPU. The same
+script passes on an NVIDIA T4 with the same PyTorch version, so the
+kernel's logic is sound where its two warp sizes agree.
+
+embedding_dense_backward_cuda launches the kernel with blockDim.x =
+at::cuda::warp_size(), the hardware's 64 on gfx803, and sizes shared
+memory as warp_size * BLOCKDIMY accumulators followed by the indices
+batch. The kernel lays out its rows with C10_WARP_SIZE, which
+c10/macros/Macros.h makes 32 in device code for every AMD target except
+gfx9. Each 64-wide row then writes over half of the next row, and the
+last row writes over the start of indices_batch, so gradients are added
+into the wrong rows, and garbage row numbers index grad_weight out of
+bounds.
+
+The fix is in the kernel, not the launcher as in
+gfx803-index-put-warp-size.patch: this kernel elects a leader among rows
+targeting the same weight row with a ballot whose lane bits stand for
+row numbers, so each threadIdx.y row must be exactly one hardware
+wavefront. A 32-wide launch would put two rows in one 64-lane wavefront
+and break that.
+
+WHAT
+The kernel's three shared-memory offsets use blockDim.x instead of
+C10_WARP_SIZE. blockDim.x is the launcher's at::cuda::warp_size() on
+every target, so CUDA and gfx9 compute the same offsets as before.
+
+REAL-HARDWARE VERIFICATION (RX 590, this image)
+F.embedding backward against a float64 CPU reference, 1 to 4096 indices
+into 128 rows with embedding dims 1, 32, 64 and 65 (36 cases, both sides
+of the 3072-index limit of this kernel's path): largest difference
+5.1e-6, against 4.6e-6 for the same script on an NVIDIA T4. The 31-index,
+dim-64 case that faulted now passes. fp16 gradients with repeated indices
+are within one fp16 step of a float64 reference computed from the same
+fp16 inputs. The image's conv, SD1.5 UNet, rocPRIM and top-k checks and a
+20-step LoRA training run give the same results as before the patch.
+diff --git a/aten/src/ATen/native/cuda/Embedding.cu b/aten/src/ATen/native/cuda/Embedding.cu
+index 4b1e420..4863bc3 100644
+--- a/aten/src/ATen/native/cuda/Embedding.cu
++++ b/aten/src/ATen/native/cuda/Embedding.cu
+@@ -55,8 +55,12 @@ __global__ void embedding_backward_feature_kernel
+ {
+   extern __shared__ char buf[];
+   accscalar_t* smem = (accscalar_t*)buf;
+-  accscalar_t* my_s = smem + C10_WARP_SIZE*threadIdx.y;
+-  int* indices_batch = (int*)(buf + sizeof(accscalar_t)*C10_WARP_SIZE*blockDim.y);
++  // Rows are blockDim.x wide, the launcher's at::cuda::warp_size(), so that each threadIdx.y row is
++  // exactly one hardware wavefront: the ballot below maps peer rows to lane bits. C10_WARP_SIZE is
++  // 32 in device code on gfx6-8, which run 64-lane wavefronts, and using it here overlaps the rows
++  // and lets the last row overwrite indices_batch. GFX803_EMBEDDING_BWD_ROW_WIDTH_PATCH
++  accscalar_t* my_s = smem + blockDim.x*threadIdx.y;
++  int* indices_batch = (int*)(buf + sizeof(accscalar_t)*blockDim.x*blockDim.y);
+ 
+   const int s = (int)stride; // OK to make int, we don't expect 2 billion+ embedding row size
+ 
+@@ -119,7 +123,7 @@ __global__ void embedding_backward_feature_kernel
+ #else
+             first_remaining_peer = __ffs(matchmask) - 1;
+ #endif
+-            my_s[threadIdx.x] += smem[threadIdx.x + C10_WARP_SIZE*first_remaining_peer];
++            my_s[threadIdx.x] += smem[threadIdx.x + blockDim.x*first_remaining_peer];
+             matchmask ^= (1 << first_remaining_peer);
+           }
+           if(f < s)

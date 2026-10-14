@@ -88,6 +88,7 @@ run with wrong numbers, not a crash. "It runs" was never taken as evidence.
 | PyTorch top-k hangs the GPU (warp-size mismatch in its scan) | Fixed | 5 | `patches/pytorch/` |
 | PyTorch nonzero, masked indexing, unique, large sorts fail to launch (rocPRIM symbol clash with rocSPARSE) | Fixed | 5 | `patches/pytorch/` |
 | PyTorch index_put accumulate drops sums (warp-size mismatch) | Fixed | 5 | `patches/pytorch/` |
+| PyTorch embedding backward wrong or faults (warp-size mismatch) | Fixed | 5 | `patches/pytorch/` |
 | A GPU-side assert resets the whole GPU instead of raising an error | Open (driver/trap handler) | 5 | none |
 | torchvision nms has no gfx803 kernel | Worked around (CPU) | 5 | `runtime/python/` |
 | No fused attention in PyTorch on gfx803 | ComfyUI node (inference, fp32 kernels) | 6 | `tools/ComfyUI-gfx803-attention/` |
@@ -418,7 +419,23 @@ size, as the layer_norm patch does. After it the GPU matches the CPU; at 3
 million indices it is closer to a float64 reference than the CPU is (4e-5
 against 2.5e-4).
 
-These are three instances of one pattern: code that checks for gfx9 when it
+**embedding backward.** The backward of `F.embedding` and `nn.Embedding` with
+at most 3072 indices (the path every text encoder and token-embedding LoRA
+takes) returned wrong weight gradients, off by 2.7 to 26 in fp32 against a
+float64 reference, and some shapes (31 indices, dim 64) read out of bounds and
+ended the process with a GPU memory access fault. The launcher runs
+`embedding_backward_feature_kernel` with 64-wide rows and sizes its shared
+memory for them, but the kernel lays its rows out `C10_WARP_SIZE` (32) apart,
+so each row overwrites half of the next and the last one overwrites the
+indices it reads its destination rows from. The kernel elects a leader among
+rows with a ballot whose lane bits stand for row numbers, so each row must be
+one hardware wavefront and the index_put-style fix (a 32-wide launch) would
+break it;
+[`gfx803-embedding-backward-row-width.patch`](../rocm6.4.4/patches/pytorch/gfx803-embedding-backward-row-width.patch)
+lays the rows out by the launched width, `blockDim.x`, instead. After it the
+GPU matches the CPU (largest difference 5.1e-6, as on an NVIDIA T4).
+
+These are four instances of one pattern: code that checks for gfx9 when it
 means "64-lane GPU" leaves gfx6-8 with a 32-lane `C10_WARP_SIZE` on 64-lane
 hardware, and a kernel goes wrong wherever it meets a value sized for the
 hardware. Fourteen of the 21 files under `aten/` that use the macro also call

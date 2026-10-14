@@ -84,9 +84,10 @@ Without this project's changes, on these cards:
   of 0.1-0.2).
 - MIOpen's binary Winograd convolutions corrupted memory and hung the GPU under
   sustained load, sometimes taking the machine down with it.
-- PyTorch's `layer_norm`, `index_put`, `topk`, `nonzero`, boolean-mask indexing,
-  `unique` and large sorts returned wrong results, failed to launch, or hung the
-  GPU. The cause in several cases is one warp-size mismatch on 64-lane hardware.
+- PyTorch's `layer_norm`, `index_put`, `topk`, embedding backward, `nonzero`,
+  boolean-mask indexing, `unique` and large sorts returned wrong results, failed
+  to launch, or hung the GPU. The cause in several cases is one warp-size
+  mismatch on 64-lane hardware.
 - Ollama read prompts about ten times slower than the card allows, generated
   text below its memory bandwidth, and could fill VRAM until the desktop stalled.
 

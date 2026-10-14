@@ -745,14 +745,17 @@ RUN pip install --no-cache-dir -r requirements.txt
 # fail to launch); the fourth gives torch's rocPRIM a private namespace.
 # index_put's accumulate launch has layer_norm's mismatch (64-wide launch,
 # 32-lane kernels) and drops half of the repeated indices; the fifth sizes it
-# like layer_norm.
+# like layer_norm. embedding's backward lays out its shared-memory rows 32
+# wide while launched 64 wide, so rows overlap and overwrite its index batch;
+# the sixth sizes the rows by the launched width.
 # Applied to the CUDA source, before build_amd.py hipifies it.
 COPY patches/pytorch/ /pytorch-patches/
 RUN sh /pytorch-patches/gfx803-int8-gemm-rocblas.sh /pytorch \
     && sh /pytorch-patches/gfx803-layer-norm-warp-size.sh /pytorch \
     && sh /pytorch-patches/gfx803-topk-scan-warp-size.sh /pytorch \
     && sh /pytorch-patches/gfx803-rocprim-private-namespace.sh /pytorch \
-    && sh /pytorch-patches/gfx803-index-put-warp-size.sh /pytorch
+    && sh /pytorch-patches/gfx803-index-put-warp-size.sh /pytorch \
+    && sh /pytorch-patches/gfx803-embedding-backward-row-width.sh /pytorch
 
 # setup.py does not hipify CUDA sources itself; build_amd.py has to run first
 # or CMake fails looking for .hip sources that don't exist yet.
