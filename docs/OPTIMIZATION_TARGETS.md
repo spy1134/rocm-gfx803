@@ -94,15 +94,15 @@ node is forward-only.
 
 ### llama.cpp decode (token generation)
 
-Qwen3 8B Q4_K_M with a 5.2k-token context generates 26.6 tok/s, 37.6 ms per
-token. Reading the ~5 GB of weights at the measured ~180 GB/s of the K-quant
-decode kernels accounts for ~28 ms, and the q8_0 KV cache for ~2 ms. The
-remaining ~7 ms is unexplained. It is not CPU launch overhead that HIP graphs
-would remove: llama.cpp captures and replays graphs on gfx803 by default, and
-turning them off (`GGML_CUDA_DISABLE_GRAPHS=1`) leaves generation unchanged
-(30.6 against 30.5 tokens/s). The K-quant matmuls
-themselves are at ~80% of the reachable bandwidth (q4_K 4096x14336: 188 us,
-~176 GB/s; q8_0 and f16 reach ~225).
+Qwen3 8B Q4_K_M with a 5.2k-token context generates 27.81 +- 0.09 tok/s, 35.96 ms
+per token (31.16 +- 0.09 tok/s, 32.09 ms at zero context depth). Reading the
+4.87 GB of weights at the measured ~198 GB/s of the K-quant decode kernels
+accounts for 24.54 ms, and the q8_0 KV cache for 2.0 ms at the 200 GB/s bound
+(4.42 ms measured). The remaining ~9.6 ms gap between wall time and the memory
+bandwidth bound is resolved in LLM-5: 2.4 ms flash attention decode latency above
+its KV read bound, 2.38 ms unquantized F16 `attn_v` projections (streaming at
+~127 GB/s), 2.97 ms across 581 small-kernel launches dominated by fixed launch
+and tail latency, ~0.2 ms matmul excess, and ~1.9 ms residual idle between kernels.
 
 ### llama.cpp prompt processing (prefill)
 
@@ -110,7 +110,7 @@ Batches of 128 tokens or more run as fp32 GEMMs on the shim (LLM-4); smaller
 ones, and MoE expert matmuls, run through mmq, which emulates int8 dot
 products at about 2.4 effective TOPS. Qwen3 8B reads a 5.2k-token prompt in
 Ollama at ~215 tok/s and Qwen2.5-Coder 7B at ~136. A 12,288-token prompt, the
-size of a coding agent's first request, takes 71 s (173 tok/s; unmodified
+size of a large coding context request, takes 71 s (173 tok/s; unmodified
 llama.cpp took 18 minutes, at 11.4 tok/s). MoE prompts: LLM-6.
 
 ## Status
@@ -119,12 +119,13 @@ Open targets in recommended order, then the rest.
 
 | Target | Area | Expected gain | Status |
 | --- | --- | --- | --- |
-| LLM-6 | MoE prompts: expert copies, MUL_MAT_ID, dense parts | expert copies now overlap compute (patch 108: pp2048 295 -> 367 tok/s); MUL_MAT_ID next | Open, first |
-| LLM-8 | MoE generation with experts in system RAM | see LLM-8; 42 ms per token on Qwen3.6 35B-A3B, about 17 ms of it RAM-bound | Open, measured |
-| PT-2 | PyTorch kernels that mix the host's 64-lane warp size with the device's 32 | correctness: wrong results or a GPU reset | Open, audit (no GPU risk) |
+| LLM-6 | MoE prompts: expert copies, MUL_MAT_ID, dense parts | expert copies now overlap compute (patch 108: pp2048 295 -> 367 tok/s); pp2048 SDMA profiling hung GPU; fused dequant unmeasured | Open, first |
+| LLM-8 | MoE generation with experts in system RAM | see LLM-8; 39.1 ms per token on Qwen3.6 35B-A3B; sync removal gains ~0.06 ms; CPU/GPU split pipelining is main lever | Open, measured |
+| PT-2 | PyTorch kernels that mix the host's 64-lane warp size with the device's 32 | correctness: wrong results or a GPU reset | Done: one more kernel fixed (embedding backward); the rest match the CPU |
 | SD-6 | Register-tiled fused attention (and llama.cpp's fp32 FA tile kernel) | SD inference ~12% per step; deep-context prompts | Open |
 | SD-7 | Fused Winograd F(2x2, 3x3) | SD 30-60 ms per step (5-10%), training too | Open |
-| LLM-5 | The unexplained ~7 ms per decoded token | unknown, up to ~19% generation | Open, measure first |
+| LLM-5 | The unexplained gap in decoded tokens | mul_mat_vec_q is at bandwidth bound (~198 GB/s); ~3.4 ms/token recoverable via attn_v and small-kernel fusion | Open, measured |
+| BLAS-4 | Shim: pipelined tiles with fp16 storage, fp32 accumulate | bandwidth-bound shapes (unmeasured); candidate to re-evaluate with fast tiles | Open, candidate |
 | SD-2 | Winograd F(4x4, 3x3) | unmeasured; only after SD-7 | Open |
 | SD-1 | Winograd weight gradients | full fine-tuning and LoCon only | Open |
 | SD-8 | Fused attention backward | training attention time and VRAM | Open, large |
@@ -135,7 +136,6 @@ Open targets in recommended order, then the rest.
 | BLAS-6 | Shim: GEMMs with 1-8 columns (decode-shaped), fp16 and fp32 | Chatterbox TTS token model 88 -> 25.7 ms per token | Done |
 | BLAS-5 | Shim: TN, NT and TT layouts | SD step 557 -> 526 ms, training 3.63 -> 3.37 s/step | Done |
 | BLAS-1, BLAS-2 | Shim: pipelined 64x64 and 32x32 tiles | large NN GEMMs 2.8-3.3 -> 3.9-4.8 TFLOPS | Done |
-| BLAS-4 | Shim: fp16 GEMMs in every layout | slower than rocBLAS | Evaluated, not adopted |
 | SD-3, SD-4, SD-5 | ComfyUI node: fused attention, GroupNorm, GEGLU | SD step 644 -> 526 ms | Done, optional install |
 | PT-1 | PyTorch layer_norm without the group_norm route | correctness (and ~1%) | Done |
 | LLM-1 | llama.cpp SDWA dot product in decode kernels (patch 104) | Q4_K_M generation +6-7% | Done |
@@ -166,6 +166,10 @@ per-part breakdown is recorded.
   321 / 367 tok/s, against a 376 tok/s bound with no copies at all. At
   512-token batches the copy is still longer than the compute it hides
   behind (12 GB/s over PCIe).
+- An MoE pp2048 SDMA profiling run hung the GPU (sdma0 ring timeout), and the
+  item is open.
+- Fused dequantization in the SGEMM load or lowering the patch-106 threshold
+  below 128 is an unmeasured kernel-side lever for expert prefill.
 - MUL_MAT_ID tile choice for gfx803: measured, not a lever. Forcing every
   tile width from 8 to 64 for the expert matmuls (dev-only override) left
   pp2048 within noise: 171-176 tok/s at 1024-token batches for every width,
@@ -194,70 +198,67 @@ backend; Ollama greedy output on qwen3.6:35b.
 ### LLM-8: MoE generation with experts in system RAM
 
 **Where the time goes.** Qwen3.6 35B-A3B Q4_K_M, all experts in host memory
-(`-ncmoe 99`), llama-bench tg: 23.7 tok/s, 42 ms per token.
+(`-ncmoe 99 -lm none`), llama-bench tg64: 25.58 +- 0.95 tok/s, 39.1 ms per token.
 
 | Part | Per token | How it was measured |
 | --- | --- | --- |
-| CPU expert matmuls | ~17 ms | GGML_SCHEDTIME split timer; 0.56 GB of Q4_K expert weights per token is ~33 GB/s, the practical limit of dual-channel DDR4-2800 |
-| GPU splits (attention, DeltaNet, router, shared expert, output head) | ~17 ms | split timer minus the hand-off share below; about 600 nodes per token |
-| GPU-CPU hand-offs (two per layer, 80 per token) | ~8 ms | moving 4 layers' experts to the GPU (`-ncmoe 36`) saves 0.53 ms per layer against 0.42 ms of CPU expert time |
+| CPU expert matmuls | 17.2 ms | GGML_SCHEDTIME split timer (568.0 ms over 33 tokens); 0.56 GB of Q4_K expert weights per token is ~33 GB/s, reaching ~80% of the practical DDR4-2800 read ceiling (39-41 GB/s). At most ~3.5 ms/token is recoverable on the CPU side. |
+| GPU splits (attention, DeltaNet, router, shared expert, output head) | 16.22 ms | Pure GPU kernel execution (1454 launches per token under rocprof, 38.2% of wall time). The split timer reports 27.0 ms for ROCm0 compute because it synchronizes before and after each split, including queue and barrier wait. |
+| Hand-offs and idle gaps | 25.3 ms | GPU idle time (59.7% of wall time), dominated by 40.3 gaps of 0.1-1 ms totaling 17.60 ms (avg 0.44 ms per layer), where the GPU waits for the CPU expert split. Input H2D copies average 13.7 us across 41 calls (0.56 ms). |
 
 What does not change it: CPU threads (4: 21.6, 8: 23.7, 12: 23.0, 16: 18.6
 tok/s), the thread pool's polling (`--poll` 0/50/100), HIP graphs (on: 23.4,
 off: 24.0; they are captured once per split and replayed, 2523 replays to 71
-captures), and `ROC_ACTIVE_WAIT_TIMEOUT` (100 to 10000 us).
+captures), `ROC_ACTIVE_WAIT_TIMEOUT` (100 to 10000 us), and disabling transparent
+huge pages. Enabling hugepages through madvise for the expert buffer is untested
+(unmeasured).
 
-**Open questions.** The GPU splits read about 1 GB of weights per token
-(5 ms at 200 GB/s) plus about 600 small kernels, which test-backend-ops runs
-at 6.7 us each back to back (ADD, 4096 floats); 17 ms is about twice that. A
-kernel timeline would settle where the rest goes, but rocprofv3 on this
-stack aborts in its own shutdown before writing the trace (see Timeline
-below for the profiler that works). The per-node timer (GGML_OPTIME) charges fused groups to their
-first node (sigmoid + mul shows as a 43 us SIGMOID), so its per-op numbers
-are not kernel times.
+**Synchronizations.** The workload issues 183 `hipStreamSynchronize` calls per
+token (20,000 recorded synchronizations over 109 tokens), not ~300. (Over 33
+tokens under tracing, HIP API calls include 6046 `hipStreamSynchronize`, 1723
+`hipEventSynchronize`, and 6009 `hipMemcpyAsync`). Total synchronization wait
+time is 19.7 ms per token, attributed as follows:
 
-**Timeline.** The legacy `rocprof --hip-trace` works on this stack when
-nothing is preloaded (`unset LD_PRELOAD`, so the image's patched HSA runtime
-loads); rocprofv3 aborts at exit even for a trivial PyTorch script, and
-rocprofv2 has no gfx803 counter definitions. In a 1.5 s window of generation
-(about 30 tokens, slowed to 13 tok/s by the tracing), the GPU runs kernels
-33% of the time and sits in barrier packets (waiting for the CPU) 46%. Per
-token, the host makes about 300 `hipStreamSynchronize` calls: 130 right after
-a `hipMemcpyAsync` (90 of them device-to-device copies into pinned host
-buffers, the GPU results the CPU expert split reads), 128 right after another
-synchronize, and 41 after a graph launch (one per GPU split). The minimum is
-about one wait per GPU-to-CPU hand-off (41). Kernel time per token is
-dominated by `mul_mat_vec_q` (about 270 calls, 32 us mean under tracing).
+| Call site | Calls/token | Mean wait | Time/token | Role |
+| --- | --- | --- | --- | --- |
+| `ggml_backend_cuda_synchronize` after `tensor_get_async` | 39.9 | 407.1 us | 16.23 ms | CPU waiting for preceding GPU split output to consume in CPU experts (needed data). |
+| `ggml_backend_sched_synchronize` at token end | 1.0 | 2296 us | 2.30 ms | Waiting for logits D2H transfer (needed data). |
+| Buffer set tensor path (`tensor_copy` fallback) | 41.9 | 23.1 us | 0.97 ms | Synchronous H2D copy of CPU split results back to GPU. Candidate for async stream ordering. |
+| User input tensors (tokens, positions, masks) | 7.0 | 16.4 us | 0.115 ms | Small host-to-device inputs. |
+| Redundant stream synchronizations (4 call sites) | 93.8 | 0.3-1.1 us | 0.06 ms | Idle-stream syncs: 42.9 at 1.09 us, 42.9 at 0.30 us, 7.0 at 0.42 us, 1.0 at 0.9 us. |
 
-**GPU kernels by shape.** With `GGML_CUDA_DISABLE_GRAPHS=1` every kernel goes
-through `hipLaunchKernel`, whose trace record carries the template (quant
-type) and grid, so each `mul_mat_vec_q` can be matched to its weight
-(rows = grid x 2 for the two-row kernel). Per generated token:
+Of the 19.7 ms synchronization wait, 18.5 ms is the CPU waiting for GPU compute
+to complete. Removing every redundant synchronization recovers only 0.06 ms
+per token (0.15% of token time).
 
-| Weight | Calls | Each | Effective bandwidth |
-| --- | --- | --- | --- |
-| output head, 248320 x 2048 q6_K | 1 | 2.09 ms | ~200 GB/s |
-| 8192 x 2048 | 43 | 63 us | 150-220 GB/s |
-| 4096 x 2048 | 32 | 37 us | ~130 GB/s |
-| 2048 x 512 (shared-expert down) and 2048 x 4096 | 85 | 22 us | the K=512 ones ~27 GB/s |
-| 512 x 2048 (shared-expert gate, up) | 64 | 15 us | ~40 GB/s |
-| router, 256 x 2048 fp32 (`mul_mat_vec_f`) | 43 | 21 us | ~100 GB/s |
+**GPU kernels by shape.** Under tracing without graphs, kernel execution
+per token is:
+- `mul_mat_vec_q`: 8.53 ms across 271 launches
+- `mul_mat_vec_f`: 1.07 ms
+- `rms_norm`: 0.97 ms across 191 launches
+- `gated_delta_net`: 0.86 ms
+- `quantize_q8_1`: 0.83 ms across 271 launches
+- `get_rows`: 0.65 ms
+- `bin_bcast`: 0.60 ms across 140 launches
+- `topk_moe`: 0.57 ms
+- `flash_attn` decode: 0.41 ms
+- `cpy`: 0.29 ms
 
-The large weights run near the card's bandwidth; the shared expert's small
-matrices do not: each workgroup has almost nothing to do, so a launch costs
-15-22 us for under 1 MB. A small-matrix variant (more rows per workgroup
-when rows x K is small) or one launch for gate and up would recover most of
-an estimated 1.5-2 ms per token (3-5%); the fp32 router about 0.5 ms more.
-`gated_delta_net` (30 per token, 29 us, ~4 MB of state each) is at about
-140 GB/s.
+Large weight matrices run near memory bandwidth: the output head (248320 x 2048
+q6_K) takes 2.09 ms (~200 GB/s) and 8192 x 2048 takes 63 us (150-220 GB/s).
+Small shared-expert matrices do not: 2048 x 512 (down) takes 22 us (~27 GB/s)
+and 512 x 2048 (gate, up) takes 15 us (~40 GB/s). Small-matrix variants (more
+rows per workgroup) or combining gate and up could recover an estimated
+1.5-2 ms per token (3-5%); the fp32 router (256 x 2048 at 21 us) about 0.5 ms
+more.
 
-**Levers.** Done: patch 109 copies a CPU split's GPU inputs with one wait
-instead of one per tensor (tg128 23.8 -> 24.4 tok/s). The back-to-back
-duplicate synchronizations are nearly free (an idle-stream synchronize
-costs about 1 us); a small copy or kernel plus its wait costs 24-29 us.
-Each layer whose experts stay in VRAM saves about 0.53 ms per token, so VRAM
-taken by other programs costs generation speed directly (with Chatterbox
-loaded, Ollama keeps 3.2 instead of 4.4 GiB of this model on the card).
+**Levers.** Removing redundant synchronizations is not a lever (~0.06 ms/token).
+Converting the synchronous CPU-to-GPU return copy (0.97 ms) to asynchronous
+stream ordering bounds recoverable time to 0.97 ms (estimate ~0.5 ms). The token
+decomposes into ~17 ms GPU compute, ~17 ms CPU compute, and ~8 ms serial
+hand-off. The primary lever is overlapping CPU and GPU execution within or
+across layers (pipelining the GPU shared expert or attention while the CPU
+computes routed experts), not synchronization removal.
 
 ### PT-2: audit PyTorch's warp-size mixing
 
@@ -271,7 +272,9 @@ binary prefix scan behind `torch.topk`
 which wrote top-k results to wrong slots and, through its assert, hung the GPU
 until the driver reset it; and index_put with accumulate
 ([`gfx803-index-put-warp-size.patch`](../rocm6.4.4/patches/pytorch/gfx803-index-put-warp-size.patch)),
-which dropped half of the repeated indices' sums. group_norm shows the
+which dropped half of the repeated indices' sums; and embedding backward
+([`gfx803-embedding-backward-row-width.patch`](../rocm6.4.4/patches/pytorch/gfx803-embedding-backward-row-width.patch)),
+which returned wrong weight gradients and faulted on some shapes. group_norm shows the
 opposite dependency: its weight and bias gradients need the 32, so the macro
 itself cannot change. FINDINGS section 5 describes all of them.
 
@@ -293,9 +296,18 @@ also call `at::cuda::warp_size()`:
 - `aten/src/ATen/native/cuda/EmbeddingBag.cu`
 - `aten/src/ATen/native/cuda/DepthwiseConv3d.cu`
 
-`layer_norm_kernel.cu` and the two index_put launchers in `Indexing.cu` are
-done; `TensorTopK.cu`'s single-block path is done through `ScanUtils.cuh`,
-and its multi-block path (`mbtopk`) is not yet read.
+`layer_norm_kernel.cu`, the two index_put launchers in `Indexing.cu` and
+`embedding_backward_feature_kernel` in `Embedding.cu` are done. A read of all
+14 files named nine suspect kernels; a GPU-against-CPU sweep (float64
+reference, fp32 and fp16, shapes chosen to reach each kernel's path) found
+only the embedding one wrong. Softmax and log-softmax forward and backward
+(persistent and block paths), embedding renorm, embedding_bag's
+per-sample-weights backward, depthwise conv2d's weight gradient and top-k's
+blockwise counts all match the reference. A second pass over the other 18
+files in `aten/` that use either value found five more suspects (top-k's
+multi-block path, sparse `coalesce` with dense dimensions above 32, `sort` on
+33 to 128 elements, `multinomial`'s row normalization, and the top-k scan the
+patch above fixes); all match the reference on the GPU.
 
 Mixing the two is not a bug by itself: a kernel whose shuffles use offsets
 below 32 and whose shared memory is sized from `blockDim` treats each half of
@@ -383,25 +395,82 @@ CPU float64, the 3-image VAE latent check, the UNet check, a training run.
 
 ### LLM-5: the unexplained part of a decoded token
 
-**Why.** About 7 of the 37.6 ms per token of Qwen3 8B at a 5.2k-token context
-are not explained by weight and KV reads (see "Where the time goes"). HIP
-graphs are already in use: `GGML_HIP_GRAPHS` defaults to ON in ggml-hip at the
-pinned version, the only architecture check that disables graphs applies to
-NVIDIA GPUs older than Volta, and generation with
-`GGML_CUDA_DISABLE_GRAPHS=1` is the same as without it (`llama-bench` tg128:
-30.6 against 30.5 tokens/s). So the gap is GPU time, or synchronization, not
-per-launch CPU cost.
+**Why.** On Qwen3 8B Q4_K_M (4.86 GiB weights excluding embedding table),
+generation at 5120-token context depth measures 27.81 +- 0.09 tok/s (35.96 ms
+per token), and 31.16 +- 0.09 tok/s (32.09 ms per token) at zero context depth.
+The 5120-token context adds 3.87 ms per token. Reading weights and KV cache at
+the 200 GB/s memory bandwidth bound accounts for 26.3 ms (24.3 ms for 4.87 GB of
+weights, 2.0 ms for 0.40 GB of q8_0 KV cache), leaving a ~9.6 ms gap to the
+35.96 ms wall time.
 
-**Approach.** Find where the time goes before choosing a fix: time the
-per-token ops in isolation with `test-backend-ops perf` (`RMS_NORM`, `ROPE`,
-`SET_ROWS` / `CPY` for the KV cache, `GLU`, `ADD`, `SOFT_MAX`, and
-`FLASH_ATTN_EXT` at the decode shapes and context lengths), multiply by their
-count per token, and compare with the gap. Small ops whose time is dominated
-by launch and tail effects, rather than bytes moved, are candidates for fusion
-into their neighbours.
+**Bandwidth measurements.**
+- **Weights:** Streaming the 4.87 GB of weights (5.218 GB model file minus the
+  0.35 GB Q4_K token embedding table, where only one row is fetched) takes 24.3 ms
+  at 200 GB/s. Measured `mul_mat_vec_q` takes 24.54 ms per token (17.76 ms Q4_K
+  across 162 launches, 6.77 ms Q6_K across 19 launches), reaching ~198 GB/s—within
+  ~0.2 ms of the hardware bandwidth ceiling.
+- **KV cache:** Reading the q8_0 KV cache at 5120 depth (36 layers x 8 KV heads x
+  128 channels x 2 tensors x 5120 tokens x 1.0625 bytes = 0.40 GB) takes 2.0 ms at
+  200 GB/s. Measured flash attention decode takes 4.42 ms per token (4.19 ms
+  `flash_attn_gcn4_decode_q8_0` across 36 launches, 0.23 ms `flash_attn_combine_results`
+  across 36 launches), running at ~90 GB/s effective, 2.4 ms above the bandwidth
+  bound.
 
-**Expected gain.** Unknown; at most the ~7 ms (~19% generation) if all of it
-turned out to be avoidable.
+**Where the ~9.6 ms gap goes.** Without HIP graphs under profiling, wall time is
+37.16 ms per token (26.91 tok/s), kernel execution sums to 34.07 ms, and idle
+between kernels is 3.09 ms (8.3%) across 834 launches per token. Comparing this
+breakdown to the 26.3 ms bandwidth bound resolves the gap:
+
+| Component | Time/token | Launches/token | Mean | Role |
+| --- | --- | --- | --- | --- |
+| `flash_attn` decode excess above KV bound | 2.4 ms | 36 | 116.3 us | Kernel runs at ~90 GB/s effective instead of 200 GB/s. |
+| `mul_mat_vec_f` (attn_v) | 2.38 ms | 36 | 66.0 us | Unquantized F16 `blk.*.attn_v.weight` [4096 x 1024] in all 36 layers (8.4 MB/layer, 302 MB/token at ~127 GB/s). |
+| Small kernels (<10 us mean) | 2.97 ms | 581 | 5.1 us | Fixed launch and tail latency across 6 small-kernel families. |
+| `mul_mat_vec_q` excess above bound | 0.2 ms | 181 | 135.6 us | Difference between measured ~198 GB/s and 200 GB/s bound. |
+| Residual idle between kernels | ~1.9 ms | - | - | 3.09 ms idle without graphs, reduced by 1.2 ms when HIP graphs are enabled. |
+
+The small-kernel total (2.97 ms across 581 launches) breaks down into:
+- `rms_norm_f32`: 73 launches, 0.65 ms (mean 8.9 us)
+- `quantize_q8_1`: 181 launches, 0.65 ms (mean 3.6 us)
+- `rms_norm_mul_rope_f32`: 72 launches, 0.55 ms (mean 7.7 us)
+- `k_set_rows_quant`: 72 launches, 0.52 ms (mean 7.2 us)
+- `fwht_cuda`: 144 launches, 0.35 ms (mean 2.4 us)
+- `flash_attn_combine_results`: 36 launches, 0.23 ms (mean 6.5 us)
+
+KV Hadamard rotation (144 `fwht_cuda` launches rotating Q, K, V, and attention
+output) costs ~0.2 ms per token: generation measures 27.58 tok/s with rotation
+enabled versus 27.75 tok/s with `LLAMA_ATTN_ROT_DISABLE=1`.
+
+**Levers and expected gain.**
+- **Requantize attn_v:** Reading `attn_v` at 200 GB/s takes 1.5 ms; requantizing
+  it to q8_0 (~160 MB) would take ~0.8 ms, recovering ~1.5 ms per token (~4%
+  generation). Alternatively, optimizing `mul_mat_vec_f` toward 200 GB/s would
+  recover ~0.9 ms per token.
+- **Kernel fusion:** Sharing quantization across matmuls that read the same
+  activation (181 launches, 0.65 ms), fusing `rms_norm` with `set_rows` (217
+  launches, 1.72 ms), fusing `fwht` with rope/set_rows (144 launches, 0.35 ms),
+  and avoiding split-K combine at this depth (36 launches, 0.23 ms). Fusing
+  roughly one-third of small-kernel time recovers ~1.0 ms.
+- Requantizing `attn_v` combined with small-kernel fusion yields an estimated
+  recoverable time of ~3.4 ms per token (~9% generation speedup). Tuning flash
+  attention decode closer to 200 GB/s offers up to 2.4 ms more. All gains are
+  unmeasured.
+
+### BLAS-4: pipelined tiles with fp16 storage and fp32 accumulate
+
+**Why.** Routing generic fp16 GEMMs to the shim was previously rejected because
+rocBLAS ran those layouts at 3.1-3.2 TFLOPS while the shim's older unpipelined
+kernels achieved 2.5-2.6 TFLOPS. With pipelined 64x64 and 32x32 tiles (BLAS-1,
+BLAS-2) now achieving 3.9-4.8 TFLOPS in fp32, the premise for evaluating fp16
+storage with fp32 accumulation re-opens.
+
+**Mechanism and expected gain.** Polaris (gfx803) has no packed fp16 math
+instructions (`v_pk_*`); fp16 arithmetic executes at the same rate as fp32.
+Holding inputs in fp16 storage and accumulating in fp32 registers halves global
+memory traffic and LDS footprint without altering arithmetic throughput. The
+gain is therefore restricted to memory bandwidth-bound GEMM shapes, with no
+benefit expected on compute-bound square matrices. Candidate to re-evaluate per
+shape (unmeasured).
 
 ### SD-2: Winograd F(4x4, 3x3)
 
@@ -458,9 +527,18 @@ Measured, and not worth pursuing unless something changes:
   of every workload measured here.
 - **HIP graphs for decode.** Already on by default and in use on gfx803;
   turning them off changes nothing measurable (LLM-5).
-- **Routing fp16 GEMMs in every layout to the shim** (BLAS-4 below).
+- **Routing generic fp16 GEMMs in every layout to the unpipelined shim.**
+  Slower than rocBLAS (evaluated under BLAS-4; pipelined tiles with fp16 storage
+  are re-opened as an open candidate).
 - **Redefining `C10_WARP_SIZE` for gfx8** (PT-1 below): a global macro change
   breaks kernels written for the old value.
+- **Fused attention in gradient-checkpointed SD training.** sd-scripts uses
+  non-reentrant checkpointing (`checkpoint(..., use_reentrant=False)`), where
+  the first forward pass runs with gradients enabled. The attention hook skips
+  tensors requiring gradients, so forward-only fused attention cannot be applied
+  during training without a fused backward implementation (SD-8).
+- **LoRA `addmm` with beta=1 fusion.** Accounts for ~360 launches of ~10 us each
+  (~4 ms out of a 3.4 s training step, ~0.1%), which does not justify a patch.
 
 ## Done
 
@@ -640,8 +718,9 @@ rocBLAS's fp16 kernels are slow on gfx803 only for op(A) = N, op(B) = T, which
 the shim already takes. Routing the other three layouts to the shim's fp16
 path made an SD 1.5 fp16 UNet step slower (633.5 -> 675.4 ms; rocBLAS ran
 those layouts at 3.1-3.2 TFLOPS against the shim's 2.5-2.6 at the time), so
-the shim leaves them to rocBLAS. The fast tiles are fp32-only; if they get
-fp16 variants, this is worth re-measuring.
+the shim leaves them to rocBLAS. The fast tiles are fp32-only; pipelined tiles
+with fp16 storage and fp32 accumulation are re-opened as an open candidate for
+bandwidth-bound shapes.
 
 ### SD-3, SD-4, SD-5: ComfyUI node
 
@@ -849,3 +928,4 @@ Run what the change can affect, on the image's own binaries:
   4096-wide benchmark measures DRAM channel conflicts, not the kernel. A tile
   order that won on SD's shapes lost 15-55% on those. Always include padded
   and real-model leading dimensions next to the square case.
+
