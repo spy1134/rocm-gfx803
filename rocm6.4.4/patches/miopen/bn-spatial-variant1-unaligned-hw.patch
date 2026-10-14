@@ -1,0 +1,210 @@
+MIOpen (pinned tag rocm-6.4.4): use scalar loads in spatial BatchNorm
+variant 1 when H*W is not a multiple of 4, and fix the backward
+recomputed-stats remainder offset.
+
+WHY
+---
+MIOpen's spatial BatchNorm training forward (BnFwdTrainingSpatial,
+src/kernels/MIOpenBatchNormFwdTrainSpatial.cl) and backward
+(BnBwdTrainingSpatialSingle, src/kernels/MIOpenBatchNormBwdSpatial.cl)
+select MIO_BN_VARIANT=1 whenever H*W > 1024 and N*H*W < 32M (and for
+512 < H*W <= 1024 when N >= 32). In NCHW layout, variant 1 steps a
+linear index k across N*H*W by 4 elements per thread (k = lid << 2,
+stride GRPRD = 4*MIO_BN_GRP0), decomposes nidx = k / MIO_BN_HW and
+hwidx = k - nidx * MIO_BN_HW, and reads _FLOAT4 vectors from
+nidx * MIO_BN_CHW + grpid * MIO_BN_HW + hwidx. Backward uses this
+vectorized loop for dscale/dbias at every variant-1 shape, and for
+recomputed mean/variance (MIO_BN_USESAVED == 0) when MIO_BN_HW >= 4096;
+forward training uses it for mean/variance when MIO_BN_HW >= 4096.
+
+When MIO_BN_HW is not divisible by 4, stepping k by 4 across the
+batch-spatial product crosses the end of a channel plane:
+- The last _FLOAT4 read of batch plane nidx starts at
+  hwidx = MIO_BN_HW - (MIO_BN_HW % 4) and reads 4 - (MIO_BN_HW % 4)
+  elements past the end of channel grpid into channel grpid + 1 of the
+  same batch item (for C > 1).
+- The next multiple of 4 lands in batch plane nidx + 1 at
+  hwidx = (4 - ((nidx + 1) * MIO_BN_HW) % 4) % 4, skipping the first
+  1 to 3 elements of that plane and misaligning every subsequent
+  _FLOAT4 load in that plane.
+- In the remainder block (MIO_BN_REM4), threads with
+  remkey >= MIO_BN_NHW compute nidx >= MIO_BN_N; the only bounds check
+  is index < MIO_BN_NCHW - 3, and at the final valid elements of the
+  last batch plane a partial tail < 4 elements fails that check and is
+  dropped entirely (which is why C = 1 with N = 1 or 2 also fails).
+
+In addition, MIOpenBatchNormBwdSpatial.cl's MIO_BN_USESAVED == 0
+remainder block computes remkey = lid + MIO_BN_LESS4 instead of
+(lid << 2) + MIO_BN_LESS4 (guarded by if(lid < MIO_BN_REM4)), whereas
+MIOpenBatchNormFwdTrainSpatial.cl and the dscale/dbias loop in the same
+file use (lid << 2) + MIO_BN_LESS4. Whenever MIO_BN_USESAVED is 0,
+MIO_BN_HW >= 4096, and MIO_BN_REM4 > 0, threads read overlapping
+_FLOAT4 vectors shifted by 1 float instead of 4.
+
+Measured on an RX 590 (fp32 vs float64 CPU reference, PyTorch
+F.batch_norm with training=True):
+- Backward, NCHW: 16 of 81 shapes (N in {1,2,4}, C in {1,16,64}, H=W in
+  {8,16,31,32,33,48,64,65,100}) are wrong, every one at H=W=33
+  (HW=1089) or H=W=65 (HW=4225); dscale and dbias relative errors are
+  1.3e-2 to 1.4e-1. H=W of 8, 16, 31, 32, 48, 64, and 100 are clean.
+  Standalone reproduction without PyTorch:
+    MIOpenDriver bnorm -n 2 -c 64 -H 33 -W 33 -m 1 --forw 0 -b 1 -r 1 --layout NCHW -V 1
+  gives dscale error 0.062 (vs 0.0024 at 32x32) and dbias error 1.2e-3
+  (vs 5.5e-8 at 32x32), while the driver still prints "verification
+  passed" because its built-in tolerance is loose.
+- Forward training, NCHW: 2x16x65x65 (HW=4225 >= 4096) has output error
+  4.0e-3 and running-stat error ~1e-4; 1x16x65x65 has 2.4e-3;
+  2x3x129x129 has 7.3e-4; 2x64x33x33 (HW=1089 < 4096, already on the
+  scalar path in forward) and all HW % 4 == 0 shapes are at ~1e-6.
+
+This is a generic index-arithmetic bug in architecture-independent
+OpenCL kernel source, not specific to gfx803, and is still present
+verbatim on upstream release/rocm-rel-7.1.
+
+WHAT
+----
+1. In both MIOpenBatchNormBwdSpatial.cl and
+   MIOpenBatchNormFwdTrainSpatial.cl under MIO_BN_VARIANT == 1, gate the
+   NCHW _FLOAT4 reduction paths on (MIO_BN_HW % 4 == 0). When
+   MIO_BN_HW % 4 != 0, use the existing scalar per-element loops
+   (stepping by MIO_BN_GRP0 up to MIO_BN_LESS with the MIO_BN_REM tail
+   guarded by index < MIO_BN_NCHW) with the NCHW element index
+   nidx * MIO_BN_CHW + chwid + hwidx. NHWC and MIO_BN_HW % 4 == 0
+   compilations are unchanged.
+2. In MIOpenBatchNormBwdSpatial.cl's MIO_BN_USESAVED == 0 vectorized
+   remainder block, compute remkey = (lid << 2) + MIO_BN_LESS4 to match
+   the 4-element stride of the _FLOAT4 load, as
+   MIOpenBatchNormFwdTrainSpatial.cl already does.
+
+REAL-HARDWARE VERIFICATION (RX 590, this image)
+Backward: 0 of the same 81 shapes wrong. Forward training at 1x16x65x65,
+2x16x65x65, 4x16x65x65 and 2x3x129x129: output error 6e-7 to 1.2e-6,
+running statistics below 1e-7. The MIOpenDriver command above gives
+dscale 0.0028 and dbias 6.1e-8 at 33x33, the same as at 32x32. A
+GPU-against-CPU sweep of BatchNorm forward and backward (MIOpen and
+PyTorch's native kernel, NCHW and NHWC, fp32 and fp16, six shapes) has
+no failures. Forward plus backward time is unchanged at 65x65 and
+129x129 (0.471 against 0.474 ms, 1.875 against 1.891 ms). The image's
+conv, SD1.5 UNet, rocPRIM and top-k checks and a 20-step LoRA training
+run give the same results as before the patch.
+
+diff --git a/src/kernels/MIOpenBatchNormBwdSpatial.cl b/src/kernels/MIOpenBatchNormBwdSpatial.cl
+index a018d35..4731fec 100644
+--- a/src/kernels/MIOpenBatchNormBwdSpatial.cl
++++ b/src/kernels/MIOpenBatchNormBwdSpatial.cl
+@@ -311,7 +311,9 @@ MIOpenBatchNormBwdSpatial(const __global _FLOAT* __restrict x_in,
+ #if(MIO_BN_USESAVED == 0)
+     //==== CALC MEAN and VARIANCE ONCE AGAIN =======================
+     _FLOAT_PREC variance = (_FLOAT_PREC)0.;
+-#if !MIO_LAYOUT_NHWC && MIO_BN_HW >= 4096
++    // GFX803_BN_VARIANT1_UNALIGNED_HW: _FLOAT4 loads across NHW require each
++    // channel plane MIO_BN_HW to be a multiple of 4 so loads do not straddle planes.
++#if !MIO_LAYOUT_NHWC && MIO_BN_HW >= 4096 && (MIO_BN_HW % 4 == 0)
+     _FLOAT4 read4;
+ #if(MIO_BN_N > MIO_BN_LOOP_UNROLL_MAXN)
+     __attribute__((opencl_unroll_hint(4))) for(unsigned int k = lid << 2; k < MIO_BN_LESS4;
+@@ -336,24 +338,21 @@ MIOpenBatchNormBwdSpatial(const __global _FLOAT* __restrict x_in,
+     }
+ 
+ #if(MIO_BN_REM4)
+-    if(lid < MIO_BN_REM4)
++    unsigned int remkey = (lid << 2) + MIO_BN_LESS4;
++    nidx                = remkey / MIO_BN_HW;
++    hwidx               = remkey - (nidx * MIO_BN_HW);
++    index               = nidx * MIO_BN_CHW + chwid + hwidx;
++    if(index < (MIO_BN_NCHW - 3))
+     {
+-        unsigned int remkey = lid + MIO_BN_LESS4;
+-        nidx                = remkey / MIO_BN_HW;
+-        hwidx               = remkey - (nidx * MIO_BN_HW);
+-        index               = nidx * MIO_BN_CHW + chwid + hwidx;
+-        if(index < (MIO_BN_NCHW - 3))
+-        {
+-            read4 = *((const global _FLOAT4*)(x_in + index));
+-            mean += FLOAT2FLOATPREC(read4.x);
+-            mean += FLOAT2FLOATPREC(read4.y);
+-            mean += FLOAT2FLOATPREC(read4.z);
+-            mean += FLOAT2FLOATPREC(read4.w);
+-            variance = mad(FLOAT2FLOATPREC(read4.x), FLOAT2FLOATPREC(read4.x), variance);
+-            variance = mad(FLOAT2FLOATPREC(read4.y), FLOAT2FLOATPREC(read4.y), variance);
+-            variance = mad(FLOAT2FLOATPREC(read4.z), FLOAT2FLOATPREC(read4.z), variance);
+-            variance = mad(FLOAT2FLOATPREC(read4.w), FLOAT2FLOATPREC(read4.w), variance);
+-        }
++        read4 = *((const global _FLOAT4*)(x_in + index));
++        mean += FLOAT2FLOATPREC(read4.x);
++        mean += FLOAT2FLOATPREC(read4.y);
++        mean += FLOAT2FLOATPREC(read4.z);
++        mean += FLOAT2FLOATPREC(read4.w);
++        variance = mad(FLOAT2FLOATPREC(read4.x), FLOAT2FLOATPREC(read4.x), variance);
++        variance = mad(FLOAT2FLOATPREC(read4.y), FLOAT2FLOATPREC(read4.y), variance);
++        variance = mad(FLOAT2FLOATPREC(read4.z), FLOAT2FLOATPREC(read4.z), variance);
++        variance = mad(FLOAT2FLOATPREC(read4.w), FLOAT2FLOATPREC(read4.w), variance);
+     }
+ #endif
+ #else
+@@ -420,6 +419,42 @@ MIOpenBatchNormBwdSpatial(const __global _FLOAT* __restrict x_in,
+ 
+ #endif
+ 
++#if !MIO_LAYOUT_NHWC && (MIO_BN_HW % 4 != 0)
++    _FLOAT dyRead;
++    _FLOAT xread;
++    _FLOAT_PREC xhat_tmp;
++#if(MIO_BN_N > MIO_BN_LOOP_UNROLL_MAXN)
++    __attribute__((opencl_unroll_hint(4))) for(unsigned int k = lid; k < MIO_BN_LESS;
++                                               k += MIO_BN_GRP0)
++#else
++    __attribute__((opencl_unroll_hint(2))) for(unsigned int k = lid; k < MIO_BN_LESS;
++                                               k += MIO_BN_GRP0)
++#endif
++    {
++        nidx     = k / MIO_BN_HW;
++        hwidx    = k - (nidx * MIO_BN_HW);
++        index    = nidx * MIO_BN_CHW + chwid + hwidx;
++        xread    = *((const global _FLOAT*)(x_in + index));
++        dyRead   = *((const global _FLOAT*)(dy_in + index));
++        xhat_tmp = (FLOAT2FLOATPREC(xread) - mean) * invVariance;
++        db += FLOAT2FLOATPREC(dyRead);
++        ds = mad(xhat_tmp, FLOAT2FLOATPREC(dyRead), ds);
++    }
++#if(MIO_BN_REM)
++    unsigned int remkey = lid + MIO_BN_LESS;
++    nidx                = remkey / MIO_BN_HW;
++    hwidx               = remkey - (nidx * MIO_BN_HW);
++    index               = nidx * MIO_BN_CHW + chwid + hwidx;
++    if(index < MIO_BN_NCHW)
++    {
++        xread    = *((const global _FLOAT*)(x_in + index));
++        dyRead   = *((const global _FLOAT*)(dy_in + index));
++        xhat_tmp = (FLOAT2FLOATPREC(xread) - mean) * invVariance;
++        db += FLOAT2FLOATPREC(dyRead);
++        ds = mad(xhat_tmp, FLOAT2FLOATPREC(dyRead), ds);
++    }
++#endif
++#else
+ #if MIO_LAYOUT_NHWC
+     _FLOAT dyRead;
+     _FLOAT xread;
+@@ -502,6 +537,7 @@ MIOpenBatchNormBwdSpatial(const __global _FLOAT* __restrict x_in,
+ #endif
+     }
+ 
++#endif
+ #endif
+     barrier(CLK_GLOBAL_MEM_FENCE);
+ 
+diff --git a/src/kernels/MIOpenBatchNormFwdTrainSpatial.cl b/src/kernels/MIOpenBatchNormFwdTrainSpatial.cl
+index ef69963..4aae93e 100644
+--- a/src/kernels/MIOpenBatchNormFwdTrainSpatial.cl
++++ b/src/kernels/MIOpenBatchNormFwdTrainSpatial.cl
+@@ -260,7 +260,9 @@ MIOpenBatchNormFwdTrainSpatial(const __global _FLOAT* __restrict in,
+     }
+     barrier(CLK_LOCAL_MEM_FENCE);
+ 
+-#if !MIO_LAYOUT_NHWC && MIO_BN_HW >= 4096
++    // GFX803_BN_VARIANT1_UNALIGNED_HW: _FLOAT4 loads across NHW require each
++    // channel plane MIO_BN_HW to be a multiple of 4 so loads do not straddle planes.
++#if !MIO_LAYOUT_NHWC && MIO_BN_HW >= 4096 && (MIO_BN_HW % 4 == 0)
+     _FLOAT4 read4;
+     __attribute__((opencl_unroll_hint(2))) for(unsigned int k = lid << 2; k < MIO_BN_LESS4;
+                                                k += GRPRD)

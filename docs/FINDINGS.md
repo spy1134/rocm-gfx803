@@ -80,6 +80,7 @@ run with wrong numbers, not a crash. "It runs" was never taken as evidence.
 | Shim large GEMMs at 2.5-3 TFLOPS | Faster (3.8-4.8 TFLOPS, pipelined tiles) | 1 | same |
 | Binary Winograd convs corrupt memory and hang the GPU | Fixed (solvers disabled) | 2 | `patches/miopen/winograd-bin-gfx803-disable.patch` |
 | No fast 3x3 convolution after that | Fixed (new solver) | 2 | `patches/miopen/winograd-f2x3-hip-gfx803.patch` |
+| BatchNorm training wrong when H*W is not a multiple of 4 (generic MIOpen bug) | Fixed | 2 | `patches/miopen/bn-spatial-variant1-unaligned-hw.patch` |
 | fp16 3x3 convolutions slow (GEMM only) | Fixed (same solver, fp16) | 8 | same |
 | rocBLAS fp16 N/T GEMMs 15-25x slow | Fixed (shim fp16 route) | 8 | `patches/sgemm-shim-batched/` |
 | bf16 reported as supported (no bf16 hardware) | Checked: correct; convs 1.7x slower than fp16 | 8 | none needed |
@@ -269,6 +270,23 @@ them. After installing a build with it, delete MIOpen's user find-db
 
 **Check.** Encode a few images with the SD 1.5 VAE on GPU and CPU and compare
 `latent_dist.std`, not only the mean: the corruption showed only in the std.
+
+**BatchNorm training at H*W not a multiple of 4.** MIOpen's spatial
+BatchNorm (variant 1, NCHW: H*W above 1024 for backward, 4096 or more for
+forward training) reads its input four elements at a time across N*H*W.
+When H*W is not a multiple of 4 those reads cross from one channel plane
+into the next, so the statistics and gradients include elements of the
+wrong channel and miss the first elements of each plane. At 33x33 and
+65x65 the weight and bias gradients were off by 1.3e-2 to 1.4e-1 (fp32,
+against a float64 reference); forward training at 65x65 and 129x129 was
+off by up to 4e-3. `MIOpenDriver bnorm ... -V 1` shows the error yet
+reports "verification passed", because its tolerance is loose. The bug is
+in the kernels' index arithmetic, not gfx803-specific, and is unchanged on
+upstream's `release/rocm-rel-7.1`.
+[`bn-spatial-variant1-unaligned-hw.patch`](../rocm6.4.4/patches/miopen/bn-spatial-variant1-unaligned-hw.patch)
+uses scalar reads for those shapes; aligned shapes and NHWC compile to the
+same code as before. After it the GPU matches the reference at every
+tested shape, at the same speed.
 
 ## 3. Host crashes under load, and what was ruled out
 

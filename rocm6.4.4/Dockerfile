@@ -475,6 +475,13 @@ RUN if [ "$ENABLE_REDUCE_BOUND" = "1" ]; then \
 COPY patches/miopen/winograd-f2x3-hip-gfx803.patch patches/miopen/winograd-f2x3-hip-gfx803.sh /miopen-patches/
 RUN sh /miopen-patches/winograd-f2x3-hip-gfx803.sh /miopen-src
 
+# Spatial BatchNorm training (variant 1, NCHW) reads four elements at a time
+# across N*H*W; when H*W is not a multiple of 4 those reads cross channel
+# planes and the statistics and gradients are wrong. A generic MIOpen bug,
+# still present upstream; the patch uses scalar reads for those shapes.
+COPY patches/miopen/bn-spatial-variant1-unaligned-hw.patch patches/miopen/bn-spatial-variant1-unaligned-hw.sh /miopen-patches/
+RUN sh /miopen-patches/bn-spatial-variant1-unaligned-hw.sh /miopen-src
+
 # -DMIOPEN_USE_COMPOSABLEKERNEL/MLIR/HIPBLASLT=Off: none of the three has
 # ever supported gfx8 (see top-of-file comment); Off here matches the
 # filtered requirements.txt above. -DMIOPEN_BUILD_DRIVER/BUILD_TESTING=Off: neither ships in the

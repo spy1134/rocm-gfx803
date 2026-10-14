@@ -84,6 +84,8 @@ Without this project's changes, on these cards:
   of 0.1-0.2).
 - MIOpen's binary Winograd convolutions corrupted memory and hung the GPU under
   sustained load, sometimes taking the machine down with it.
+- MIOpen's BatchNorm training returned wrong statistics and gradients whenever
+  a feature map's height times width was not a multiple of 4.
 - PyTorch's `layer_norm`, `index_put`, `topk`, embedding backward, `nonzero`,
   boolean-mask indexing, `unique` and large sorts returned wrong results, failed
   to launch, or hung the GPU. The cause in several cases is one warp-size
