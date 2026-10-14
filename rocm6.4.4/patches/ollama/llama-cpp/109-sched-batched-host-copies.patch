@@ -1,0 +1,84 @@
+llama.cpp (as fetched by Ollama v0.35.1, llama.cpp b11232, applied after
+108): a split that runs in host memory waits for each of its GPU inputs
+separately. Not gfx803-specific code; measured on gfx803.
+
+WHY
+---
+With MoE experts in system RAM, every layer of token generation hands the
+hidden state, the router weights and the chosen expert ids from the GPU to
+the CPU expert split. The scheduler copies each one with a synchronous
+copy, so every tensor costs a full GPU round trip: on an RX 590 a 4 KB
+device-to-host copy plus its wait takes about 25 us, and a HIP trace of
+Qwen3.6 35B-A3B generation showed about 130 such copy-and-wait pairs per
+token.
+
+The copies into a host-memory split are now queued on the source backend's
+stream, and the split waits once for all of them before it runs. Inputs
+the queued path cannot take (non-contiguous tensors, a source backend
+without asynchronous reads) keep the synchronous copy.
+
+VERIFIED ON REAL HARDWARE (RX 590, llama-bench, Qwen3.6 35B-A3B heretic
+Q4_K_M, -ncmoe 99, tg128, two runs each): 23.9 / 23.7 -> 24.6 / 24.3
+tok/s. llama-perplexity with 16-token batches (the generation path, no op
+offload), 8 chunks of 512: PPL 13.3639 before and after, mean KLD 0, same
+top token 99.95% (one near-tie in about 2000; run-to-run noise on this
+build is the same size).
+
+--- a/ggml/src/ggml-backend.cpp	2026-10-11 16:12:52.058525105 -0700
++++ b/ggml/src/ggml-backend.cpp	2026-10-11 16:13:00.932451112 -0700
+@@ -1873,6 +1873,12 @@
+             }
+         }
+ 
++        // GPU results a host-memory split reads are queued and waited for once, after the loop:
++        // each copy-and-wait is a GPU round trip (about 25 us on gfx803), and a MoE layer's CPU
++        // expert split reads several small tensors
++        ggml_backend_t pending_get[GGML_SCHED_MAX_BACKENDS];
++        int n_pending_get = 0;
++
+         // copy the input tensors to the split backend
+         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
+@@ -1992,18 +1998,40 @@
+                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
+                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
+                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+-                        ggml_backend_synchronize(input_backend);
++                        const bool queue_get = input->buffer && input_cpy->buffer &&
++                                               !ggml_backend_buffer_is_host(input->buffer) &&
++                                               ggml_backend_buffer_is_host(input_cpy->buffer) &&
++                                               input_backend->iface.get_tensor_async != NULL &&
++                                               ggml_is_contiguous(input) && ggml_is_contiguous(input_cpy);
++                        if (!queue_get) {
++                            ggml_backend_synchronize(input_backend);
++                        }
+                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                         } else {
+                             ggml_backend_synchronize(split_backend);
+                         }
+-                        ggml_backend_tensor_copy(input, input_cpy);
++                        if (queue_get) {
++                            ggml_backend_tensor_get_async(input_backend, input, input_cpy->data, 0, ggml_nbytes(input));
++                            bool listed = false;
++                            for (int p = 0; p < n_pending_get; p++) {
++                                listed = listed || pending_get[p] == input_backend;
++                            }
++                            if (!listed) {
++                                pending_get[n_pending_get++] = input_backend;
++                            }
++                        } else {
++                            ggml_backend_tensor_copy(input, input_cpy);
++                        }
+                     }
+                 }
+             }
+         }
+ 
++        for (int p = 0; p < n_pending_get; p++) {
++            ggml_backend_synchronize(pending_get[p]);
++        }
++
+         const int expert_slot = sched->expert_split_slot[split_id];
+         if (expert_slot >= 0) {
+             ggml_backend_event_wait(split_backend, sched->expert_copy_done[split_backend_id][expert_slot]);
