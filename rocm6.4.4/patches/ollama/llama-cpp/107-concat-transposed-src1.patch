@@ -1,0 +1,125 @@
+llama.cpp (as fetched by Ollama v0.35.1, llama.cpp b11232): CONCAT along
+dim 0 with a transposed second operand goes through shared-memory tiles.
+
+WHY
+---
+Gated DeltaNet layers (Qwen3.5/3.6 and Qwen3-Next, including the MoE
+models) build their convolution input as concat(conv_state,
+transpose(qkv), dim 0): qkv is a contiguous [channels, tokens] tensor, and
+its transpose has the token index strided by the channel count. The CUDA
+backend handled that with its generic non-contiguous kernel, which walks
+dst rows: every lane's read of src1 lands nb10 bytes from its neighbour's,
+32 KiB for 8192 channels. On an RX 590 one such concat (3 + 2048 columns,
+8192 rows, f32) took 27 ms, 4.9 GB/s, and the 30 of them in a 2048-token
+batch of Qwen3.6 35B-A3B took 0.83 s of the GPU's 5.4 s.
+
+The new kernel reads src1 in 32x32 tiles along its contiguous index and
+writes them along dst's rows. blockIdx.x walks the contiguous index as
+well: with tiles ordered along the token index instead, workgroups running
+together read rows a power of two apart, which on gfx803 all map to one
+DRAM channel (9.3 ms for the same concat).
+
+Measured on an RX 590:
+  test-backend-ops perf CONCAT f32 [3,8192] + transposed [2048,8192]:
+    27 ms -> 1.14 ms (110 GB/s).
+  llama-bench Qwen3.6 35B-A3B Q4_K_M, all experts in system RAM
+  (-ncmoe 99), pp2048: ubatch 1024 224 -> 233 tok/s, ubatch 2048
+  244 -> 270 tok/s.
+  test-backend-ops CONCAT 193/193 against the CPU backend, with added cases
+  for a transposed src1 (f32 and f16, odd sizes, ne2/ne3 > 1, a viewed
+  src0); those cases are not part of this patch.
+
+The slow path is not specific to gfx803; only gfx803 was measured.
+
+WHAT
+----
+In ggml/src/ggml-cuda/concat.cu, concat_dim0_src1_transposed handles dim 0
+when src1's ne[1] is its contiguous index and dst is contiguous along dim
+0; the first ne00 columns of each dst row come from src0 in the same
+launch. Every other case keeps the existing kernels.
+
+diff --git a/ggml/src/ggml-cuda/concat.cu b/ggml/src/ggml-cuda/concat.cu
+index 6df89013c..e085d0275 100644
+--- a/ggml/src/ggml-cuda/concat.cu
++++ b/ggml/src/ggml-cuda/concat.cu
+@@ -139,6 +139,63 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
+     }
+ }
+ 
++// dim 0 with src1 a transposed view (its ne[1] is the contiguous index), as
++// in the DeltaNet conv input: [conv state | transpose(qkv)]. The generic
++// kernel below walks dst rows, so each lane of src1's reads lands nb10 bytes
++// from the next (32 KiB for 8192 channels): 16.8M elements took 27 ms on an
++// RX 590. src1 goes through 32x32 tiles in shared memory instead, read along
++// its contiguous index and written along dst's rows. blockIdx.x walks that
++// contiguous index too, so workgroups running together read neighbouring
++// pieces of the same src1 rows rather than rows a power of two apart.
++#define CONCAT_T_TILE 32
++#define CONCAT_T_ROWS 8
++template <typename T>
++static __global__ void concat_dim0_src1_transposed(
++        const char * __restrict__ src0, const char * __restrict__ src1, char * __restrict__ dst,
++        const int64_t ne00, const int64_t ne10, const int64_t ne1, const int64_t ne2,
++        const uint64_t nb01, const uint64_t nb00, const uint64_t nb02, const uint64_t nb03,
++        const uint64_t nb10, const uint64_t nb12, const uint64_t nb13,
++        const uint64_t nb1, const uint64_t nb2, const uint64_t nb3) {
++    __shared__ T tile[CONCAT_T_TILE][CONCAT_T_TILE + 1];
++
++    const int64_t i2 = blockIdx.z % ne2;
++    const int64_t i3 = blockIdx.z / ne2;
++    const int64_t i0_base = (int64_t) blockIdx.y * CONCAT_T_TILE;
++    const int64_t i1_base = (int64_t) blockIdx.x * CONCAT_T_TILE;
++
++    const char * s1 = src1 + i3*nb13 + i2*nb12;
++    char       * d  = dst  + i3*nb3  + i2*nb2;
++
++    for (int j = threadIdx.y; j < CONCAT_T_TILE; j += CONCAT_T_ROWS) {
++        const int64_t i0 = i0_base + j;
++        const int64_t i1 = i1_base + threadIdx.x;
++        if (i0 < ne10 && i1 < ne1) {
++            tile[j][threadIdx.x] = *(const T *)(s1 + i0*nb10 + i1*sizeof(T));
++        }
++    }
++    __syncthreads();
++    for (int j = threadIdx.y; j < CONCAT_T_TILE; j += CONCAT_T_ROWS) {
++        const int64_t i1 = i1_base + j;
++        const int64_t i0 = i0_base + threadIdx.x;
++        if (i0 < ne10 && i1 < ne1) {
++            *(T *)(d + i1*nb1 + (ne00 + i0)*sizeof(T)) = tile[threadIdx.x][j];
++        }
++    }
++
++    if (blockIdx.y == 0) {
++        const char * s0 = src0 + i3*nb03 + i2*nb02;
++        for (int j = threadIdx.y; j < CONCAT_T_TILE; j += CONCAT_T_ROWS) {
++            const int64_t i1 = i1_base + j;
++            if (i1 >= ne1) {
++                continue;
++            }
++            for (int64_t i0 = threadIdx.x; i0 < ne00; i0 += CONCAT_T_TILE) {
++                *(T *)(d + i1*nb1 + i0*sizeof(T)) = *(const T *)(s0 + i1*nb01 + i0*nb00);
++            }
++        }
++    }
++}
++
+ template <typename T>
+ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
+     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
+@@ -160,6 +217,16 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
+ 
+         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data,         src0->data, size0, cudaMemcpyDeviceToDevice, stream));
+         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + size0, src1->data, size1, cudaMemcpyDeviceToDevice, stream));
++    } else if (dim == 0 && src1->nb[1] == sizeof(T) && src1->nb[0] != sizeof(T) && dst->nb[0] == sizeof(T) &&
++               src0->ne[1] == dst->ne[1] && src0->ne[2] == dst->ne[2] && src0->ne[3] == dst->ne[3]) {
++        const dim3 grid_dim((dst->ne[1] + CONCAT_T_TILE - 1) / CONCAT_T_TILE, (src1->ne[0] + CONCAT_T_TILE - 1) / CONCAT_T_TILE,
++                            dst->ne[2]*dst->ne[3]);
++        concat_dim0_src1_transposed<T><<<grid_dim, dim3(CONCAT_T_TILE, CONCAT_T_ROWS), 0, stream>>>(
++            (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
++            src0->ne[0], src1->ne[0], dst->ne[1], dst->ne[2],
++            src0->nb[1], src0->nb[0], src0->nb[2], src0->nb[3],
++            src1->nb[0], src1->nb[2], src1->nb[3],
++            dst->nb[1], dst->nb[2], dst->nb[3]);
+     } else {
+         GGML_ASSERT(!ggml_is_quantized(src0->type));
+ 
