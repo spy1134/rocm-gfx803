@@ -282,11 +282,15 @@ against a float64 reference); forward training at 65x65 and 129x129 was
 off by up to 4e-3. `MIOpenDriver bnorm ... -V 1` shows the error yet
 reports "verification passed", because its tolerance is loose. The bug is
 in the kernels' index arithmetic, not gfx803-specific, and is unchanged on
-upstream's `release/rocm-rel-7.1`.
+upstream's `release/rocm-rel-7.1` and `release/rocm-rel-7.2`; `develop` has
+fixed the backward kernel only.
 [`bn-spatial-variant1-unaligned-hw.patch`](../rocm6.4.4/patches/miopen/bn-spatial-variant1-unaligned-hw.patch)
 uses scalar reads for those shapes; aligned shapes and NHWC compile to the
-same code as before. After it the GPU matches the reference at every
-tested shape, at the same speed.
+same code as before. It also corrects the vector remainder of the backward
+kernel for recomputed statistics (`MIOpenDriver -s 0`; PyTorch always passes
+saved statistics and never reaches it), which indexed four-element loads at
+one-element stride. After it the GPU matches the reference at every tested
+shape, at the same speed, with saved and with recomputed statistics.
 
 ## 3. Host crashes under load, and what was ruled out
 

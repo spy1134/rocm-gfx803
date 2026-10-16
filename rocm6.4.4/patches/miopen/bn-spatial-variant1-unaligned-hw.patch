@@ -58,8 +58,10 @@ F.batch_norm with training=True):
   scalar path in forward) and all HW % 4 == 0 shapes are at ~1e-6.
 
 This is a generic index-arithmetic bug in architecture-independent
-OpenCL kernel source, not specific to gfx803, and is still present
-verbatim on upstream release/rocm-rel-7.1.
+OpenCL kernel source, not specific to gfx803. It is present verbatim on
+upstream release/rocm-rel-7.1 and rocm-rel-7.2. The develop branch fixed
+the backward kernel (it reads four elements only when H*W % 4 == 0) and
+still has the unguarded vector read in the forward training kernel.
 
 WHAT
 ----
@@ -74,25 +76,37 @@ WHAT
 2. In MIOpenBatchNormBwdSpatial.cl's MIO_BN_USESAVED == 0 vectorized
    remainder block, compute remkey = (lid << 2) + MIO_BN_LESS4 to match
    the 4-element stride of the _FLOAT4 load, as
-   MIOpenBatchNormFwdTrainSpatial.cl already does.
+   MIOpenBatchNormFwdTrainSpatial.cl already does, and guard the block
+   with (lid << 2) < MIO_BN_REM4 (MIO_BN_REM4 / 4 lanes have work, not
+   MIO_BN_REM4 lanes). The remainder lives in its own braces so that its
+   remkey does not share a scope with the remkey the dscale/dbias
+   remainder declares later in the kernel: with both at function scope
+   the kernel fails to compile ("redefinition of 'remkey'") whenever
+   MIO_BN_USESAVED == 0, MIO_BN_HW >= 4096, MIO_BN_HW % 4 == 0 and
+   MIO_BN_REM4 > 0 (for example 1x16x80x80), and MIOpenDriver then
+   reports garbage because the failed build leaves the outputs unwritten.
 
 REAL-HARDWARE VERIFICATION (RX 590, this image)
-Backward: 0 of the same 81 shapes wrong. Forward training at 1x16x65x65,
-2x16x65x65, 4x16x65x65 and 2x3x129x129: output error 6e-7 to 1.2e-6,
-running statistics below 1e-7. The MIOpenDriver command above gives
-dscale 0.0028 and dbias 6.1e-8 at 33x33, the same as at 32x32. A
-GPU-against-CPU sweep of BatchNorm forward and backward (MIOpen and
-PyTorch's native kernel, NCHW and NHWC, fp32 and fp16, six shapes) has
-no failures. Forward plus backward time is unchanged at 65x65 and
-129x129 (0.471 against 0.474 ms, 1.875 against 1.891 ms). The image's
-conv, SD1.5 UNet, rocPRIM and top-k checks and a 20-step LoRA training
-run give the same results as before the patch.
+Backward through PyTorch (saved statistics): 0 of 81 shapes wrong. Forward
+training at 1x16x65x65, 2x16x65x65, 4x16x65x65 and 2x3x129x129: output
+error 6e-7 to 1.2e-6, running statistics below 1e-7; forward plus backward
+time is unchanged at 65x65 and 129x129 (0.471 against 0.474 ms, 1.875
+against 1.891 ms). Those runs predate the second hunk, which changes only
+the MIO_BN_USESAVED == 0 backward remainder.
+With the second hunk, MIOpenDriver bnorm -F 0 -b 1 -V 1 passes dx, dscale
+and dbias for -s 0 and -s 1 at 30 shapes (H*W from 1024 to 16641,
+including 33x33, 65x65, 129x129, 65x66, 65x67, 80x80, 96x96, 100x100 and
+72x72 with N=3), and the logs contain no "Code object build failed". At
+-s 0 dscale is about 3e-3 and dbias 5e-8, the same as the 32x32 control. A
+GPU-against-float64 sweep through miopenBatchNormalizationBackward (45
+shapes, saved and recomputed statistics) has 0 wrong, and PyTorch's
+BatchNorm check (NCHW and NHWC, fp32 and fp16) has 0 failures. Without the
+brace scoping in hunk 2, seven of the sweep's shapes fail to build.
 
 diff --git a/src/kernels/MIOpenBatchNormBwdSpatial.cl b/src/kernels/MIOpenBatchNormBwdSpatial.cl
-index a018d35..4731fec 100644
 --- a/src/kernels/MIOpenBatchNormBwdSpatial.cl
 +++ b/src/kernels/MIOpenBatchNormBwdSpatial.cl
-@@ -311,7 +311,9 @@ MIOpenBatchNormBwdSpatial(const __global _FLOAT* __restrict x_in,
+@@ -311,7 +311,9 @@
  #if(MIO_BN_USESAVED == 0)
      //==== CALC MEAN and VARIANCE ONCE AGAIN =======================
      _FLOAT_PREC variance = (_FLOAT_PREC)0.;
@@ -103,46 +117,22 @@ index a018d35..4731fec 100644
      _FLOAT4 read4;
  #if(MIO_BN_N > MIO_BN_LOOP_UNROLL_MAXN)
      __attribute__((opencl_unroll_hint(4))) for(unsigned int k = lid << 2; k < MIO_BN_LESS4;
-@@ -336,24 +338,21 @@ MIOpenBatchNormBwdSpatial(const __global _FLOAT* __restrict x_in,
+@@ -336,9 +338,12 @@
      }
  
  #if(MIO_BN_REM4)
 -    if(lid < MIO_BN_REM4)
-+    unsigned int remkey = (lid << 2) + MIO_BN_LESS4;
-+    nidx                = remkey / MIO_BN_HW;
-+    hwidx               = remkey - (nidx * MIO_BN_HW);
-+    index               = nidx * MIO_BN_CHW + chwid + hwidx;
-+    if(index < (MIO_BN_NCHW - 3))
++    // Each lane loads four elements, so only the first MIO_BN_REM4 / 4 lanes
++    // have remainder work. The braces keep remkey out of the function scope,
++    // where the dscale/dbias remainder below declares it again.
++    if((lid << 2) < MIO_BN_REM4)
      {
 -        unsigned int remkey = lid + MIO_BN_LESS4;
--        nidx                = remkey / MIO_BN_HW;
--        hwidx               = remkey - (nidx * MIO_BN_HW);
--        index               = nidx * MIO_BN_CHW + chwid + hwidx;
--        if(index < (MIO_BN_NCHW - 3))
--        {
--            read4 = *((const global _FLOAT4*)(x_in + index));
--            mean += FLOAT2FLOATPREC(read4.x);
--            mean += FLOAT2FLOATPREC(read4.y);
--            mean += FLOAT2FLOATPREC(read4.z);
--            mean += FLOAT2FLOATPREC(read4.w);
--            variance = mad(FLOAT2FLOATPREC(read4.x), FLOAT2FLOATPREC(read4.x), variance);
--            variance = mad(FLOAT2FLOATPREC(read4.y), FLOAT2FLOATPREC(read4.y), variance);
--            variance = mad(FLOAT2FLOATPREC(read4.z), FLOAT2FLOATPREC(read4.z), variance);
--            variance = mad(FLOAT2FLOATPREC(read4.w), FLOAT2FLOATPREC(read4.w), variance);
--        }
-+        read4 = *((const global _FLOAT4*)(x_in + index));
-+        mean += FLOAT2FLOATPREC(read4.x);
-+        mean += FLOAT2FLOATPREC(read4.y);
-+        mean += FLOAT2FLOATPREC(read4.z);
-+        mean += FLOAT2FLOATPREC(read4.w);
-+        variance = mad(FLOAT2FLOATPREC(read4.x), FLOAT2FLOATPREC(read4.x), variance);
-+        variance = mad(FLOAT2FLOATPREC(read4.y), FLOAT2FLOATPREC(read4.y), variance);
-+        variance = mad(FLOAT2FLOATPREC(read4.z), FLOAT2FLOATPREC(read4.z), variance);
-+        variance = mad(FLOAT2FLOATPREC(read4.w), FLOAT2FLOATPREC(read4.w), variance);
-     }
- #endif
- #else
-@@ -420,6 +419,42 @@ MIOpenBatchNormBwdSpatial(const __global _FLOAT* __restrict x_in,
++        unsigned int remkey = (lid << 2) + MIO_BN_LESS4;
+         nidx                = remkey / MIO_BN_HW;
+         hwidx               = remkey - (nidx * MIO_BN_HW);
+         index               = nidx * MIO_BN_CHW + chwid + hwidx;
+@@ -420,6 +425,42 @@
  
  #endif
  
@@ -185,19 +175,18 @@ index a018d35..4731fec 100644
  #if MIO_LAYOUT_NHWC
      _FLOAT dyRead;
      _FLOAT xread;
-@@ -502,6 +537,7 @@ MIOpenBatchNormBwdSpatial(const __global _FLOAT* __restrict x_in,
- #endif
+@@ -503,6 +544,7 @@
      }
  
-+#endif
  #endif
++#endif
      barrier(CLK_GLOBAL_MEM_FENCE);
  
+ #if !MIOPEN_USE_AMDGCN
 diff --git a/src/kernels/MIOpenBatchNormFwdTrainSpatial.cl b/src/kernels/MIOpenBatchNormFwdTrainSpatial.cl
-index ef69963..4aae93e 100644
 --- a/src/kernels/MIOpenBatchNormFwdTrainSpatial.cl
 +++ b/src/kernels/MIOpenBatchNormFwdTrainSpatial.cl
-@@ -260,7 +260,9 @@ MIOpenBatchNormFwdTrainSpatial(const __global _FLOAT* __restrict in,
+@@ -260,7 +260,9 @@
      }
      barrier(CLK_LOCAL_MEM_FENCE);
  
