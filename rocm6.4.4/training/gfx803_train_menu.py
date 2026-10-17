@@ -261,6 +261,8 @@ def new_run_form(m, sets, models, vaes, actions=("Start training", "Dry run (sho
         field("buckets", "Buckets", "text", "%s:%s" % (env("MIN_BUCKET"), env("MAX_BUCKET")), check=is_buckets,
               help_="MIN:MAX bucket resolution"),
         field("clip", "Clip skip", "choice", 0, ["1 (SD 1.5 default)", "2 (most anime models)"]),
+        field("prec", "Precision", "choice", 0, ["fp16 (mixed precision)", "fp32"],
+              help_="fp16: faster and 2.2 GB less VRAM; fp32: the most thoroughly checked path"),
         field("te", "Text encoder", "choice", 0, ["frozen (UNet only)", "trained"],
               help_="training it helps prompts respond to the trigger; it overfits quickly"),
         field("te_lr", "  TE rate", "text", env("TE_LR", "5e-5"), check=is_lr),
@@ -353,7 +355,8 @@ def args_for(c, extra=()):
 
     Keys: data, model (path), vae (None = default, "none", or a path), name,
     steps, save, lr, dim, alpha, res, buckets ("MIN:MAX"), clip_skip (1/2),
-    vram ("auto", "none", ("reserve", MiB) or ("cap", MiB)), te (bool), te_lr.
+    vram ("auto", "none", ("reserve", MiB) or ("cap", MiB)), te (bool), te_lr,
+    precision ("fp16" or "fp32").
     """
     args = ["--data", c["data"]]
     if c.get("model"):
@@ -371,6 +374,8 @@ def args_for(c, extra=()):
     buckets = c.get("buckets") or ""
     if buckets and buckets != "%s:%s" % (env("MIN_BUCKET"), env("MAX_BUCKET")):
         args += ["--buckets", buckets]
+    if c.get("precision") == "fp32":
+        args += ["--precision", "fp32"]
     if c.get("te"):
         args += ["--train-text-encoder"]
         if c.get("te_lr") and str(c["te_lr"]) != env("TE_LR"):
@@ -400,6 +405,7 @@ def build_args(fields, sets, models, vaes, extra):
         "dim": f["dim"]["value"], "alpha": f["alpha"]["value"], "res": f["res"]["value"],
         "buckets": f["buckets"]["value"],
         "clip_skip": 2 if f["clip"]["value"] == 1 else 1,
+        "precision": "fp32" if f["prec"]["value"] == 1 else "fp16",
         "te": f["te"]["value"] == 1, "te_lr": f["te_lr"]["value"],
         "vram": "auto" if vram_i == 0 or (vram_i in (1, 2) and not mib)
                 else "none" if vram_i == 3 else (("reserve" if vram_i == 1 else "cap"), mib),

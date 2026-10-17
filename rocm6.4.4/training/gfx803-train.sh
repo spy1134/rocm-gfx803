@@ -68,6 +68,7 @@ SCHEDULER=constant_with_warmup
 INIT_WEIGHTS=""
 TRAIN_TE=0
 TE_LR=5e-5
+PRECISION=fp16
 EXTRA_ARGS=()
 
 # Diagnostics (taken from the command line every time, also when resuming).
@@ -135,10 +136,16 @@ Training
       --warmup N           LR warmup steps [$WARMUP]
       --scheduler NAME     LR scheduler [$SCHEDULER]
       --fresh-latents      delete cached latents and re-encode them
+      --precision fp16|fp32
+                           fp16: the frozen model in fp16 with fp32 LoRA weights
+                           and loss scaling (mixed precision); 14-16% faster
+                           than fp32 and 2.2 GB less VRAM at 512 px. fp32: the
+                           most thoroughly checked path on gfx803 [$PRECISION]
       --no-checkpointing   keep activations instead of recomputing them in the
-                           backward pass: about 30% faster at 512 px, but the
-                           peak rises from about 5.6 to 6.9 GB, which leaves
-                           no room for a desktop on an 8 GB card
+                           backward pass: about 30% faster at 512 px; the card
+                           peak rises from about 3.6 to 4.9 GB in fp16 (5.8 to
+                           7.1 GB in fp32, which leaves no room for a desktop
+                           on an 8 GB card)
 
 GPU stack and diagnostics
       --runtime stock|patched
@@ -310,7 +317,7 @@ save_run_env() {  # write the run's training parameters
         local v
         for v in RUN_NAME MODEL_PATH VAE_PATH DATA_DIR STEPS SAVE_EVERY LR DIM ALPHA \
                  BATCH GRAD_ACCUM RESOLUTION MIN_BUCKET MAX_BUCKET WARMUP SCHEDULER INIT_WEIGHTS \
-                 TRAIN_TE TE_LR; do
+                 TRAIN_TE TE_LR PRECISION; do
             printf '%s=%q\n' "$v" "${!v}"
         done
         declare -p EXTRA_ARGS
@@ -641,6 +648,7 @@ while [ $# -gt 0 ]; do
         --scheduler) SCHEDULER=$2; shift 2 ;;
         --fresh-latents) FRESH_LATENTS=1; shift ;;
         --no-checkpointing) NO_CHECKPOINTING=1; shift ;;
+        --precision) PRECISION=$2; shift 2 ;;
         --runtime) RUNTIME=$2; DIAG_ARGS+=("$1" "$2"); shift 2 ;;
         --shim) SHIM=$2; DIAG_ARGS+=("$1" "$2"); shift 2 ;;
         --no-batched) NO_BATCHED=1; DIAG_ARGS+=("$1"); shift ;;
@@ -664,6 +672,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 case "$RESUME_MODE" in ask|auto|never) ;; *) die "--resume must be ask, auto or never" ;; esac
+case "$PRECISION" in fp16|fp32) ;; *) die "--precision must be fp16 or fp32" ;; esac
 [[ "$VRAM_RESERVE" == auto || "$VRAM_RESERVE" =~ ^[0-9]+$ ]] \
     || die "--vram-reserve must be auto or a whole number of MiB"
 [[ -z "$VRAM_CAP" || "$VRAM_CAP" == none || "$VRAM_CAP" =~ ^[0-9]+$ ]] \
@@ -733,8 +742,9 @@ RESUME_FLAGS=()
 if [ "$RESUMING" = 1 ]; then
     # Reload the run's own training settings; diagnostics stay as given now.
     CLI_EXTRA=("${EXTRA_ARGS[@]}")
-    # Runs recorded before the text encoder option existed trained the UNet only.
-    TRAIN_TE=0; TE_LR=5e-5
+    # Runs recorded before the text encoder option existed trained the UNet only,
+    # and those recorded before the precision option trained in fp32.
+    TRAIN_TE=0; TE_LR=5e-5; PRECISION=fp32
     # shellcheck disable=SC1090
     source "$(run_dir "$CANDIDATE")/run.env"
     [ -d "$DATA_DIR" ] || die "run $RUN_NAME's dataset folder no longer exists: $DATA_DIR
@@ -803,7 +813,9 @@ LOG_FILE="$(run_dir "$RUN_NAME")/train.log"
 
 setup_gpu_env
 
-CMD=(env "${GPU_ENV[@]}" "$ACCELERATE" launch --num_processes=1 --num_machines=1 --mixed_precision=no --dynamo_backend=no
+MIXED=no
+[ "$PRECISION" = fp16 ] && MIXED=fp16
+CMD=(env "${GPU_ENV[@]}" "$ACCELERATE" launch --num_processes=1 --num_machines=1 --mixed_precision="$MIXED" --dynamo_backend=no
     "$TRAINING_DIR/gfx803_attn_launch.py" "$TRAINING_DIR/gfx803_vram_cap.py" "$SD_SCRIPTS/train_network.py"
     --pretrained_model_name_or_path="$MODEL_PATH"
     --train_data_dir="$DATA_DIR"
@@ -813,7 +825,7 @@ CMD=(env "${GPU_ENV[@]}" "$ACCELERATE" launch --num_processes=1 --num_machines=1
     --resolution="$RESOLUTION,$RESOLUTION"
     --enable_bucket --min_bucket_reso="$MIN_BUCKET" --max_bucket_reso="$MAX_BUCKET"
     --cache_latents --cache_latents_to_disk
-    --mixed_precision=no --no_half_vae
+    --mixed_precision="$MIXED" --no_half_vae
     --optimizer_type=AdamW
     --learning_rate="$LR" --unet_lr="$LR"
     --lr_scheduler="$SCHEDULER" --lr_warmup_steps="$WARMUP"
