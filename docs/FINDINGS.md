@@ -617,7 +617,8 @@ ComfyUI custom node that replaces three operations of ComfyUI's SD 1.5 path
 with HIP kernels from [`tools/`](../tools/):
 
 - attention for head sizes 40, 64 and 80, in one pass with an online softmax
-  (`gfx803_fused_attention.hip`), hooked into `F.scaled_dot_product_attention`
+  (`gfx803_fused_attention.hip`: a block of four waves shares each 32-key K/V
+  tile across 128 query rows), hooked into `F.scaled_dot_product_attention`
   and ComfyUI's split and optimized attention (fp16 inputs are computed in
   fp32); head size 160 and calls that need gradients stay on PyTorch;
 - GroupNorm with float64 accumulation (`gfx803_group_norm_silu.hip`), fp32
@@ -629,13 +630,32 @@ All three match a CPU float64 reference (attention within 3.5e-6 relative,
 GroupNorm and GEGLU within 1e-5, over odd shapes, 2-D/3-D and non-contiguous
 inputs). A full ComfyUI SD 1.5 fp32 txt2img, 512 px and 20 steps, sent 400
 attention, 320 GEGLU and 1220 GroupNorm calls through the node, and its image
-differs from a CPU run's by at most 0.3/255. With the node, a 512 px fp32
-denoising step takes 526 ms instead of 644. Per call, with classifier-free
-guidance (batch 2, 8 heads): self-attention at 64x64 26 ms against 50 ms for
-ComfyUI's split attention and 58 ms for PyTorch's SDPA, which also allocates
-2.3 GB for it (the fused kernel 10 MB); GEGLU 1.6-1.7x faster; GroupNorm
-1.0-1.35x faster. At head size 160 the fused kernel is slower than split
-attention (0.79 against 0.34 ms), so that level is left to ComfyUI.
+differs from a CPU run's by at most 1/255 (mean 0.001/255). The same
+workflow at fp16 takes 10.0 s per warm image with the node and 11.5 s
+without it. With the node, a 512 px fp16
+denoising step (ComfyUI's default precision on this card) takes 393 ms
+instead of 460, and its attention 92 ms instead of 161. The kernel reads the
+fp16 projections in ComfyUI's [b, tokens, heads*D] layout and writes its
+output there, with no transposed or fp32 copies around the call. Per call, with
+classifier-free guidance (batch 2, 8 heads): self-attention at 64x64 14.3 ms
+against 50 ms for ComfyUI's split attention and 58 ms for PyTorch's SDPA,
+which also allocates 2.3 GB for it (the fused kernel 10 MB); SDXL's
+self-attention at 4096 tokens (head size 64, 10 heads) 12.2 ms per batch
+item; GEGLU 1.6-1.7x faster; GroupNorm 1.0-1.35x faster. At head size 160 the
+fused kernel is slower than split attention (0.79 against 0.34 ms), so that
+level is left to ComfyUI.
+
+The attention kernel's multiply-adds are written as `a * b + c`, never
+`fmaf()`. gfx803 issues the fused `v_fma_f32` at a quarter of the rate of
+`v_mac_f32` and `v_mad_f32` (measured: 894 against 3,540 G operations per
+second over the card), and the compiler turns `a * b + c` into `v_mac_f32`
+because fp32 denormals are flushed on gfx8. With `fmaf()` in its two inner
+products the same kernel runs 2-3x slower. The unfused form rounds each
+product, which shows only on ill-conditioned inputs: with logits scaled 50x
+the kernel lands 2e-4 to 1.1e-3 from a float64 reference, within 2.5x of
+what a CPU fp32 computation of the same inputs gets (2e-4 to 4.5e-4); at
+realistic magnitudes every head size stays within 3e-6.
+`tools/correctness-suite/pytorch/attention_check.py` checks both.
 
 The node is not built into the images. `tools/ComfyUI-gfx803-attention/install.sh`
 compiles the three libraries (with the base image's `hipcc` when the host has

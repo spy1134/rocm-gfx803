@@ -47,12 +47,53 @@ if _LIB_PATH and os.path.exists(_LIB_PATH):
             ctypes.c_void_p   # stream
         ]
         _lib.gfx803_fused_attention_forward.restype = ctypes.c_int
+        if hasattr(_lib, "gfx803_fused_attention_forward_strided"):
+            _lib.gfx803_fused_attention_forward_strided.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 6 + [
+                ctypes.c_float, ctypes.POINTER(ctypes.c_longlong), ctypes.c_void_p]
+            _lib.gfx803_fused_attention_forward_strided.restype = ctypes.c_int
+        if hasattr(_lib, "gfx803_fused_attention_train_bwd"):
+            _lib.gfx803_fused_attention_train_fwd.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_int] * 5 + [
+                ctypes.c_float, ctypes.c_void_p]
+            _lib.gfx803_fused_attention_train_fwd.restype = ctypes.c_int
+            _lib.gfx803_fused_attention_train_bwd.argtypes = [ctypes.c_void_p] * 9 + [ctypes.c_int] * 5 + [
+                ctypes.c_float, ctypes.c_void_p]
+            _lib.gfx803_fused_attention_train_bwd.restype = ctypes.c_int
     except Exception as e:
         sys.stderr.write(f"[gfx803_attention] Warning: Failed to load {_LIB_PATH}: {e}\n")
 
 
 def is_available() -> bool:
     return _lib is not None and torch.cuda.is_available()
+
+
+_STRIDED_DTYPES = {torch.float32: 0, torch.float16: 1}
+
+
+def fused_attention_into(q, k, v, out, scale) -> bool:
+    """Attention of [B, H, rows, D] views written into the [B, H, N, D] view
+    `out`, read and written in place in their own dtype (fp32 or fp16), so a
+    caller holding [B, rows, H*D] projections needs no transposed or fp32
+    copies. Returns False when the library or the layout cannot take it."""
+    if _lib is None or not hasattr(_lib, "gfx803_fused_attention_forward_strided"):
+        return False
+    dtype = _STRIDED_DTYPES.get(q.dtype)
+    if dtype is None or not (k.dtype == v.dtype == out.dtype == q.dtype):
+        return False
+    if any(t.ndim != 4 or t.stride(-1) != 1 for t in (q, k, v, out)):
+        return False
+    B, H, N, D = q.shape
+    M = k.shape[2]
+    if k.shape != (B, H, M, D) or v.shape != (B, H, M, D) or out.shape != (B, H, N, D):
+        return False
+    strides = (ctypes.c_longlong * 12)(*[st for t in (q, k, v, out) for st in t.stride()[:3]])
+    ret = _lib.gfx803_fused_attention_forward_strided(
+        q.data_ptr(), k.data_ptr(), v.data_ptr(), out.data_ptr(), dtype, B, H, N, M, D, ctypes.c_float(scale),
+        strides, torch.cuda.current_stream().cuda_stream)
+    if ret == -4:
+        return False
+    if ret != 0:
+        raise RuntimeError(f"gfx803_fused_attention_forward_strided failed with code {ret}")
+    return True
 
 
 def fused_attention(
@@ -95,16 +136,17 @@ def fused_attention(
     if scale is None:
         scale = 1.0 / math.sqrt(D)
 
+    out = torch.empty((B, H, N, D), device=q.device, dtype=q.dtype)
+    if fused_attention_into(q, k, v, out, scale):
+        return out.squeeze(1) if is_3d else out
+
     # Ensure contiguous FP32 tensors on device
+    # Each tensor is converted on its own: the kernel reads all three as fp32, so a half-precision K or V next to
+    # an fp32 Q would be read past its end.
     orig_dtype = q.dtype
-    if orig_dtype != torch.float32:
-        q_f32 = q.contiguous().to(torch.float32)
-        k_f32 = k.contiguous().to(torch.float32)
-        v_f32 = v.contiguous().to(torch.float32)
-    else:
-        q_f32 = q.contiguous()
-        k_f32 = k.contiguous()
-        v_f32 = v.contiguous()
+    q_f32 = q.contiguous().to(torch.float32)
+    k_f32 = k.contiguous().to(torch.float32)
+    v_f32 = v.contiguous().to(torch.float32)
 
     out_f32 = torch.empty_like(q_f32)
 
@@ -131,13 +173,70 @@ def fused_attention(
     return out.squeeze(1) if is_3d else out
 
 
+class _FusedAttentionTrain(torch.autograd.Function):
+    """Attention whose backward recomputes the probabilities from Q, K and the
+    forward's per-row log-sum-exp instead of storing the [N, M] matrices, so
+    its memory grows with N. Computes in fp32 and returns the input dtype."""
+
+    @staticmethod
+    def forward(ctx, q, k, v, scale):
+        dtype = q.dtype
+        q, k, v = (t.detach().contiguous().float() for t in (q, k, v))
+        B, H, N, D = q.shape
+        M = k.shape[2]
+        o = torch.empty_like(q)
+        lse = torch.empty((B, H, N), device=q.device, dtype=torch.float32)
+        ret = _lib.gfx803_fused_attention_train_fwd(q.data_ptr(), k.data_ptr(), v.data_ptr(), o.data_ptr(),
+                                                    lse.data_ptr(), B, H, N, M, D, ctypes.c_float(scale),
+                                                    torch.cuda.current_stream().cuda_stream)
+        if ret != 0:
+            raise RuntimeError(f"gfx803_fused_attention_train_fwd failed with code {ret}")
+        ctx.save_for_backward(q, k, v, o, lse)
+        ctx.scale, ctx.dtype = scale, dtype
+        return o.to(dtype)
+
+    @staticmethod
+    def backward(ctx, do):
+        q, k, v, o, lse = ctx.saved_tensors
+        do = do.contiguous().float()
+        dvec = (do * o).sum(-1).contiguous()
+        dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        B, H, N, D = q.shape
+        ret = _lib.gfx803_fused_attention_train_bwd(
+            q.data_ptr(), k.data_ptr(), v.data_ptr(), do.data_ptr(), lse.data_ptr(), dvec.data_ptr(),
+            dq.data_ptr(), dk.data_ptr(), dv.data_ptr(), B, H, N, k.shape[2], D, ctypes.c_float(ctx.scale),
+            torch.cuda.current_stream().cuda_stream)
+        if ret != 0:
+            raise RuntimeError(f"gfx803_fused_attention_train_bwd failed with code {ret}")
+        return dq.to(ctx.dtype), dk.to(ctx.dtype), dv.to(ctx.dtype), None
+
+
+# Below this many query x key pairs PyTorch's attention backward is as fast and
+# its stored matrices are small (SD1.5's 32x32 and 16x16 levels, cross-attention).
+_TRAIN_MIN_PAIRS = int(os.environ.get("GFX803_ATTN_TRAIN_MIN_PAIRS", str(1 << 21)))
+_TRAIN_ENABLED = os.environ.get("GFX803_ATTN_TRAIN", "1") != "0"
+
+
+def _train_eligible(q, k, v):
+    return (_TRAIN_ENABLED and _lib is not None and hasattr(_lib, "gfx803_fused_attention_train_bwd")
+            and q.ndim == 4 and q.shape[-2] * k.shape[-2] >= _TRAIN_MIN_PAIRS
+            and q.dtype in (torch.float32, torch.float16) and k.dtype == v.dtype == q.dtype)
+
+
 _orig_sdpa = F.scaled_dot_product_attention
 
 
 def patched_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False):
-    # Strictly forward-only: if any input tracks gradients for autograd, immediately
-    # pass through to stock PyTorch to guarantee mathematically correct backpropagation.
+    # Calls that need gradients take the training path (its own backward) when it
+    # applies, and stock PyTorch otherwise.
     if query.requires_grad or key.requires_grad or value.requires_grad:
+        d = query.shape[-1]
+        if (query.is_cuda and attn_mask is None and dropout_p == 0.0 and not is_causal and not enable_gqa
+                and d in (40, 64, 80) and query.ndim == key.ndim == value.ndim
+                and key.shape[:-2] == query.shape[:-2] == value.shape[:-2]
+                and key.shape[-1] == d == value.shape[-1] and key.shape[-2] == value.shape[-2]
+                and _train_eligible(query, key, value)):
+            return _FusedAttentionTrain.apply(query, key, value, scale if scale is not None else 1.0 / math.sqrt(d))
         return _orig_sdpa(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale, enable_gqa=enable_gqa)
 
     # Route forward inference when unmasked, no dropout, non-causal.
@@ -159,6 +258,7 @@ def patched_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=Fal
         and query.ndim in (3, 4) and query.ndim == key.ndim == value.ndim
         and key.shape[:-2] == query.shape[:-2] == value.shape[:-2]
         and key.shape[-1] == d == value.shape[-1]
+        and key.shape[-2] == value.shape[-2]
     ):
         return fused_attention(query, key, value, scale=scale)
 
@@ -169,7 +269,7 @@ def patch_torch_sdpa():
     """Install gfx803 fused attention as the default handler for F.scaled_dot_product_attention."""
     F.scaled_dot_product_attention = patched_sdpa
     torch.nn.functional.scaled_dot_product_attention = patched_sdpa
-    print("[gfx803_attention] F.scaled_dot_product_attention successfully patched with gfx803 2D block-tiled attention.")
+    print("[gfx803_attention] F.scaled_dot_product_attention patched with the gfx803 fused attention.")
 
 
 def unpatch_torch_sdpa():

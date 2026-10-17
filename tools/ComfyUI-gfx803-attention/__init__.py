@@ -3,7 +3,7 @@ ComfyUI Custom Node for AMD gfx803 (Polaris) Accelerated Kernels.
 
 Hooks:
 1. F.scaled_dot_product_attention & ComfyUI attention_split / optimized_attention:
-   Native 2D block-tiled fused online softmax (D=40/64/80).
+   Fused multi-wave online-softmax attention (D=40/64/80), reading fp16 in place.
    Saves 2+ GB transient VRAM allocations and provides up to 2.2x speedup.
 2. ComfyUI GEGLU forward pass:
    Native 128-bit vectorized exact erff GEGLU activation kernel (>180 GB/s bandwidth).
@@ -13,6 +13,8 @@ Hooks:
 
 import os
 import sys
+
+import torch
 
 _curr_dir = os.path.dirname(os.path.abspath(__file__))
 if _curr_dir not in sys.path:
@@ -57,13 +59,19 @@ try:
                     scale = kwargs.get("scale", dim_head ** -0.5)
 
                     if not skip_reshape:
-                        q_4d = q.view(b, N_q, heads, dim_head).transpose(1, 2).contiguous()
-                        k_4d = k.view(b, N_kv, heads, dim_head).transpose(1, 2).contiguous()
-                        v_4d = v.view(b, N_kv, heads, dim_head).transpose(1, 2).contiguous()
+                        q_4d = q.view(b, N_q, heads, dim_head).transpose(1, 2)
+                        k_4d = k.view(b, N_kv, heads, dim_head).transpose(1, 2)
+                        v_4d = v.view(b, N_kv, heads, dim_head).transpose(1, 2)
                     else:
-                        q_4d = q.contiguous()
-                        k_4d = k.contiguous()
-                        v_4d = v.contiguous()
+                        q_4d, k_4d, v_4d = q, k, v
+                    # The output goes straight into the layout this function returns.
+                    if not skip_output_reshape:
+                        out = torch.empty((b, N_q, heads * dim_head), device=q.device, dtype=q.dtype)
+                        out_4d = out.view(b, N_q, heads, dim_head).transpose(1, 2)
+                    else:
+                        out = out_4d = torch.empty((b, heads, N_q, dim_head), device=q.device, dtype=q.dtype)
+                    if gfx803_attention.fused_attention_into(q_4d, k_4d, v_4d, out_4d, scale):
+                        return out
 
                     out_4d = gfx803_attention.fused_attention(q_4d, k_4d, v_4d, scale=scale)
 
@@ -86,7 +94,10 @@ try:
                 import gfx803_geglu
                 _orig_geglu_forward = comfy_attn.GEGLU.forward
                 def patched_geglu_forward(self, x):
-                    if gfx803_geglu._LIB is not None and x.is_cuda and not x.requires_grad:
+                    # The kernel's output has no grad_fn, so any trainable input, including the projection's own
+                    # parameters, must take the stock path.
+                    if (gfx803_geglu._LIB is not None and x.is_cuda and not x.requires_grad
+                            and not any(p.requires_grad for p in self.proj.parameters())):
                         proj_out = self.proj(x)
                         return gfx803_geglu.gfx803_geglu(proj_out, approximate_tanh=False)
                     return _orig_geglu_forward(self, x)
