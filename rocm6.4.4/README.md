@@ -496,11 +496,25 @@ measurements and a reproduction. In short:
   waited. Large batches now prefetch the next layer's experts on a second
   stream, over the DMA engines (`HSA_ENABLE_SDMA=1`, set in
   `Dockerfile-Ollama`). Qwen3.6 35B-A3B pp2048 at 512 / 1024 / 2048-token
-  batches: 193 / 250 / 295 -> 243 / 321 / 367 tok/s.
-- **109-sched-batched-host-copies.patch**: during generation a MoE layer's CPU
-  expert split waited for each of its GPU inputs separately, about 130 GPU round
-  trips per token. The copies are now queued and waited for once. Qwen3.6
-  35B-A3B tg128 23.8 -> 24.4 tok/s.
+  batches (llama-bench, development tree): 193 / 250 / 295 -> 243 / 321 / 367
+  tok/s. Through Ollama's default 512-token batches in the image, a 3,100-token
+  prompt reads 165 -> 196 tok/s and a 11,900-token prompt 174 -> 193 tok/s, and
+  generation is 4% faster. The patch changes the graph scheduler, which lives in
+  `libggml-base`; it is in `patches/ollama/llama-cpp-sched/` so that
+  `Dockerfile-Ollama` applies it before the CPU build that installs that
+  library, and the build fails if the installed library lacks it.
+- **111-mmvq-reuse-quantized-src1.patch**: every single-token matrix-vector
+  product converted its input to q8_1 in a kernel of its own, also when the
+  product before it had just converted the same input (attention's q, k and v;
+  a DeltaNet layer's four input projections). Each repeat costs a dispatch,
+  4.3 us at least on gfx803. The converted input is now kept until a node
+  writes over it. Generation: Qwen3 8B 30.1 -> 30.3-30.8 tok/s, Qwen3.6
+  35B-A3B with experts in system RAM 24.0-24.2 -> 24.5-24.6 tok/s; outputs
+  unchanged (same perplexity to the last digit through the same path).
+
+`patches/ollama/unapplied/` holds `109-sched-batched-host-copies.patch`, which is
+not built: with the scheduler patched and `HSA_ENABLE_SDMA=1`, MoE generation
+ends in an `sdma0` ring timeout and a GPU reset (see the README there).
 
 `patches/ollama/llama-cpp-server/090-mmproj-fit-target-device.patch` fixes
 llama.cpp's server, on every GPU. When it fits a model with a multimodal
@@ -533,8 +547,8 @@ GPU:
 The llama.cpp kernel patches 100-104 and 106 are gfx803-only by construction:
 each takes effect only for `GGML_CUDA_CC_GCN4` or `__gfx803__` and is sized from
 gfx803 register and bandwidth measurements. 105 changes q5_K's dot product for
-every GPU, with the same arithmetic. 107, 108, 109, 090 and the two Ollama
-patches fix problems that are not specific to any GPU (107-109 were measured
+every GPU, with the same arithmetic. 107, 108, 090 and the two Ollama
+patches fix problems that are not specific to any GPU (107 and 108 were measured
 on gfx803 only).
 Upstream llama.cpp master (checked 2026-10-03, b11382) still has the vec
 kernel 102 replaces on gfx803, unchanged; llama.cpp issue

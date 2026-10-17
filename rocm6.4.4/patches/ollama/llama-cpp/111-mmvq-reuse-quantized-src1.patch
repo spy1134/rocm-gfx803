@@ -1,0 +1,151 @@
+llama.cpp (as fetched by Ollama v0.35.1, llama.cpp b11232): a
+matrix-vector product reuses the q8_1 copy of its input that the previous
+product of the same input made.
+
+WHY
+---
+Every quantized matrix-vector product (mul_mat_vec_q, the path of
+single-token decode) first converts its fp32 input to q8_1 in a kernel of
+its own, also when the product right before it read the same input. Most
+layers start with several such products: attention's q, k and v, and in a
+Gated DeltaNet layer (Qwen3.5/3.6, Qwen3-Next) the qkv, z, beta and alpha
+projections all read the same normalised hidden state. On an RX 590 a
+dispatch costs at least 4.3 us however small the kernel (an empty kernel,
+back to back on one stream), and these inputs are a few KiB, so each
+repeated quantize costs about as much as a launch.
+
+Measured on an RX 590 (llama-bench tg64, two alternating rounds, same
+binaries otherwise):
+  Qwen3 8B Q4_K_M, all on the GPU: 30.11 / 30.12 -> 30.33 / 30.75 tok/s.
+  Qwen3.6 35B-A3B Q4_K_M, experts in system RAM (-ncmoe 99):
+    24.20 / 24.03 -> 24.60 / 24.52 tok/s (run-to-run spread about 1 tok/s).
+  llama-perplexity with -ub 1 (every token through mul_mat_vec_q) gives the
+  same perplexity to the last printed digit on both models (8B 14.3290,
+  35B-A3B 8.5860): the products read the same q8_1 bytes as before.
+  test-backend-ops 16476/16476 against the CPU backend.
+
+The repeated quantize is not specific to gfx803; only gfx803 was measured.
+
+WHAT
+----
+ggml_backend_cuda_context keeps the q8_1 buffer of the last input that
+ggml_cuda_mul_mat_vec_q quantized, with that input's data pointer, shape
+and strides. A product whose src1 matches all of them on the main stream
+skips the quantize kernel and reads the kept buffer. The buffer is dropped
+at the start of every graph compute, before any node whose output overlaps
+the kept input's bytes (each node of a fused group is checked), and
+whenever a node runs on another stream. The q8_1 conversion does not
+depend on src0's type, so products of different weight types share it.
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 343f471..362c781 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1656,6 +1656,35 @@ struct ggml_backend_cuda_context {
+     ggml_cuda_pool & pool() {
+         return pool(device);
+     }
++
++    // q8_1 copy of the last src1 that a matrix-vector product quantized, so the
++    // next product of the same input (q/k/v, a DeltaNet layer's input
++    // projections) skips its own quantize launch. Valid on the main stream
++    // within one graph compute, until a node writes over the input; declared
++    // last so it returns its memory before the pools are destroyed.
++    struct {
++        const void * data = nullptr;
++        size_t nbytes = 0;
++        int64_t ne[GGML_MAX_DIMS] = {};
++        size_t nb[GGML_MAX_DIMS] = {};
++        std::unique_ptr<ggml_cuda_pool_alloc<char>> q8_1;
++    } mmvq_src1;
++
++    void mmvq_src1_invalidate() {
++        mmvq_src1.data = nullptr;
++        mmvq_src1.q8_1.reset();
++    }
++
++    void mmvq_src1_invalidate_if_written(const ggml_tensor * t) {
++        if (mmvq_src1.data == nullptr) {
++            return;
++        }
++        const char * w0 = (const char *) t->data;
++        const char * c0 = (const char *) mmvq_src1.data;
++        if (curr_stream_no != 0 || (w0 < c0 + mmvq_src1.nbytes && c0 < w0 + ggml_nbytes(t))) {
++            mmvq_src1_invalidate();
++        }
++    }
+ };
+ 
+ struct ggml_cuda_mm_fusion_args_host {
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index be3b1e5..390a371 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4389,7 +4389,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     continue;
+                 }
+ 
++                cuda_ctx->mmvq_src1_invalidate_if_written(node);
+                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
++                for (int j = 1; j <= nodes_to_skip; j++) {
++                    cuda_ctx->mmvq_src1_invalidate_if_written(cgraph->nodes[i + j]);
++                }
+ 
+                 if (nodes_to_skip != 0) {
+ #ifdef GGML_CUDA_DEBUG
+@@ -4486,6 +4490,7 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
+ 
+ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    cuda_ctx->mmvq_src1_invalidate();
+ 
+     ggml_cuda_set_device(cuda_ctx->device);
+ 
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index bff8439..2dc82f8 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1536,12 +1536,31 @@ void ggml_cuda_mul_mat_vec_q(
+     }
+ 
+     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+-    {
++    const size_t src1_q8_1_size = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
++    auto & cache = ctx.mmvq_src1;
++    const bool cacheable = ctx.curr_stream_no == 0;
++    const bool cached = cacheable && cache.data == src1->data && cache.q8_1 &&
++        std::equal(cache.ne, cache.ne + GGML_MAX_DIMS, src1->ne) && std::equal(cache.nb, cache.nb + GGML_MAX_DIMS, src1->nb);
++    ggml_cuda_pool_alloc<char> src1_q8_1_local(ctx.pool());
++    char * src1_q8_1;
++    if (cached) {
++        src1_q8_1 = cache.q8_1->get();
++    } else {
++        if (cacheable) {
++            ctx.mmvq_src1_invalidate();
++            cache.q8_1 = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), src1_q8_1_size);
++            cache.data = src1->data;
++            cache.nbytes = ggml_nbytes(src1);
++            std::copy(src1->ne, src1->ne + GGML_MAX_DIMS, cache.ne);
++            std::copy(src1->nb, src1->nb + GGML_MAX_DIMS, cache.nb);
++            src1_q8_1 = cache.q8_1->get();
++        } else {
++            src1_q8_1 = src1_q8_1_local.alloc(src1_q8_1_size);
++        }
+         const int64_t s11 = src1->nb[1] / ts_src1;
+         const int64_t s12 = src1->nb[2] / ts_src1;
+         const int64_t s13 = src1->nb[3] / ts_src1;
+-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
++        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+     }
+ 
+     const int64_t s01 = src0->nb[1] / ts_src0;
+@@ -1567,7 +1586,7 @@ void ggml_cuda_mul_mat_vec_q(
+     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+ 
+     mul_mat_vec_q_switch_type(
+-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
++        src0->data, src0->type, src1_q8_1, ids_d, fusion_local, dst_d, ne00,
+         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
+         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);

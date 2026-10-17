@@ -110,8 +110,8 @@ run with wrong numbers, not a crash. "It runs" was never taken as evidence.
 | llama.cpp integer dot products built from byte unpacking | Faster (decode kernels) | 9 | `patches/ollama/llama-cpp/104-*`, `105-*` |
 | llama.cpp prompts on emulated int8 (mmq) | Faster (fp32 GEMMs on the shim) | 9 | `patches/ollama/llama-cpp/106-*` |
 | llama.cpp DeltaNet concat reads 32 KiB-strided | Fixed (all GPUs) | 9 | `patches/ollama/llama-cpp/107-*` |
-| MoE prompts: the GPU idles while each layer's experts cross PCIe | Fixed (all GPUs; needs SDMA copies on gfx803) | 9 | `patches/ollama/llama-cpp/108-*`, `HSA_ENABLE_SDMA=1` in Dockerfile-Ollama |
-| MoE generation: one GPU round trip per tensor handed to the CPU experts | Improved (all GPUs) | 9 | `patches/ollama/llama-cpp/109-*` |
+| MoE prompts: the GPU idles while each layer's experts cross PCIe | Fixed (all GPUs; needs SDMA copies on gfx803) | 9 | `patches/ollama/llama-cpp-sched/108-*`, `HSA_ENABLE_SDMA=1` in Dockerfile-Ollama |
+| MoE generation: one GPU round trip per tensor handed to the CPU experts | Patch kept but not applied: with SDMA on it ends in a GPU reset | 9 | `patches/ollama/unapplied/` |
 | Ollama rejects argument-less tools | Fixed (all GPUs) | 9 | `patches/ollama/ollama/` |
 | llama.cpp reserves a vision projector's memory on the wrong device | Fixed (all GPUs) | 9 | `patches/ollama/llama-cpp-server/` |
 | Ollama keeps stale free-memory figures on slow-starting GPUs | Fixed (all GPUs) | 9 | `patches/ollama/ollama/` |
@@ -808,6 +808,14 @@ bullets are the original findings (patches 100-105); the rest build on them.
   107, Qwen3.6 35B-A3B (experts in system RAM) in Ollama reads a ~5.5k-token
   prompt at 236 tok/s against 189 before, and generates at 23.8 tok/s against
   22.2.
+- **Decode re-quantized the same input for every product.** Each quantized
+  matrix-vector product converts its fp32 input to q8_1 in its own kernel, and
+  most layers start with several products of one input. A dispatch costs at
+  least 4.3 us on this card however small the kernel, so the repeats add up
+  over the ~1,450 dispatches of a MoE token. `111-mmvq-reuse-quantized-src1.patch`
+  keeps the converted input until a node writes over it: generation +1-2%
+  (Qwen3 8B 30.1 -> 30.3-30.8 tok/s), identical outputs. Not specific to
+  gfx803.
 - **MoE prompts waited for every layer's expert copy.** With most experts
   in system RAM, each MoE layer of a prompt batch runs on the GPU after the
   scheduler copies that layer's experts there, and the GPU sat idle for the
@@ -826,15 +834,27 @@ bullets are the original findings (patches 100-105); the rest build on them.
   124 -> 144 and 122 -> 135 tok/s. Generation is unchanged. Logits are
   unchanged too (llama-perplexity with and without: PPL 12.1753, mean KLD
   0), and 767 GiB of byte-compared SDMA round trips next to running GEMMs
-  found no mismatch.
+  found no mismatch. The scheduler is compiled into `libggml-base`, which
+  `Dockerfile-Ollama` installs from its CPU build, so the patch is applied
+  before that build (`patches/ollama/llama-cpp-sched/`) and the build checks
+  the installed library for it. In the image, through Ollama's default
+  512-token batches, a 3,100-token prompt reads 165 -> 196 tok/s and a
+  11,900-token prompt 174 -> 193 tok/s, with no GPU fault. On a short prompt
+  the greedy text with prefetch on follows the text with it off for 295
+  characters and then diverges at a near-tie; with prefetch off the text is
+  identical to the unpatched scheduler's.
 - **Each GPU tensor a CPU expert split reads cost a full round trip.** In
   generation with experts in RAM, every layer hands its hidden state, router
   weights and expert ids to the CPU, and the scheduler copied each with a
   synchronous copy: about 25 us per 4 KB copy-and-wait on an RX 590, about
   130 per token. `109-sched-batched-host-copies.patch` queues those copies
   and waits once per split: Qwen3.6 35B-A3B tg128 23.8 -> 24.4 tok/s, logits
-  unchanged. The rest of a generated token's time is in
-  docs/OPTIMIZATION_TARGETS.md (LLM-8).
+  unchanged. It is not applied: with the scheduler patched in `libggml-base`
+  and `HSA_ENABLE_SDMA=1`, generation with the experts in host memory ends in
+  `ring sdma0 timeout` and a GPU reset (two reproductions, with expert prefetch
+  on and off), and it gives no speedup in the image (28 to 31 tokens/s with and
+  without it). The cause of the SDMA timeout is not understood. The rest of a
+  generated token's time is in docs/OPTIMIZATION_TARGETS.md (LLM-8).
 
 Upstream llama.cpp has no equivalent of the third fix; issue
 [#27796](https://github.com/ggml-org/llama.cpp/issues/27796) reports the same
@@ -880,7 +900,7 @@ original 98% of the time (KL divergence 0.0014).
 A mixture-of-experts model goes further on the same card. Qwen3.6 35B-A3B
 (Q4_K_M, 22 GB) activates about 3B parameters per token: llama.cpp keeps its
 attention, shared weights and a q8_0 KV cache for the full 262k context on
-the GPU and most routed experts in system RAM. Before patches 106-109, on a
+the GPU and most routed experts in system RAM. Before patches 106-108, on a
 5.5k-token prompt it read 189 tok/s and generated 22 tok/s with DDR4-2800 (158
 and 19 at 2133); the bullets above give the later figures.
 What decided those numbers:

@@ -40,19 +40,29 @@ RUN curl -fsSL "https://go.dev/dl/go$(awk '/^go / { print $2 }' go.mod).linux-am
     | tar xz -C /usr/local
 ENV PATH=/usr/local/go/bin:$PATH
 
-# The CPU build provides llama-server itself and the CPU backends; the ROCm
-# build adds only the HIP backend module next to them. llama-server's own fixes
-# are therefore copied in before the CPU build, and the HIP ones after it.
+# The CPU build provides llama-server itself, the CPU backends and libggml-base,
+# which holds the graph scheduler (ggml-backend.cpp); the ROCm build adds only
+# the HIP backend module next to them. llama-server's own fixes and the
+# scheduler patches are therefore copied in before the CPU build, and the HIP
+# ones after it. A scheduler patch applied only to the ROCm build compiles into
+# a libggml-base that is never installed, and the runner silently runs the
+# unpatched scheduler.
 COPY patches/ollama/llama-cpp-server/*.patch llama/compat/gfx803-server/
+COPY patches/ollama/llama-cpp-sched/*.patch llama/compat/gfx803-sched/
 RUN cmake -S llama/server --preset cpu \
     && { grep -q fit_devs \
              build/llama-server-cpu/_deps/llama_cpp-src/tools/server/server-context.cpp \
          || { echo "090-mmproj-fit-target-device.patch was not applied" >&2; exit 1; }; } \
+    && { grep -q ggml_backend_sched_prefetch_split \
+             build/llama-server-cpu/_deps/llama_cpp-src/ggml/src/ggml-backend.cpp \
+         || { echo "108-moe-expert-prefetch.patch was not applied" >&2; exit 1; }; } \
     && cmake --build build/llama-server-cpu --parallel "$(nproc)" \
-    && cmake --install build/llama-server-cpu --component llama-server --strip
+    && cmake --install build/llama-server-cpu --component llama-server --strip \
+    && { grep -q GGML_SCHED_EXPERT_PREFETCH dist/lib/ollama/libggml-base.so.0.* \
+         || { echo "the installed libggml-base.so lacks the scheduler patches" >&2; exit 1; }; }
 
 # Ollama applies every *.patch under llama/compat to the llama.cpp source it
-# fetches, in filename order. Copied here rather than before the CPU build: the
+# fetches, in filename order. Copied here rather than before the CPU build: these
 # patches change only the HIP backend, so the CPU layer stays cached.
 COPY patches/ollama/llama-cpp/*.patch llama/compat/gfx803/
 
@@ -90,12 +100,12 @@ RUN CC=/opt/rocm/llvm/bin/clang CXX=/opt/rocm/llvm/bin/clang++ \
     && { grep -q concat_dim0_src1_transposed \
              build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/concat.cu \
          || { echo "107-concat-transposed-src1.patch was not applied" >&2; exit 1; }; } \
+    && { grep -q mmvq_src1_invalidate_if_written \
+             build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/ggml-cuda.cu \
+         || { echo "111-mmvq-reuse-quantized-src1.patch was not applied" >&2; exit 1; }; } \
     && { grep -q ggml_backend_sched_prefetch_split \
              build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-backend.cpp \
          || { echo "108-moe-expert-prefetch.patch was not applied" >&2; exit 1; }; } \
-    && { grep -q pending_get \
-             build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-backend.cpp \
-         || { echo "109-sched-batched-host-copies.patch was not applied" >&2; exit 1; }; } \
     && cmake --build build/llama-server-rocm_v7_2 --parallel "$(nproc)" \
     && cmake --install build/llama-server-rocm_v7_2 --component llama-server --strip
 
