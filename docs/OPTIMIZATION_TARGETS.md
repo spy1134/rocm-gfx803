@@ -17,6 +17,7 @@ fixes are documented in [`FINDINGS.md`](FINDINGS.md).
 | | RX 590 (Polaris 30) | What it means for kernels |
 | --- | --- | --- |
 | fp32 | 36 CUs, 2304 lanes, ~1.55 GHz: ~7.1 TFLOPS (FMA) | The card's real strength. Measure GEMM-shaped work against it. |
+| Power | 185 W board limit, which is also the most the driver accepts without overdrive | GEMM and attention load hold the clock at ~1.34 GHz (173-176 W): ~6.2 TFLOPS of multiply-adds sustained. The first ~0.1 s of load runs at the 1.56 GHz boost, so short timings read 10-20% fast. |
 | fp32 multiply-add | `v_mac_f32` / `v_mad_f32` full rate; the fused `v_fma_f32` a quarter of it (894 against 3,540 G operations per second) | Write `a * b + c`, never `fmaf()`: the compiler contracts it to `v_mac_f32` because fp32 denormals are flushed on gfx8. The fused form remains in division and transcendental sequences, outside inner loops. |
 | fp16 | same rate as fp32 | No packed fp16 math (`v_pk_*`): fp16 halves memory traffic and storage, not arithmetic time. |
 | Integer dot products | none | No `v_dot4`/`dp4a`. Quantized dot products are ALU sequences; 24-bit integer multiplies (`v_mul_i32_i24`) are full rate, and SDWA byte/word operand selects are free. |
@@ -48,19 +49,20 @@ dimension is a multiple of 8 KiB still run on older kernels.
 
 One denoising step, fp16 UNet (ComfyUI's default on this card), 512 px,
 classifier-free guidance (batch 2), with the gfx803 node and a MIOpen
-find-db made by the current build: 360 ms (395 without the node). Time per
+find-db made by the current build: 342 ms (392 without the node). Time per
 module class (`tools/unet_breakdown.py`: CUDA events around every UNet
 module's forward, each module's time exclusive of its children):
 
 | What | Time | How it runs | Efficiency |
 | --- | --- | --- | --- |
-| Convolutions | 127 ms (35%) | MIOpen `ConvHipWinogradF2x3`: input/output transforms in HIP kernels around a strided-batched GEMM in the shim (NN, 438 GFLOP per step) | transforms 26 ms by kernel time, the GEMM the rest |
-| Linear layers (attention projections, feed-forward, proj in/out) | 112 ms (31%) | shim fast tiles with fp16 storage, TN layout (all 184 linears per step) | ~4.2 TFLOPS |
-| Attention, excluding its projections | 91 ms (25%) | node's multi-wave fused kernel reading the fp16 projections in place, 32 calls per step; 64x64 self-attention 14.3 ms per call (fp32 copies) | ~2.5 TFLOPS (252 GFLOP) |
+| Convolutions | 127 ms (37%) | MIOpen `ConvHipWinogradF2x3`: input/output transforms in HIP kernels around a strided-batched GEMM in the shim (NN, 438 GFLOP per step) | transforms 26 ms by kernel time, the GEMM the rest |
+| Linear layers (attention projections, feed-forward, proj in/out) | 108 ms (32%) | shim fast tiles with fp16 storage, TN layout (all 184 linears per step) | ~4.2 TFLOPS |
+| Attention, excluding its projections | 79 ms (23%) | node's multi-wave fused kernel reading the fp16 projections in place, 32 calls per step; 64x64 self-attention 12.5 ms per call | ~3.2 TFLOPS (252 GFLOP) |
 | GroupNorm, LayerNorm, SiLU | 10 ms (3%) | | |
 | Residuals, reshapes, launch gaps | ~14 ms (4%) | estimate: step time minus the hooked modules | |
 
-By kernel (PyTorch profiler, same step, 353 ms of kernel time): the shim's
+By kernel (PyTorch profiler, 353 ms of kernel time, before SD-9 took the
+attention from 91 to 79 ms per step): the shim's
 GEMMs 202 ms (57%: linears, the Winograd solver's batched GEMMs and 1x1
 convolutions, ~917 GFLOP at ~4.5 TFLOPS on average), fused attention 87 ms,
 elementwise kernels, norms and casts ~38 ms, the Winograd filter transform
@@ -88,11 +90,12 @@ op(B) = not transposed.
 ### SDXL inference
 
 Pony V6 (SDXL), 1024 px, CFG batch 2, fp16 UNet, the gfx803 node: one UNet
-step 2.84 s. By kernel, before the two-wavefront TN tile (BLAS-7; step
+step 2.75 s. By kernel, before the two-wavefront TN tile (BLAS-7; step
 2.98 s then): the shim's GEMMs 2.23 s (75%), fused attention 0.50 s (17%),
-elementwise and norms 0.18 s, Winograd transforms 0.04 s. The large linears
-now run at 5.3-6.3 TFLOPS (10240x2048x1280 6.25, 5120x8192x640 5.31); the
-1280-wide ones with few tiles stay on the 64x64 tile at 4.3-5.0, and the
+elementwise and norms 0.18 s, Winograd transforms 0.04 s; the fused
+attention is now 0.42 s (SD-9). At sustained clocks the large linears run
+at 5.0-5.3 TFLOPS (10240x2048x1280 10.2 ms), the 1280-wide ones with few
+tiles stay on the 64x64 tile at 4.1-4.6 (see BLAS-7), and the
 cross-attention K/V projections of the 77-token context (n = 154, 1.1-2.5
 TFLOPS) lose about 30 ms per step.
 
@@ -156,7 +159,7 @@ Open targets in recommended order, then the rest.
 | PT-2 | PyTorch kernels that mix the host's 64-lane warp size with the device's 32 | correctness: wrong results or a GPU reset | Done: one more kernel fixed (embedding backward); the rest match the CPU |
 | SD-7 | Fused Winograd F(2x2, 3x3) | fp16 SD at most ~9 ms per step (2%); fp32 and training unmeasured | Open, low |
 | BLAS-7 | Shim GEMM efficiency at SD 1.5 / SDXL shapes | GEMMs are 202 ms (57%) of an fp16 SD 1.5 step at ~4.5 TFLOPS on average; fp16 dispatch fixes, fp16 widening, a one-wavefront tile for batched NN and a two-wavefront TN tile took the step 415 -> 355 ms, SDXL 3.34 -> 2.84 s | Open, measured |
-| SD-9 | SDXL attention | 0.50 s (17%) of an SDXL fp16 step on the fused kernel at ~2.5 TFLOPS; no kernel work at head size 64 and 4096 tokens beyond SD-6 | Open, measured |
+| SD-9 | SDXL attention | P now moves between lanes inside the multiply-adds (DPP): SDXL step attention 0.50 -> 0.42 s (step 2.84 -> 2.75 s), SD 1.5 91 -> 79 ms (step 355 -> 342 ms); self-attention at ~4 TFLOPS against ~5.4 for its instruction mix | Open, measured |
 | LLM-5 | The unexplained gap in decoded tokens | mul_mat_vec_q is at bandwidth bound (~198 GB/s); ~3.4 ms/token recoverable via attn_v and small-kernel fusion | Open, measured |
 | SD-2 | Winograd F(4x4, 3x3) | unmeasured; only after SD-7 | Open |
 | SD-1 | Winograd weight gradients | full fine-tuning and LoCon only | Open |
@@ -416,6 +419,45 @@ find-db once, or old records keep choosing other solvers.
 **Verify.** All 17 SD 1.5 conv shapes forward and backward-data against
 CPU float64, the 3-image VAE latent check, the UNet check, a training run.
 
+### SD-9: SDXL attention
+
+SDXL spends 0.42 s of its 2.75 s step in the fused attention, 0.39 s of it
+in self-attention at 4096 tokens (10 calls) and 1024 tokens (60 calls),
+head size 64. Sustained, per CFG-batch-2 call: 4096 tokens 21.2 ms, 1024
+tokens 2.68 ms, about 4.0 TFLOPS; SD 1.5's head size 40 at 4096 tokens
+12.5 ms (3.4 TFLOPS), head size 80 at 1024 tokens 1.43 ms (3.8).
+
+The kernel runs one wave per SIMD (one block per CU: 51 KiB of LDS at head
+size 64 and about 200 VGPRs), and with nothing to co-issue with, every
+instruction a wave issues besides its multiply-adds takes a slot from them.
+Its main loop is 91% `v_mac_f32`, so the multiply-adds alone would allow
+~5.4 TFLOPS at the sustained clock. Timing builds with one cost removed at a
+time, before the change below: Q*K^T's LDS reads 0%, the 128 `ds_bpermute`
+per tile that fetched P for P*V 10%, the V reads with them 11%, the
+exponentials 4%, the K/V tile loads, stores and barriers 8%.
+
+**Done: P through DPP.** The lanes now hold the score tile so that a query
+row's 32 scores lie in one 16-lane DPP row, and each step of P*V takes the
+key group whose P values are a fixed rotation away, which `v_mac_f32_dpp`
+applies to its operand for free (inline asm: the compiler emits a separate
+`v_mov_b32_dpp` for `__builtin_amdgcn_mov_dpp`, and with those 112 moves
+per tile the kernel was 12% slower than with the bpermutes). K and V rows
+in LDS got a D+4 stride like Q: in this layout the eight key groups of a
+16-lane row read eight K rows at once, which unpadded share one bank group
+(9% slower). The softmax's xor-2 lane exchange is a DPP quad permutation.
+SDXL step attention 504 -> 416 ms (step 2.84 -> 2.75 s), SD 1.5 91 -> 79 ms
+(step 355 -> 342 ms). Q*K^T, the row maxima and the row sums combine the
+same values in the same order as before, so the log-sum-exp the training
+backward uses is bit-identical; P*V sums its keys in a different order per
+lane, and the fp16 outputs differ from the previous kernel's by at most
+one fp16 rounding step, at the same distance from a float64 reference.
+
+**Left.** A second wave per SIMD would hide the remaining LDS reads,
+waits and barriers, but needs 128 VGPRs and half the LDS (the fp32 Q tile
+alone is 34 KiB). The training backward kernels (SD-8) still move P and dS
+with 336 `ds_bpermute` per tile pair, the same exchange this change took
+out of the forward kernel.
+
 ### BLAS-7: shim GEMM efficiency at SD shapes
 
 **Why.** The shim's GEMMs are 202 ms (57%) of an fp16 SD 1.5 step: about
@@ -465,12 +507,29 @@ wavefront does not fit (two pieces at a time already take 127 VGPRs). The
 two wavefronts share a 16-deep slice's fetch, hold the next slice in 12
 VGPRs while multiplying the current one out of one 12 KiB LDS buffer, and
 synchronize twice per slice; each barrier's drain of outstanding loads
-comes after a whole slice of multiply-adds. SDXL's large linears: TN
-5120x8192x640 13.9 -> 10.1 ms, 10240x2048x1280 10.4 -> 8.6 ms (6.25
-TFLOPS), 2560x8192x320 2.84 -> 2.37 ms. Bit-identical on the 478 cases with
+comes after a whole slice of multiply-adds. SDXL's large linears, timed at
+sustained clocks: TN 10240x2048x1280 12.4 -> 10.2 ms (4.3 -> 5.3 TFLOPS);
+in short timings at the boost clock 5120x8192x640 13.9 -> 10.1 ms and
+2560x8192x320 2.84 -> 2.37 ms. Bit-identical on the 478 cases with
 the tile forced on every call it supports, and on 25 more with K a multiple
 of 16 but not 32, padded leading dimensions, offsets and batches. fp16 UNet
 step: SDXL 2.98 -> 2.84 s, SD 1.5 359 -> 355 ms.
+
+SDXL's 1280-wide linears have too few 64x128 tiles for the rule (320 for
+1280x2048) and stay on the 64x64 tile, at 4.1-4.6 TFLOPS sustained:
+1280x2048x1280 1.45 ms (372 calls per step) and the feed-forward output
+projection 1280x2048x5120 6.5 ms (60 calls). The second also shows why
+the two-wavefront tile is limited to many tiles. Its rows are 10240 bytes
+apart, a multiple of 2048, so the 192 rows a tile reads at one k fall in
+the same DRAM channel, and the two-wavefront tile, which reads half of
+each 64-byte line per slice and needs L2 to keep the other half, took
+9.2 ms. Every row stride that is a multiple of 2048 bytes does the same
+(K = 3072, 4096, 6144 at fp16); with rows padded by 64 halves it ran 4.9-6.4
+ms, depending on where the buffers landed. At 2048 tiles (4096x4096xK) it
+stays at or ahead of the 64x64 tile even at those strides, so the rule
+needs no stride test. Padding the operands into a copy would take scratch
+memory, which the shim has none of by design, for at most ~80 ms of
+SDXL's step.
 
 **Left, by time lost per step against 4.8 TFLOPS** (each shape timed alone):
 TN with n = 128/154 (cross-attention K/V projections and the 16x16 level)
@@ -676,8 +735,9 @@ remaining overhead.
 
 Done in the node (`tools/gfx803_fused_attention.hip`): a block
 of four waves handles 128 query rows and shares each 32-key K/V tile, P
-values move between lanes with `ds_bpermute` instead of an LDS tile, and the
-next K/V tile is prefetched into registers. Per call: SD 1.5 64x64
+values move between lanes instead of through an LDS tile (since SD-9 inside
+the multiply-adds, by DPP), and the next K/V tile is prefetched into
+registers. Per call, before SD-9: SD 1.5 64x64
 self-attention (CFG batch 2, head size 40) 26.3 -> 14.3 ms, 32x32 (head
 size 80) 1.95 -> 0.84 ms, SDXL 4096-token self-attention (head size 64)
 35.0 -> 12.2 ms; SD 1.5 step attention 129 ms (ComfyUI's own) -> 91 ms.
@@ -692,11 +752,8 @@ same multi-wave kernel written with `fmaf()` measured 15.3 ms at head size
 40 and 29.8 ms at 64, because gfx803 issues the fused `v_fma_f32` at a
 quarter rate (see the card table).
 
-**Left.** Head size 40 reaches 2.9-3.0 TFLOPS and 64 about 3.5. Head size
-40 runs one block per CU: two blocks fit in LDS but need the kernel within
-128 VGPRs, and at that bound the compiler spills the `v_mac_f32`
-accumulators. Head size 160 stays on ComfyUI's split attention (0.34 ms per
-call against the node's 0.79).
+**Left.** Head size 160 stays on ComfyUI's split attention (0.34 ms per
+call against the node's 0.79). Head sizes 40-80: SD-9.
 
 **Shared with llama.cpp.** Patch 101's fp32 flash-attention tile kernel
 (`fattn-tile-kernel.cuh`) already compiles its inner products to
@@ -989,13 +1046,15 @@ matmul (4096x14336) goes from 233 to 224 us for one column and from 287 to
   cannot be differentiated), and `--force-fp32` to match the service. A 512 px
   forward and backward with PyTorch's attention does not fit in 8 GB without
   gradient checkpointing; with the fused training attention (SD-8) it does.
-- **GEMM speed.** Time `A @ B` with CUDA events after a few warm-up calls;
-  build transposed operands as `.t()` views to reach each rocBLAS layout.
-  Two effects of 5-15% hide in back-to-back A/B timing. The variant timed
-  first in each round runs faster on some shapes, whatever its code. Output
-  buffers at different physical addresses also run at different speeds
-  (DRAM channel mapping). Time both variants into the same buffer, in both
-  orders, and keep the best of each.
+- **GEMM speed.** Time `A @ B` with CUDA events; build transposed operands
+  as `.t()` views to reach each rocBLAS layout. Keep the card under load for
+  about 2 s before the first timing and time each case for tens of
+  milliseconds, so every number is taken at the power-limited ~1.34 GHz
+  rather than the boost clock (see the card table); a variant timed first,
+  or with a few calls, otherwise reads up to 20% fast. Buffers at different
+  physical addresses also run at different speeds (DRAM channel mapping),
+  and on some kernels the difference between two processes reaches 25%:
+  alternate the variants over several processes and compare medians.
 - **Which GEMM call differs.** A debug shim that includes the old and new
   headers in two namespaces runs both kernels on every intercepted fp32
   call, compares them byte for byte, and prints the parameters of any call

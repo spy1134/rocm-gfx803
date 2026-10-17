@@ -634,14 +634,14 @@ attention, 320 GEGLU and 1220 GroupNorm calls through the node, and its image
 differs from a CPU run's by at most 1/255 (mean 0.001/255). The same
 workflow at fp16 takes 8.5 s per warm image with the node and 10.5 s
 without it. With the node, a 512 px fp16
-denoising step (ComfyUI's default precision on this card) takes 360 ms
-instead of 395, and its attention 91 ms instead of 129. The kernel reads the
+denoising step (ComfyUI's default precision on this card) takes 342 ms
+instead of 392, and its attention 79 ms instead of 129. The kernel reads the
 fp16 projections in ComfyUI's [b, tokens, heads*D] layout and writes its
 output there, with no transposed or fp32 copies around the call. Per call, with
-classifier-free guidance (batch 2, 8 heads): self-attention at 64x64 14.3 ms
+classifier-free guidance (batch 2, 8 heads): self-attention at 64x64 12.5 ms
 against 50 ms for ComfyUI's split attention and 58 ms for PyTorch's SDPA,
 which also allocates 2.3 GB for it (the fused kernel 10 MB); SDXL's
-self-attention at 4096 tokens (head size 64, 10 heads) 12.2 ms per batch
+self-attention at 4096 tokens (head size 64, 10 heads) 10.6 ms per batch
 item; GEGLU 1.6-1.7x faster; GroupNorm 1.0-1.35x faster. At head size 160 the
 fused kernel is slower than split attention (0.79 against 0.34 ms), so that
 level is left to ComfyUI.
@@ -734,6 +734,16 @@ SDXL UNets in fp16 match fp32 to about 1e-3.
   the two wavefronts share 16-deep slices instead (SDXL TN 10240x2048x1280
   10.4 -> 8.6 ms, 5120x8192x640 13.9 -> 10.1 ms). Bit-identical; fp16 UNet
   step SDXL 2.98 -> 2.84 s, SD 1.5 359 -> 355 ms.
+- The node's fused attention runs one wave per SIMD, so every instruction
+  besides its multiply-adds costs it time, and fetching the softmax
+  probabilities from other lanes with `ds_bpermute` (128 per 32-key tile)
+  cost 10% of the kernel. The lanes now hold the score tile so that each
+  row's probabilities lie in one 16-lane DPP row, and the P*V multiply-adds
+  read them through a DPP row rotation (`v_mac_f32_dpp`) at no instruction
+  of their own. Attention time per step: SDXL 504 -> 416 ms (step 2.84 ->
+  2.75 s), SD 1.5 91 -> 79 ms (step 355 -> 342 ms). The log-sum-exp the
+  training backward uses is bit-identical; outputs differ by at most one
+  fp16 rounding step, at the same distance from a float64 reference.
 
 **Training.** SD1.5 LoRA, 512 px, batch 1 with gradient accumulation 4,
 steps 5-20 of a 20-step run with a warm find-db, card peak VRAM:
