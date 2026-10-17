@@ -91,9 +91,16 @@ run with wrong numbers, not a crash. "It runs" was never taken as evidence.
 | PyTorch index_put accumulate drops sums (warp-size mismatch) | Fixed | 5 | `patches/pytorch/` |
 | PyTorch embedding backward wrong or faults (warp-size mismatch) | Fixed | 5 | `patches/pytorch/` |
 | A GPU-side assert resets the whole GPU instead of raising an error | Open (driver/trap handler) | 5 | none |
-| torchvision nms has no gfx803 kernel | Worked around (CPU) | 5 | `runtime/python/` |
+| torchvision's roi_align, roi_pool, deform_conv2d and nms had no GPU kernel (the wheel was built CPU-only) | Fixed (torchvision built with its GPU sources) | 5 | `Dockerfile` (`FORCE_CUDA=1`) |
+| PyTorch sparse `coalesce()` wrong for dense widths above 160 | Fixed | 5 | `patches/pytorch/gfx803-sparse-coalesce-block-width.patch` |
+| PyTorch softmax and log_softmax backward wrong for some large dimensions (shared memory sized for 32 lanes, launched 64 wide) | Fixed | 5 | `patches/pytorch/gfx803-logical-warp-smem.patch` |
+| MIGraphX int32 reductions fail to compile for gfx803 | Fixed | 5 | `patches/migraphx/dpp-int32-sum-gfx8.patch` |
+| MIGraphX fp16 matrix products accumulate in fp16 (error 0.7-1% instead of 0.02%) | Fixed | 5 | `patches/migraphx/rocblas-compute-fp32-gfx803.patch` |
+| ONNX Runtime TopK with sorted = 0 fails above K of about 7,800 | Fixed | 5 | `patches/onnxruntime/topk-safe-small-k-smem-bound.patch` |
 | No fused attention in PyTorch on gfx803 | ComfyUI node (inference, fp32 kernels) | 6 | `tools/ComfyUI-gfx803-attention/` |
 | Patched HSA runtime page faults | Open; images default to the stock runtime | 4 | `Dockerfile`, start scripts |
+| Kernels read stale data from the per-CU vector L1 after a freed address is reused (silent wrong results in rocBLAS, rocSOLVER, torch.linalg) | Fixed (libamdhip64 rebuilt); decode costs about 2.6% | 4 | `patches/clr/` |
+| rocSOLVER and rocSPARSE ship no gfx803 code, so their kernels silently never run | Fixed (rebuilt for gfx803) | 4 | `patches/rocsolver/`, `patches/rocsparse/` |
 | VRAM exhaustion freezes the desktop | Mitigated (VRAM cap) | 7 | `training/gfx803-train.sh` |
 | llama.cpp prompt processing 10x slow | Fixed | 9 | `patches/ollama/llama-cpp/100-*` |
 | llama.cpp long-context prompts slow | Fixed | 9 | `patches/ollama/llama-cpp/101-*` |
@@ -566,12 +573,35 @@ hardware. Fourteen of the 21 files under `aten/` that use the macro also call
 `at::cuda::warp_size()`; the audit is target PT-2 in
 [`OPTIMIZATION_TARGETS.md`](OPTIMIZATION_TARGETS.md).
 
+torchvision is built with its GPU sources (`FORCE_CUDA=1`; its setup compiles them only when it
+can see a GPU, which it cannot during `docker build`). Without that, `roi_align`, `roi_pool`,
+`ps_roi_align`, `deform_conv2d` and `nms` have no GPU implementation and fail on GPU tensors.
+`tools/correctness-suite/pytorch/torchvision_ops_check.py` compares them with the CPU, forward and
+backward; `nms` and `batched_nms` also match from 1 to 20,000 boxes. torchaudio is still built
+without its GPU ops.
+
+Four more kernel bugs, each reproduced on the card before the fix and clean after it:
+
+- **Sparse `coalesce()`.** The kernel strides over features with the 32-lane `C10_WARP_SIZE` while it is launched with a
+  64-wide block, so features 160 and up of every 256-wide tile are never written. `gfx803-sparse-coalesce-block-width.patch`
+  strides by `blockDim.x`. `tools/correctness-suite/pytorch/sparse_coalesce_check.py`: 23 failing cases before, none after.
+- **Softmax and log_softmax backward.** The block reductions and the persistent softmax launch with the hardware warp width
+  but index their shared memory by 32, so some large dimensions read uninitialised shared memory
+  (`log_softmax` in fp16 at dimension 9672: backward error 0.11, row sums off by 0.12).
+  `gfx803-logical-warp-smem.patch` sizes those launches by the logical width. `softmax_smem_check.py`: 13 failing
+  cases before, none after. The speed of softmax before and after has not been measured.
+- **MIGraphX.** The DPP reduction for int32 emits `v_add_u32 ... row_shr`, which does not assemble for gfx8, so every
+  int32 `reduce_sum` fails to compile (`dpp-int32-sum-gfx8.patch`). Its GEMM asks rocBLAS for fp16 compute on gfx803,
+  so fp16 `dot` accumulates in fp16 and is off by 0.7% to 1% instead of 0.02%
+  (`rocblas-compute-fp32-gfx803.patch`). `migraphx_check.py` runs both through the gpu target.
+- **ONNX Runtime TopK.** With `sorted = 0` the kernel asks for shared memory that grows with K; above about 7,800 it
+  exceeds the 64 KiB of LDS and the ROCm provider raises `hipErrorInvalidValue`. `topk-safe-small-k-smem-bound.patch`
+  sends those requests to the radix kernel (`ort_topk_smem_bound_check.py`: 20 of 20 cases pass).
+
 The workarounds below are loaded into every Python process through `sitecustomize` in the base
 image; the modules are in [`rocm6.4.4/runtime/python/`](../rocm6.4.4/runtime/python/).
 They are workarounds with their source fixes still to do.
 
-- **torchvision nms.** The compiled op has no gfx803 code object ("invalid
-  device function"); it runs on the CPU.
 - **accelerate on a build without torch.distributed.** accelerate 1.15 imports
   `torch.distributed.tensor` unconditionally, which crashes on this
   single-GPU build; the image stubs the check (a model on such a build cannot
@@ -890,7 +920,6 @@ a reproduction.
   `gfx803_unet_check.py --only GEGLU` and the wide-GEMM-then-transposed-copy
   sequence described in section 4, on
   `GFX803_RUNTIME=patched` with the desktop stopped (a fault storm can freeze it).
-- torchvision's nms op needs a source fix or gfx803 kernel target in the PyTorch / torchvision build.
 - Whether PyTorch's group_norm computes wrong weight and bias gradients on
   gfx9 for a spatial size of 1 and more than 128 rows:
   `GammaBeta1dBackwardCUDAKernel2` reduces a 32-wide tile with shuffles over

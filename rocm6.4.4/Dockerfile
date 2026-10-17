@@ -695,6 +695,9 @@ RUN git clone --branch "${MIGRAPHX_REF}" --depth 1 \
         echo "applying ${p}"; \
         git -C /migraphx-src apply --verbose "${p}"; \
     done
+# The loop above trusts only the exit code of git apply; these drivers also check their marker.
+RUN sh /migraphx-patches/dpp-int32-sum-gfx8.sh /migraphx-src \
+    && sh /migraphx-patches/rocblas-compute-fp32-gfx803.sh /migraphx-src
 
 WORKDIR /migraphx-src
 # Drop composable_kernel and rocMLIR from requirements.txt before rbuild runs.
@@ -851,7 +854,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 # 32-lane kernels) and drops half of the repeated indices; the fifth sizes it
 # like layer_norm. embedding's backward lays out its shared-memory rows 32
 # wide while launched 64 wide, so rows overlap and overwrite its index batch;
-# the sixth sizes the rows by the launched width.
+# the sixth sizes the rows by the launched width. Sparse coalesce visits only
+# features 0-159 of every 256-wide tile because its stride is the 32-lane
+# C10_WARP_SIZE while the block is 64 wide; the seventh strides by blockDim.x.
+# The block reductions and the persistent softmax are launched with the
+# hardware warp width but index their shared memory by 32; the eighth sizes
+# those launches by the logical width.
 # Applied to the CUDA source, before build_amd.py hipifies it.
 COPY patches/pytorch/ /pytorch-patches/
 RUN sh /pytorch-patches/gfx803-int8-gemm-rocblas.sh /pytorch \
@@ -859,7 +867,9 @@ RUN sh /pytorch-patches/gfx803-int8-gemm-rocblas.sh /pytorch \
     && sh /pytorch-patches/gfx803-topk-scan-warp-size.sh /pytorch \
     && sh /pytorch-patches/gfx803-rocprim-private-namespace.sh /pytorch \
     && sh /pytorch-patches/gfx803-index-put-warp-size.sh /pytorch \
-    && sh /pytorch-patches/gfx803-embedding-backward-row-width.sh /pytorch
+    && sh /pytorch-patches/gfx803-embedding-backward-row-width.sh /pytorch \
+    && sh /pytorch-patches/gfx803-sparse-coalesce-block-width.sh /pytorch \
+    && sh /pytorch-patches/gfx803-logical-warp-smem.sh /pytorch
 
 # setup.py does not hipify CUDA sources itself; build_amd.py has to run first
 # or CMake fails looking for .hip sources that don't exist yet.
@@ -906,7 +916,7 @@ RUN git clone --recursive --branch "${TORCHVISION_REF}" --depth 1 --shallow-subm
 WORKDIR /vision
 RUN --mount=type=cache,target=/root/.ccache,id=gfx803-vision-ccache \
     env USE_ROCM=1 USE_CUDA=0 "PYTORCH_ROCM_ARCH=${ROCM_ARCH}" \
-        FORCE_CUDA=0 \
+        FORCE_CUDA=1 \
         python3 setup.py bdist_wheel \
     && pip install --no-cache-dir dist/torchvision-*.whl \
     && cp dist/torchvision-*.whl /wheels/
@@ -958,6 +968,12 @@ RUN sh /onnxruntime-patches/mha-basic-mode-no-viable-op.sh /onnxruntime
 # See the patch for the full investigation, including two fixes that looked
 # obvious and were rejected (one crashes, one can't safely cover this shape).
 RUN sh /onnxruntime-patches/topk-radix-tiebreak-nondeterministic.sh /onnxruntime
+
+# The unsorted-output route of the patch above launches SafeSmallKTopK with shared
+# memory that grows with K; above about 7800 the launch asks for more than the
+# workgroup's 64 KiB of LDS, runs nothing, and the op still returns success. The
+# patch sends those requests to RadixTopK.
+RUN sh /onnxruntime-patches/topk-safe-small-k-smem-bound.sh /onnxruntime
 
 # ORT's cmake/deps.txt fetches Eigen as a GitLab commit-archive zip and pins
 # its SHA1. Those archives aren't reproducible server-side (gitlab.com/
@@ -1155,8 +1171,8 @@ ENV UV_CONSTRAINT=/opt/pip-constraints.txt
 
 ENV PATH="$VIRTUAL_ENV/bin:${PATH}"
 
-# Python-level gfx803 workarounds (torchvision nms, accelerate and
-# torch.distributed on a build without distributed support),
+# Python-level gfx803 workarounds (accelerate and torch.distributed on a build
+# without distributed support),
 # loaded into every Python process through sitecustomize; PYTHONPATH above puts
 # /opt/rocm/lib on the path. Each module's header says what it works around.
 COPY runtime/python/ /opt/rocm/lib/

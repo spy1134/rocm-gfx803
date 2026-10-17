@@ -1,0 +1,207 @@
+PyTorch (ROCm/pytorch release/2.8, commit d618db8): size the shared-memory
+buffers of block reductions, and the persistent softmax launch, by the warp
+width the device code was compiled with.
+
+WHY
+c10/macros/Macros.h makes C10_WARP_SIZE 32 in device code for every AMD
+target except gfx9, while at::cuda::warp_size() is the hardware's 64 on
+gfx803 (the same disagreement as gfx803-layer-norm-warp-size.patch and
+gfx803-index-put-warp-size.patch). Two consequences remain in launches those
+patches did not touch.
+
+1. cuda_utils::BlockReduce* (block_reduce.cuh) keep one shared-memory slot
+per C10_WARP_SIZE threads: shared[tid / 32], 32 slots for a 1024-thread
+block. Several launchers size the dynamic buffer as block.x / warp_size() =
+block.x / 64 slots, half of what the device writes and reads: the five
+softmax forward and backward launches in SoftMax.cu, embedding_renorm_, the
+renormRows launch of torch.multinomial, and conv_depthwise2d_grad_weight. The
+extra slots land past the end of the dynamic allocation. They go unnoticed
+while the overrun stays inside the workgroup's LDS allocation granule
+(believed to be 512 bytes on gfx7 and later, UNVERIFIED for dynamic LDS),
+which is why the existing op checks pass. cunn_SoftMaxForwardSmem puts the
+buffer last, behind dim_size * sizeof bytes, so for some sizes (fp32 dim 9316,
+9320, 9324, 9328, 9444 and others; 223 of the 1787 eligible sizes between 9217
+and 16368) the overrun leaves the allocation. Out-of-range LDS reads return 0
+by the ISA definition (UNVERIFIED here), which drops the partial sums of the
+lost slots and gives a wrong normaliser.
+
+2. dispatch_softmax_forward and dispatch_softmax_backward (PersistentSoftmax.cuh)
+launch threads(64, 2) while softmax_warp_forward and softmax_warp_backward use
+WARP_SIZE = min(next_power_of_two, C10_WARP_SIZE) = 32 as their lane count and
+reduction width. For softmax dimensions above 32 the second 32 lanes of every
+wavefront recompute elements the first 32 lanes already handle (their own
+reductions cover only part of the row), and their stores are overwritten later
+in program order by the correct lanes, so the output is right but half of
+every wavefront is wasted and one wavefront serves one row where it could
+serve two. This is the attention-score softmax for rows up to 2048; SD 1.5 at
+32x32 latents has 1024-wide rows.
+
+WHAT
+device_warp_size() in block_reduce.cuh returns 32 on a ROCm device whose
+wavefront is 64 but which is not gfx9 (matching Macros.h) and
+at::cuda::warp_size() everywhere else. The six reduction-buffer launches use
+it for the slot count, and the persistent softmax dispatchers use it for the
+launch width, so host and device agree and a 128-thread block holds four rows
+(two per wavefront). CUDA builds and gfx9 are unchanged. The marker
+GFX803_LOGICAL_WARP_SMEM sits once in block_reduce.cuh.
+
+VERIFICATION (RX 590, gfx803, image built with this patch): tools/correctness-suite/pytorch/softmax_smem_check.py runs
+softmax and log_softmax, forward and backward, over last dimensions 33 to 2048 and the large fp32 and fp16 sizes against
+float64, with row sums checked. Without the patch 13 cases fail (log_softmax in fp16 at dim 9672: backward error 0.11,
+row sum off by 0.12); with it none do (the same case: backward error 7.1e-4). rocprim_ops_check.py is 118 of 118 on
+the same image. The speed of softmax at (8*4096, 1024) before and after has not been measured.
+
+diff --git a/aten/src/ATen/native/cuda/DepthwiseConv2d.cu b/aten/src/ATen/native/cuda/DepthwiseConv2d.cu
+index 92c0d17..64d3328 100644
+--- a/aten/src/ATen/native/cuda/DepthwiseConv2d.cu
++++ b/aten/src/ATen/native/cuda/DepthwiseConv2d.cu
+@@ -635,7 +635,7 @@ void conv_depthwise2d_grad_weight_out(
+     const auto input_a = input.packed_accessor32<const scalar_t, 4>();
+     const auto grad_weight_a = grad_weight.packed_accessor32<scalar_t, 4>();
+     using acc_t = at::acc_type<scalar_t, true>;
+-    int warp_size = at::cuda::warp_size();
++    int warp_size = cuda_utils::device_warp_size();
+     TORCH_INTERNAL_ASSERT(block.x % warp_size == 0);
+     int smem = (block.x  / warp_size) * sizeof(acc_t);
+     conv_depthwise2d_grad_weight_kernel<<<grid, block, smem, stream>>>(
+diff --git a/aten/src/ATen/native/cuda/Embedding.cu b/aten/src/ATen/native/cuda/Embedding.cu
+index 4863bc3..83b786b 100644
+--- a/aten/src/ATen/native/cuda/Embedding.cu
++++ b/aten/src/ATen/native/cuda/Embedding.cu
+@@ -371,7 +371,7 @@ Tensor & embedding_renorm_cuda_(Tensor & self, const Tensor & indices,
+       num_indices
+     );
+ 
+-    int warp_size = at::cuda::warp_size();
++    int warp_size = cuda_utils::device_warp_size();
+     TORCH_INTERNAL_ASSERT(num_threads() % warp_size == 0 &&
+                   num_threads() <= cuda_utils::kCUDABlockReduceMaxThreads(),
+                   "BlockReduceSum requires all warps be active");
+diff --git a/aten/src/ATen/native/cuda/MultinomialKernel.cu b/aten/src/ATen/native/cuda/MultinomialKernel.cu
+index 8132e7d..be36c91 100644
+--- a/aten/src/ATen/native/cuda/MultinomialKernel.cu
++++ b/aten/src/ATen/native/cuda/MultinomialKernel.cu
+@@ -88,7 +88,7 @@ void renormRows(Tensor& t) {
+   const int64_t maxThreads = std::min(
+       props->maxThreadsPerBlock, cuda_utils::kCUDABlockReduceMaxThreads());
+ 
+-  int warp_size = at::cuda::warp_size();
++  int warp_size = cuda_utils::device_warp_size();
+   dim3 grid(rows < numSM * 4 ? rows : numSM * 4);
+   dim3 block(std::min(maxThreads, warp_size * ceil_div(cols, int64_t{warp_size})));
+ 
+diff --git a/aten/src/ATen/native/cuda/PersistentSoftmax.cuh b/aten/src/ATen/native/cuda/PersistentSoftmax.cuh
+index f0871fa..95d6558 100644
+--- a/aten/src/ATen/native/cuda/PersistentSoftmax.cuh
++++ b/aten/src/ATen/native/cuda/PersistentSoftmax.cuh
+@@ -7,6 +7,7 @@
+ #include <c10/macros/Macros.h>
+ 
+ #include <ATen/cuda/DeviceUtils.cuh>
++#include <ATen/native/cuda/block_reduce.cuh>
+ 
+ namespace {
+ 
+@@ -310,7 +311,7 @@ void dispatch_softmax_forward(output_t *dst, const input_t *src, int softmax_ele
+         const int next_power_of_two = 1 << log2_elements;
+ 
+         // This value must match the WARP_SIZE constexpr value computed inside softmax_warp_forward.
+-        int warp_size = at::cuda::warp_size();
++        int warp_size = at::native::cuda_utils::device_warp_size();
+         warp_size = (next_power_of_two < warp_size) ? next_power_of_two : warp_size;
+ 
+         // This value must match the WARP_BATCH constexpr value computed inside softmax_warp_forward.
+@@ -361,7 +362,7 @@ void dispatch_softmax_backward(output_t *grad_input, const input_t *grad, const
+         const int next_power_of_two = 1 << log2_elements;
+ 
+         // This value must match the WARP_SIZE constexpr value computed inside softmax_warp_backward.
+-        int warp_size = at::cuda::warp_size();
++        int warp_size = at::native::cuda_utils::device_warp_size();
+         warp_size = (next_power_of_two < warp_size) ? next_power_of_two : warp_size;
+ 
+         // This value must match the WARP_BATCH constexpr value computed inside softmax_warp_backward.
+diff --git a/aten/src/ATen/native/cuda/SoftMax.cu b/aten/src/ATen/native/cuda/SoftMax.cu
+index f27d762..3301c08 100644
+--- a/aten/src/ATen/native/cuda/SoftMax.cu
++++ b/aten/src/ATen/native/cuda/SoftMax.cu
+@@ -1108,7 +1108,7 @@ Tensor host_softmax(const Tensor & input_, const int64_t dim_, const bool half_t
+             constexpr int ILP = sizeof(float4) / sizeof(scalar_t);
+             if constexpr (use_fast_softmax) {
+               dim3 block(512);
+-              size_t smem_reduction_sz = block.x / at::cuda::warp_size() * sizeof(accscalar_t);
++              size_t smem_reduction_sz = block.x / cuda_utils::device_warp_size() * sizeof(accscalar_t);
+               if (dim_size % ILP == 0) {
+                 cunn_SoftMaxForwardGmem<ILP, scalar_t, accscalar_t, scalar_t, EpilogueWithMul>
+                     <<<grid, block, smem_reduction_sz, stream>>>(output_ptr, input_ptr, dim_size);
+@@ -1118,7 +1118,7 @@ Tensor host_softmax(const Tensor & input_, const int64_t dim_, const bool half_t
+               }
+             } else {
+               dim3 block = SoftMaxForward_getBlockSize(dim_size);
+-              size_t smem_reduction_sz = block.x / at::cuda::warp_size() * sizeof(accscalar_t);
++              size_t smem_reduction_sz = block.x / cuda_utils::device_warp_size() * sizeof(accscalar_t);
+               auto max_elements_per_smem = (at::cuda::getCurrentDeviceProperties()->sharedMemPerBlock -
+                 smem_reduction_sz) / sizeof(scalar_t);
+ 
+@@ -1199,7 +1199,7 @@ Tensor host_softmax(const Tensor & input_, const int64_t dim_, const bool half_t
+             constexpr int ILP = sizeof(float4) / sizeof(scalar_t);
+             if constexpr (use_fast_softmax) {
+               dim3 block(512);
+-              size_t smem_reduction_sz = block.x / at::cuda::warp_size() * sizeof(accscalar_t);
++              size_t smem_reduction_sz = block.x / cuda_utils::device_warp_size() * sizeof(accscalar_t);
+               if (dim_size % ILP == 0) {
+                 cunn_SoftMaxForwardGmem<ILP, scalar_t, accscalar_t, accscalar_t, EpilogueWithMul>
+                     <<<grid, block, smem_reduction_sz, stream>>>(output_ptr, input_ptr, dim_size);
+@@ -1209,7 +1209,7 @@ Tensor host_softmax(const Tensor & input_, const int64_t dim_, const bool half_t
+               }
+             } else {
+               dim3 block = SoftMaxForward_getBlockSize(dim_size);
+-              size_t smem_reduction_sz = block.x / at::cuda::warp_size() * sizeof(accscalar_t);
++              size_t smem_reduction_sz = block.x / cuda_utils::device_warp_size() * sizeof(accscalar_t);
+               auto max_elements_per_smem = (at::cuda::getCurrentDeviceProperties()->sharedMemPerBlock -
+                 smem_reduction_sz) / sizeof(scalar_t);
+ 
+@@ -1275,7 +1275,7 @@ void dispatch_host_softmax_backward(int64_t dim_size, dim3 grid, Tensor &grad, T
+   constexpr int ILP = sizeof(float4) / sizeof(output_t);
+   dim3 block = SoftMax_getBlockSize(ILP, dim_size);
+ 
+-  size_t smem_reduction_sz = block.x / at::cuda::warp_size() * sizeof(accscalar_t);
++  size_t smem_reduction_sz = block.x / cuda_utils::device_warp_size() * sizeof(accscalar_t);
+   auto max_elements_per_smem = (at::cuda::getCurrentDeviceProperties()->sharedMemPerBlock -
+     smem_reduction_sz) / sizeof(output_t);
+   bool can_use_smem = static_cast<size_t>(dim_size) < max_elements_per_smem;
+diff --git a/aten/src/ATen/native/cuda/block_reduce.cuh b/aten/src/ATen/native/cuda/block_reduce.cuh
+index 1818987..ababb66 100644
+--- a/aten/src/ATen/native/cuda/block_reduce.cuh
++++ b/aten/src/ATen/native/cuda/block_reduce.cuh
+@@ -3,7 +3,9 @@
+ #include <thrust/tuple.h>
+ 
+ #include <ATen/native/SharedReduceOps.h>
++#include <ATen/cuda/CUDAContext.h>
+ #include <ATen/cuda/DeviceUtils.cuh>
++#include <cstring>
+ 
+ namespace at::native::cuda_utils {
+ 
+@@ -24,6 +26,21 @@ constexpr int kCUDABlockReduceMaxThreads() {
+ }
+ #endif
+ 
++// GFX803_LOGICAL_WARP_SMEM: width of the "warp" that the device code in this file and its callers
++// index by, as a host value. C10_WARP_SIZE is 32 in device code for every AMD target except gfx9 and
++// cannot be used in host code, while at::cuda::warp_size() reports the hardware's 64 on gfx6-8.
++// BlockReduce* keep one shared-memory slot per C10_WARP_SIZE threads, so a launch that sizes that
++// buffer by block / warp_size() gets half the slots the device writes.
++inline int device_warp_size() {
++#ifdef USE_ROCM
++  const auto* prop = at::cuda::getCurrentDeviceProperties();
++  if (prop->warpSize == 64 && std::strncmp(prop->gcnArchName, "gfx9", 4) != 0) {
++    return 32;
++  }
++#endif
++  return at::cuda::warp_size();
++}
++
+ // Sums `val` across all threads in a warp.
+ //
+ // Assumptions:

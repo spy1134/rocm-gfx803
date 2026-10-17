@@ -1,0 +1,44 @@
+AMDMIGraphX (pinned tag rocm-6.4.4): accumulate fp16 GEMMs in fp32 on gfx803.
+
+WHY
+---
+MIGraphX decides per device whether an fp16 GEMM computes in fp32
+(get_compute_fp32_flag, src/targets/gpu/rocblas.cpp). The flag is true only for
+gfx908 and later gfx9 parts. When it is false the GEMM's compute type equals its
+output type (gemm_impl.cpp), so an fp16 GEMM calls rocBLAS with an fp16 compute
+type and runs the Type_HH Tensile kernels, which sum the whole K dimension in
+fp16. gfx803 takes that path, and gets nothing for it: it has no packed fp16
+arithmetic, so the fp16-compute kernels are not faster than the Type_HH_HPA
+kernels, which accumulate in fp32. Both families ship in the gfx803 Tensile
+libraries. With fp16 accumulation the rounding error of a GEMM grows with K
+(transformer projections have K of 1024 to 5120), while the fp32-accumulate
+kernels keep it near the fp16 output rounding. The fp32 route is also the one
+the rest of this stack uses and has validated for fp16 GEMMs.
+
+WHAT
+----
+Make get_compute_fp32_flag return true for gfx803 as well, so fp16 and bf16
+GEMMs use an fp32 compute type with fp32 alpha and beta, exactly as on gfx908 and
+later. The marker GFX803_GEMM_COMPUTE_FP32 sits once in rocblas.cpp.
+
+VERIFICATION (RX 590, gfx803, image built with this patch): tools/correctness-suite/pytorch/migraphx_check.py runs fp16
+dot programs with K = 4096 and 2048 through the gpu target against float64 from the same fp16 inputs. Without the patch
+the relative L2 error is 6.6e-3 to 9.6e-3 (fp16 accumulation); with it 2.1e-4, below the fp16 output rounding.
+
+diff --git a/src/targets/gpu/rocblas.cpp b/src/targets/gpu/rocblas.cpp
+index 8c06ad5..7b7758e 100644
+--- a/src/targets/gpu/rocblas.cpp
++++ b/src/targets/gpu/rocblas.cpp
+@@ -51,7 +51,11 @@ rocblas_handle_ptr create_rocblas_handle_ptr(hipStream_t s)
+ bool get_compute_fp32_flag()
+ {
+     const auto device_name = trim(split_string(get_device_name(), ':').front());
+-    return (starts_with(device_name, "gfx9") and device_name >= "gfx908");
++    // GFX803_GEMM_COMPUTE_FP32: gfx803 has no packed fp16 arithmetic, so rocBLAS's fp16-compute GEMMs
++    // (Type_HH) gain no speed there and accumulate the whole K sum in fp16, while the fp32-accumulate
++    // kernels (Type_HH_HPA) keep the rounding error independent of K.
++    return (starts_with(device_name, "gfx9") and device_name >= "gfx908") or
++           device_name == "gfx803";
+ }
+ 
+ bool rocblas_fp8_available()

@@ -1,0 +1,84 @@
+ONNX Runtime (pinned ORT_VERSION): send unsorted TopK requests whose SafeSmallKTopK
+shared memory would exceed the workgroup LDS limit to RadixTopK, instead of a
+launch that cannot run. Applies after topk-radix-tiebreak-nondeterministic.patch.
+
+WHY
+---
+topk-radix-tiebreak-nondeterministic.patch routes every request that reaches the
+`K <= BT * 16 || 0 == sorted` branch of TopKImpl (BT = 256) to SafeSmallKTopK. That
+kernel takes dynamic shared memory of
+
+    smem_bytes = 256 * (sizeof(T) + sizeof(int64_t)) + K * sizeof(int64_t)
+
+The K term exists because the kernel keeps the K indices it has already selected in
+shared memory. For sorted output the branch is only reached with K <= 4096, so
+smem_bytes is at most 256 * 16 + 8 * 4096 = 36864 bytes and always fits. For unsorted
+output the `0 == sorted` clause admits any K up to the axis length, and smem_bytes
+passes the 64 KiB LDS limit of a gfx803 workgroup at
+
+    K > 7808 for float   (256 * 12 + 8 * K > 65536)
+    K > 7872 for fp16    (256 * 10 + 8 * K > 65536)
+    K > 7680 for double  (256 * 16 + 8 * K > 65536)
+
+A launch that asks for more LDS than the device has runs no block, and TopKImpl does
+not check the launch status, so the op can return success with output buffers that
+were never written. Without the topk-radix patch the same requests go to RadixTopK,
+which handles them.
+
+RadixTopK serves this case. Its shared memory is a fixed 256 * sizeof(uint32_t) plus
+a static BlockScan/BlockReduce/BlockRadixSort union, independent of K. With
+`0 == sorted` the dispatch condition `BT * 2 >= K || 0 == sorted` selects the
+RadixTopK<CudaT, BT, 2> instantiation for every K, and that instantiation never runs
+the final BlockRadixSort step (guarded by `1 == sorted`), so K is not limited by KPT.
+For exactly tied candidates at the K-th value, RadixTopK can still pick a different
+winner from run to run (the defect SafeSmallKTopK was added for); that remains possible
+only for unsorted requests with K above the bound.
+
+SafeSmallKTopK is also quadratic in K per block (every candidate scans the K selected
+indices on every pass), so a large unsorted K is much cheaper through RadixTopK than
+through a kernel that would fit.
+
+WHAT
+----
+Compare smem_bytes with a 64 KiB bound before launching SafeSmallKTopK. Above it, launch
+RadixTopK<CudaT, BT, 2> with the same arguments the CUDA path uses. Only that
+instantiation can be reached on ROCm (the bound is exceeded only when sorted == 0), so
+the other RadixTopK instantiations stay out of the ROCm build, which keeps this file's
+compile time as it is. The non-ROCm path is untouched.
+
+VERIFICATION (RX 590, gfx803, image built with this patch):
+tools/correctness-suite/pytorch/ort_topk_smem_bound_check.py runs TopK with sorted = 0 at K above the bound (7808 for
+float, 7872 for fp16) for float and fp16, largest 0 and 1, against a numpy reference: 20 of 20 cases pass. Without the
+patch the ROCm EP raises hipErrorInvalidValue for those requests (the launch asks for more than 64 KiB of LDS), so TopK
+with sorted = 0 is unusable above the bound. The cases just below the bound (--include-below) go through the quadratic
+SafeSmallKTopK and were not run.
+
+diff --git a/onnxruntime/core/providers/cuda/math/topk_impl.cuh b/onnxruntime/core/providers/cuda/math/topk_impl.cuh
+index 667576f..01b5fbb 100644
+--- a/onnxruntime/core/providers/cuda/math/topk_impl.cuh
++++ b/onnxruntime/core/providers/cuda/math/topk_impl.cuh
+@@ -560,10 +560,21 @@ Status TopKImpl(const CudaKernel* kernel, bool use_deterministic_compute,
+ 
+ #ifdef USE_ROCM
+     // SAFE_SMALL_K_TOPK_PATCH: see the kernel's own comment above for why.
++    // SAFE_SMALL_K_SMEM_BOUND: the kernel's dynamic shared memory grows with K, and a launch that asks for more
++    // than the workgroup's 64 KiB of LDS runs no block at all. Only unsorted output can get there (with sorted
++    // output this branch has K <= BT * 16, which always fits), and RadixTopK serves unsorted output for any K.
++    constexpr size_t kSafeSmallKMaxSmemBytes = 64 * 1024;
+     size_t smem_bytes = GridDim::maxThreadsPerBlock * (sizeof(CudaT) + sizeof(int64_t)) + K * sizeof(int64_t);
+-    SafeSmallKTopK<CudaT><<<N, GridDim::maxThreadsPerBlock, smem_bytes, stream>>>(
+-        input_x_ptr, output_v_ptr, output_i, elem_nums, size, axis, K, largest, sorted, dimension,
+-        NumericLimits<CudaT>::Lowest(), NumericLimits<CudaT>::Max());
++    if (smem_bytes <= kSafeSmallKMaxSmemBytes) {
++      SafeSmallKTopK<CudaT><<<N, GridDim::maxThreadsPerBlock, smem_bytes, stream>>>(
++          input_x_ptr, output_v_ptr, output_i, elem_nums, size, axis, K, largest, sorted, dimension,
++          NumericLimits<CudaT>::Lowest(), NumericLimits<CudaT>::Max());
++    } else {
++      auto XPT = static_cast<int64_t>(ceil(static_cast<double>(dimension) / GridDim::maxThreadsPerBlock));
++      RadixTopK<CudaT, BT, 2><<<N, BT, 256 * sizeof(uint32_t), stream>>>(
++          input_x_ptr, output_v_ptr, output_i, elem_nums, size, axis, K, largest, sorted, dimension, XPT,
++          NumericLimits<CudaT>::Lowest(), NumericLimits<CudaT>::Max());
++    }
+ #else
+     auto XPT = static_cast<int64_t>(ceil(static_cast<double>(dimension) / GridDim::maxThreadsPerBlock));
+     if (BT * 2 >= K || 0 == sorted) {

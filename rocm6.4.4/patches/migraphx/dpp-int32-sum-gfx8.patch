@@ -1,0 +1,88 @@
+AMDMIGraphX (pinned tag rocm-6.4.4): do not emit the gfx9 form of v_add_u32 for
+integer DPP sums on gfx8.
+
+WHY
+---
+src/targets/gpu/kernels/include/migraphx/kernels/reduce.hpp implements wave
+reductions (dpp_reduce) with inline assembly that spells each step as
+"<ins> %0 %0 %0 row_shr:N" and similar, one overload per element type and
+operation. The int32_t and uint32_t overloads for op::sum use the instruction
+name v_add_u32. gfx9 and later have a three-operand v_add_u32 with no carry
+output; gfx8 only has the carry-out encoding, which takes an explicit vcc
+operand, so the assembler rejects the string. Any reduction kernel that
+instantiates dpp_reduce for an int32 or uint32 sum on gfx803 therefore fails to
+compile:
+
+    error: not a valid operand.
+
+for the first asm statement, while the same source assembles for gfx900. The
+failure is a kernel JIT error at model compile time, not a wrong result.
+Floating-point sums (v_add_f32, v_add_f16, v_add_f64) assemble on gfx803.
+
+WHAT
+----
+Split MIGRAPHX_DPP_REDUCE into a floating-point part (MIGRAPHX_DPP_REDUCE_FLOAT)
+and an integer part (MIGRAPHX_DPP_REDUCE_INT32), with the same overloads as
+before, and on gfx8 (__GFX8__) define only the floating-point overloads for
+op::sum. Integer sums then resolve to the generic dpp_reduce template at the top
+of the file, which builds the same reduction from dpp_mov builtins and lets the
+compiler choose the encoding of the add for the target. Every other architecture
+and every other operation keeps the asm overloads unchanged. The marker
+GFX803_DPP_INT32_SUM sits once in reduce.hpp.
+
+VERIFICATION (RX 590, gfx803, image built with this patch): tools/correctness-suite/pytorch/migraphx_check.py compiles
+reduce_sum over int32 and uint32 tensors (axes of 16, 64, 256, 1000 and 4096 elements) for the gpu target and compares
+with numpy. Without the patch the int32 programs fail to compile ("not a valid operand" at the DPP add); with it all
+ten cases are exact. The compile matrix (hipcc with MIGraphX's JIT flags, gfx803 and gfx900) is as follows: the
+unpatched header fails the two integer sums for gfx803 and builds the other 14 of 16; with -std=c++20 and no warning
+flags, dpp_reduce<16> and <64> over sum, product, max and min for int32, uint32, float and half build for gfx803 and
+gfx900 except the int32 and uint32 products, which fail on both architectures before and after the patch (v_mul_u32 is
+not an instruction).
+
+diff --git a/src/targets/gpu/kernels/include/migraphx/kernels/reduce.hpp b/src/targets/gpu/kernels/include/migraphx/kernels/reduce.hpp
+index 76150cb..7be97b2 100644
+--- a/src/targets/gpu/kernels/include/migraphx/kernels/reduce.hpp
++++ b/src/targets/gpu/kernels/include/migraphx/kernels/reduce.hpp
+@@ -146,23 +146,34 @@ __device__ void dpp_reduce(T& in, Op op)
+ // Navi21 doesn't support int32 dpp
+ #if defined(__gfx1030__)
+ // NOLINTNEXTLINE
+-#define MIGRAPHX_DPP_REDUCE(op, prefix, sign)              \
+-    MIGRAPHX_DPP_REDUCE_ASM_FUN(double, op, prefix##_f64); \
+-    MIGRAPHX_DPP_REDUCE_ASM_FUN(float, op, prefix##_f32);  \
+-    MIGRAPHX_DPP_REDUCE_ASM_FUN(half, op, prefix##_f16);   \
++#define MIGRAPHX_DPP_REDUCE_INT32(op, prefix, sign) \
+     MIGRAPHX_DPP_REDUCE_ASM_FUN(uint32_t, op, prefix##_u32);
+ #else
+ // NOLINTNEXTLINE
+-#define MIGRAPHX_DPP_REDUCE(op, prefix, sign)                   \
+-    MIGRAPHX_DPP_REDUCE_ASM_FUN(double, op, prefix##_f64);      \
+-    MIGRAPHX_DPP_REDUCE_ASM_FUN(float, op, prefix##_f32);       \
+-    MIGRAPHX_DPP_REDUCE_ASM_FUN(half, op, prefix##_f16);        \
++#define MIGRAPHX_DPP_REDUCE_INT32(op, prefix, sign)             \
+     MIGRAPHX_DPP_REDUCE_ASM_FUN(int32_t, op, prefix##sign##32); \
+     MIGRAPHX_DPP_REDUCE_ASM_FUN(uint32_t, op, prefix##_u32);
+ #endif
+ 
++// NOLINTNEXTLINE
++#define MIGRAPHX_DPP_REDUCE_FLOAT(op, prefix)              \
++    MIGRAPHX_DPP_REDUCE_ASM_FUN(double, op, prefix##_f64); \
++    MIGRAPHX_DPP_REDUCE_ASM_FUN(float, op, prefix##_f32);  \
++    MIGRAPHX_DPP_REDUCE_ASM_FUN(half, op, prefix##_f16);
++
++// NOLINTNEXTLINE
++#define MIGRAPHX_DPP_REDUCE(op, prefix, sign) \
++    MIGRAPHX_DPP_REDUCE_FLOAT(op, prefix)     \
++    MIGRAPHX_DPP_REDUCE_INT32(op, prefix, sign)
++
+ // Note: when max and min are in int32_t, signed version of instruction needs to be used.
++// GFX803_DPP_INT32_SUM: gfx8 only has the carry-out encoding of v_add_u32 (it takes a vcc operand), which
++// the three-operand DPP asm above cannot spell, so the integer sums use the generic dpp_mov path there.
++#if defined(__GFX8__)
++MIGRAPHX_DPP_REDUCE_FLOAT(op::sum, v_add)
++#else
+ MIGRAPHX_DPP_REDUCE(op::sum, v_add, _u)
++#endif
+ MIGRAPHX_DPP_REDUCE(op::product, v_mul, _u)
+ MIGRAPHX_DPP_REDUCE(op::max, v_max, _i)
+ MIGRAPHX_DPP_REDUCE(op::min, v_min, _i)

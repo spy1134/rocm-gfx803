@@ -1,0 +1,85 @@
+PyTorch (ROCm/pytorch release/2.8, commit d618db8): lay out sparse coalesce's
+feature tiles by the launched block width.
+
+WHY
+Tensor.coalesce() on a sparse COO tensor whose dense part is wider than 160
+elements leaves the tail of every 256-wide tile of each output row
+uninitialised (the output is at::empty). Reproduce: indices with duplicates,
+values of shape [4, 256]; compare
+torch.sparse_coo_tensor(idx, v, (n, 256)).coalesce().values() against the CPU.
+With a dense width of 256, 96 features are never written; with 512, 192; with
+1024, 384. Widths up to 160 are unaffected, which is why a check with widths 64
+and 128 passes.
+
+SparseCUDATensor.cu launches coalesceValuesKernel with
+block(at::cuda::warp_size(), 4) and grid.y = ceil(stride / (warp_size * 4)),
+which is 64 on gfx803. The kernel walks four features per thread at
+startFeature + ii * C10_WARP_SIZE, and c10/macros/Macros.h makes
+C10_WARP_SIZE 32 in device code for every AMD target except gfx9. Each tile
+of 64 * 4 = 256 features is therefore visited as x + 32 * ii for x in 0..63,
+ii in 0..3: features 0..159, with 32..127 visited twice (the duplicate writes
+store the same value) and 160..255 never. Reach: nn.Embedding(sparse=True)
+gradients and SparseAdam with an embedding dimension above 160.
+
+WHAT
+The inner stride is blockDim.x, the width the launcher already used to size
+the grid, in both coalesceValuesKernel variants (the numeric one and the bool
+one). Every feature of a tile is visited exactly once and nothing depends on
+C10_WARP_SIZE. Where the block width already equals C10_WARP_SIZE (CUDA, gfx9)
+the behaviour is unchanged.
+
+VERIFICATION (RX 590, gfx803, image built with this patch): tools/correctness-suite/pytorch/sparse_coalesce_check.py
+compares coalesce() of COO tensors with duplicate indices against a float64 CPU result for dense widths from 1 to 1024
+around the 160 and 256 boundaries, in fp32, fp16 and bool. Without the patch 23 cases fail (features 160 and up of each
+256-wide tile are wrong); with it none do.
+
+diff --git a/aten/src/ATen/native/sparse/cuda/SparseCUDAApplyUtils.cuh b/aten/src/ATen/native/sparse/cuda/SparseCUDAApplyUtils.cuh
+index 693ca53..948b2f9 100644
+--- a/aten/src/ATen/native/sparse/cuda/SparseCUDAApplyUtils.cuh
++++ b/aten/src/ATen/native/sparse/cuda/SparseCUDAApplyUtils.cuh
+@@ -207,6 +207,9 @@ __global__ void coalesceValuesKernel(
+     const int newValueRow = seg * stride;
+     const int begin = segment_offsets[seg];
+     const int end = (seg < newNnz - 1) ? segment_offsets[seg + 1] : nnz;
++    // GFX803_SPARSE_COALESCE_BLOCK_WIDTH: the launcher tiles the features by blockDim.x * SZ and
++    // blockDim.x is the hardware warp size, which C10_WARP_SIZE does not match on AMD targets
++    // other than gfx9, so the inner stride has to be blockDim.x for every feature to be visited.
+     const int startFeature = threadIdx.x + blockIdx.y * blockDim.x * SZ;
+     Acctype tmp[SZ];
+     #pragma unroll
+@@ -219,7 +222,7 @@ __global__ void coalesceValuesKernel(
+       #pragma unroll
+       for (int ii = 0; ii < SZ; ii++)
+       {
+-        int featureDim = startFeature + ii * C10_WARP_SIZE;
++        int featureDim = startFeature + ii * blockDim.x;
+         if (featureDim < stride)
+         {
+           tmp[ii] += static_cast<Acctype>(values[valueRow + featureDim]);
+@@ -229,7 +232,7 @@ __global__ void coalesceValuesKernel(
+     #pragma unroll
+     for (int ii = 0; ii < SZ; ii++)
+     {
+-      int featureDim = startFeature + ii * C10_WARP_SIZE;
++      int featureDim = startFeature + ii * blockDim.x;
+       if (featureDim < stride)
+       {
+         newValues[newValueRow + featureDim] = static_cast<Dtype>(tmp[ii]);
+@@ -273,7 +276,7 @@ __global__ void coalesceValuesKernel(
+       #pragma unroll
+       for (int ii = 0; ii < SZ; ii++)
+       {
+-        int featureDim = startFeature + ii * C10_WARP_SIZE;
++        int featureDim = startFeature + ii * blockDim.x;
+         if (featureDim < stride)
+         {
+           tmp[ii] |= values[valueRow + featureDim];
+@@ -283,7 +286,7 @@ __global__ void coalesceValuesKernel(
+     #pragma unroll
+     for (int ii = 0; ii < SZ; ii++)
+     {
+-      int featureDim = startFeature + ii * C10_WARP_SIZE;
++      int featureDim = startFeature + ii * blockDim.x;
+       if (featureDim < stride)
+       {
+         newValues[newValueRow + featureDim] = tmp[ii];
