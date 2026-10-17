@@ -52,6 +52,8 @@
 // gfx803_w_kernel computes a 64x64 (or 64x32) tile with one wavefront, an 8x8
 // (or 8x4) block per thread, and no barrier; it takes the fp16 batched calls
 // that gfx803_w_applies picks from the 64x64 tiles.
+// gfx803_w2_kernel computes a 64x128 tile with two wavefronts sharing the A
+// piece; it takes the fp16 TN calls (nn.Linear) that gfx803_w2_applies picks.
 // gfx803_sgemm_small_n_kernel takes GEMMs with at most 8 columns of C and
 // op(A) = T, a token-by-token decode step's nn.Linear, as a GEMV; it sums in
 // a different order than the tiles (see the comment there).
@@ -1709,6 +1711,130 @@ gfx803_w_kernel(int GW, int M, int N, int K, float alpha,
                                                    row0, col0, pz, As, Bs);
 }
 
+// Two wavefronts per tile: gfx803_w2_kernel computes a 64x128 tile of an fp16
+// TN product (both operands contiguous in K), each wavefront a 64x64 half with
+// the 8x8-per-thread layout of gfx803_w_tile, the two sharing the A piece.
+//
+// Why: gfx803_w_kernel fetches 8-deep K pieces, 16 bytes of each 64-byte
+// line of a K-contiguous fp16 row, and L2 delivers every line up to four
+// times; fetching two pieces at a time (P2) takes it to 127 VGPRs, so a
+// wider fetch does not fit one wavefront. Here a slice is 16 deep (32 bytes
+// per row), and the 128 threads share its fetch: 12 VGPRs hold the next
+// slice while the current one is multiplied. One LDS buffer (12 KiB) leaves
+// room for four workgroups per CU, two wavefronts per SIMD. The barriers
+// drain the outstanding loads, which by then have had a whole slice (1024
+// multiply-adds per lane) to arrive.
+//
+// Each output accumulates its K products one at a time in increasing k, as in
+// the other tiles, and pz adds the +0 those would have padded, so results are
+// bit-identical.
+#define GFX803_W2_KH 16
+
+template <typename E>
+__global__ void __launch_bounds__(128) __attribute__((amdgpu_waves_per_eu(2)))
+gfx803_w2_kernel(int M, int N, int K, float alpha,
+                 const E* __restrict__ A, int lda, int64_t strideA,
+                 const E* __restrict__ B, int ldb, int64_t strideB,
+                 float beta, E* __restrict__ C, int ldc, int64_t strideC, int pz) {
+    static_assert(sizeof(E) == 2, "fp16 operands");
+    constexpr int KH = GFX803_W2_KH;
+    typedef E vec __attribute__((ext_vector_type(8)));
+    __shared__ float As[KH][64];
+    __shared__ float Bs[KH][128];
+    const int64_t bz = (int64_t)blockIdx.z;
+    A += bz * strideA;
+    B += bz * strideB;
+    C += bz * strideC;
+    const int gx = M / 64;
+    const int row0 = (blockIdx.x % gx) * 64, col0 = (blockIdx.x / gx) * 128;
+    const int t = threadIdx.x, r = t >> 1, kq = (t & 1) * 8;
+    const E* pa = A + (size_t)(row0 + r) * lda + kq;
+    const E* pb0 = B + (size_t)(col0 + r) * ldb + kq;
+    const E* pb1 = B + (size_t)(col0 + 64 + r) * ldb + kq;
+    const int w = t >> 6, lane = t & 63, tx = lane & 7, ty = lane >> 3, cb = 64 * w;
+
+    vec ra, rb0, rb1;
+    auto load = [&]() {
+        ra = *reinterpret_cast<const vec*>(pa);
+        rb0 = *reinterpret_cast<const vec*>(pb0);
+        rb1 = *reinterpret_cast<const vec*>(pb1);
+        pa += KH;
+        pb0 += KH;
+        pb1 += KH;
+    };
+    auto store = [&]() {
+        #pragma unroll
+        for (int e = 0; e < 8; e++) {
+            As[kq + e][r] = static_cast<float>(ra[e]);
+            Bs[kq + e][r] = static_cast<float>(rb0[e]);
+            Bs[kq + e][64 + r] = static_cast<float>(rb1[e]);
+        }
+    };
+
+    float acc[8][8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++)
+        #pragma unroll
+        for (int j = 0; j < 8; j++) acc[i][j] = 0.0f;
+
+    auto compute = [&]() {
+        float a[2][8], b[2][8];
+        auto read = [&](int s, int k) {
+            const float4 x0 = *reinterpret_cast<const float4*>(&As[k][tx * 4]);
+            const float4 x1 = *reinterpret_cast<const float4*>(&As[k][32 + tx * 4]);
+            const float4 y0 = *reinterpret_cast<const float4*>(&Bs[k][cb + ty * 4]);
+            const float4 y1 = *reinterpret_cast<const float4*>(&Bs[k][cb + 32 + ty * 4]);
+            a[s][0] = x0.x; a[s][1] = x0.y; a[s][2] = x0.z; a[s][3] = x0.w;
+            a[s][4] = x1.x; a[s][5] = x1.y; a[s][6] = x1.z; a[s][7] = x1.w;
+            b[s][0] = y0.x; b[s][1] = y0.y; b[s][2] = y0.z; b[s][3] = y0.w;
+            b[s][4] = y1.x; b[s][5] = y1.y; b[s][6] = y1.z; b[s][7] = y1.w;
+        };
+        read(0, 0);
+        #pragma unroll
+        for (int k = 0; k < KH; k++) {
+            if (k + 1 < KH) read((k + 1) & 1, k + 1);
+            #pragma unroll
+            for (int i = 0; i < 8; i++)
+                #pragma unroll
+                for (int j = 0; j < 8; j++) acc[i][j] += a[k & 1][i] * b[k & 1][j];
+            __builtin_amdgcn_sched_barrier(0);
+        }
+    };
+
+    const int ns = K / KH;
+    load();
+    store();
+    __syncthreads();
+    // One basic block per slice (see gfx803_w_tile): the last slice is
+    // computed after the loop instead of under a branch.
+    for (int s = 0; s + 1 < ns; s++) {
+        load();
+        compute();
+        __syncthreads();
+        store();
+        __syncthreads();
+    }
+    compute();
+
+    if (pz) {
+        #pragma unroll
+        for (int i = 0; i < 8; i++)
+            #pragma unroll
+            for (int j = 0; j < 8; j++) acc[i][j] += 0.0f;
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+        const int col = col0 + cb + (j < 4 ? ty * 4 + j : 32 + ty * 4 + j - 4);
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const int row = row0 + (i < 4 ? tx * 4 + i : 32 + tx * 4 + i - 4);
+            const size_t idx = (size_t)col * ldc + row;
+            C[idx] = static_cast<E>(alpha * acc[i][j] + (beta != 0.0f ? beta * static_cast<float>(C[idx]) : 0.0f));
+        }
+    }
+}
+
 inline long gfx803_sgemm_cus() {
     static const long cus = [] {
         int dev = 0, n = 0;
@@ -1719,6 +1845,21 @@ inline long gfx803_sgemm_cus() {
         return (long)n;
     }();
     return cus;
+}
+
+// The calls gfx803_w2_kernel takes: fp16 TN with whole 64x128 tiles, K a
+// multiple of 16, and at least three rounds of tiles over the CUs' four
+// workgroup slots each. On an RX 590 it ran SDXL's large linears 17-27%
+// faster (TN 5120x8192x640: 13.9 -> 10.1 ms, 10240x2048x1280: 10.4 -> 8.6)
+// and calls with fewer tiles up to 64% slower: a 64x128 tile is twice the
+// work of the 64x64 tiles it replaces, so a call with few of them leaves
+// CUs idle in its last round. GFX803_SGEMM_W2 overrides the rule for timing:
+// 0 = never, 1 = every call whose shape it supports.
+inline bool gfx803_w2_applies(int M, int N, int K, int batch, bool transA, bool transB, size_t elem) {
+    static const long mode = gfx803_sgemm_env_long("GFX803_SGEMM_W2", -1);
+    if (mode == 0 || elem != 2 || !transA || transB || M % 64 != 0 || N % 128 != 0 || K % GFX803_W2_KH != 0)
+        return false;
+    return mode == 1 || (long)(M / 64) * (N / 128) * batch >= 3 * 4 * gfx803_sgemm_cus();
 }
 
 // Tile width for gfx803_w_kernel: 64x64 tiles unless 64x32 tiles fill the
@@ -1882,6 +2023,25 @@ inline hipError_t gfx803_gemm_strided_batched(int M, int N, int K,
         return hipSuccess;
     }
     const int tile = gfx803_sgemm_pick_tile(M, N, K, batch_count, sizeof(T) == 2);
+    if constexpr (sizeof(T) == 2) {
+        if (gfx803_w2_applies(M, N, K, batch_count, transA, transB, sizeof(T)) &&
+            (int64_t)(M / 64) * (N / 128) <= 0x7fffffff) {
+            const int kt_old = gfx803_sgemm_g_applies<T>(tile, M, K, lda, transA, ldb, transB) ? 32 : GFX803_SGEMM_BIG_K;
+            (void)hipGetLastError();
+            for (int start = 0; start < batch_count; start += GFX803_SGEMM_MAX_GRID_YZ) {
+                int chunk = batch_count - start;
+                if (chunk > GFX803_SGEMM_MAX_GRID_YZ) chunk = GFX803_SGEMM_MAX_GRID_YZ;
+                hipLaunchKernelGGL(gfx803_w2_kernel<T>, dim3((unsigned)((M / 64) * (N / 128)), 1, (unsigned)chunk),
+                                   dim3(128), 0, stream, M, N, K, alpha,
+                                   A + (int64_t)start * strideA, lda, strideA,
+                                   B + (int64_t)start * strideB, ldb, strideB, beta,
+                                   C + (int64_t)start * strideC, ldc, strideC, K % kt_old != 0 ? 1 : 0);
+                hipError_t err = hipGetLastError();
+                if (err != hipSuccess) return err;
+            }
+            return hipSuccess;
+        }
+    }
     if (gfx803_w_applies(tile, M, transA, transB, batch_count, sizeof(T))) {
         const int kt_old = gfx803_sgemm_g_applies<T>(tile, M, K, lda, transA, ldb, transB) ? 32 : GFX803_SGEMM_BIG_K;
         hipError_t err;
