@@ -137,7 +137,7 @@ Training
       --fresh-latents      delete cached latents and re-encode them
       --no-checkpointing   keep activations instead of recomputing them in the
                            backward pass: about 30% faster at 512 px, but the
-                           peak rises from about 5.2 to 7.0 GB, which leaves
+                           peak rises from about 5.6 to 6.9 GB, which leaves
                            no room for a desktop on an 8 GB card
 
 GPU stack and diagnostics

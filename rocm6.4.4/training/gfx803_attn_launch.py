@@ -10,7 +10,7 @@ one SD1.5 self-attention at 512 px, which is what forces gradient
 checkpointing on an 8 GB card. The fused kernels (/opt/gfx803-attn, built
 from tools/gfx803_fused_attention.hip) recompute them from a per-row
 log-sum-exp, so memory grows with the token count instead. Calls the
-kernels do not cover (masks, other head sizes, small attentions) keep
+kernels do not cover (masks, dropout, head sizes other than 40/64/80) keep
 PyTorch's implementation. GFX803_ATTN_TRAIN=0 sends every call needing
 gradients back to PyTorch.
 """

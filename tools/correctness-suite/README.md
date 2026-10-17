@@ -139,6 +139,10 @@ any image of the line with the card passed through.
   `--lib`) against float64 at SD 1.5 and SDXL shapes, odd sizes and tails, within 1e-4. The
   large-logit cases are ill-conditioned (a CPU fp32 computation is already 2e-4 to 5e-4 off), so
   they fail only above 4x that CPU fp32 error. Expect 23 of 23.
+- `attention_train_check.py`: the fused attention's training path (forward with log-sum-exp and the
+  backward kernels) against float64 autograd: output, dQ, dK and dV at self- and cross-attention
+  shapes, ragged sizes, fp16 inputs and large logits, plus bit identity of the inference path.
+  Needs `tools/` mounted at `/tools` (or `GFX803_TOOLS`). Expect PASS.
 - `shim_alpha0_check.py`: GEMMs with alpha == 0 (and k == 0) must give beta * C without reading A
   or B, so a NaN or Inf in A or B stays out of C. Expect 15 of 15; a shim that computes 0 * (A * B)
   fails 13.

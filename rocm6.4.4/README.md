@@ -323,8 +323,8 @@ and `vae-ft-mse-840000-ema-pruned` from `ComfyUI/models/vae/`, fp32, AdamW at
 (`--resume-run`); a run whose loss turns NaN stops, drops the NaN checkpoints
 and resumes from the last clean state. A healthy SD 1.5 LoRA loss sits around
 0.1-0.2. On an RX 590, a step (4 accumulated images of up to 512x512) takes
-about 3.1 seconds at a 5.2 GB card peak, or 2.3 seconds with
-`--no-checkpointing`, which raises the peak to 7.0 GB and leaves no room for a
+about 2.9 seconds at a 5.6 GB card peak, or 2.0 seconds with
+`--no-checkpointing`, which raises the peak to 6.9 GB and leaves no room for a
 desktop on an 8 GB card. The UNet's attention runs through the fused kernels
 in `tools/gfx803_fused_attention.hip`, whose backward keeps no N x M matrices
 (`GFX803_ATTN_TRAIN=0` uses PyTorch's attention instead).

@@ -140,7 +140,7 @@ Open targets in recommended order, then the rest.
 | SD-1 | Winograd weight gradients | full fine-tuning and LoCon only | Open |
 | LLM-3 | mmvq vs mmq for 9-16 tokens | speculative/parallel decoding | Open |
 | LLM-1b | SDWA dot product losses (2-token decode) | 1-11% on 2-token decode | Open, minor |
-| SD-8 | Fused attention backward for training | SD1.5 LoRA 512 px 3.37 -> 3.13 s/step and 7.6 -> 5.2 GB; 2.30 s/step without gradient checkpointing | Done (first version) |
+| SD-8 | Fused attention backward for training | SD1.5 LoRA 512 px 3.37 -> 2.87 s/step and 7.6 -> 5.6 GB; 2.03 s/step without gradient checkpointing | Done |
 | SD-6 | Multi-wave fused attention | SD 1.5 fp16 step attention 161 -> 92 ms (step 460 -> 393 ms); SDXL self-attention 2.9x | Done |
 | LLM-4 | llama.cpp prompts through dequantize + fp32 SGEMM (patch 106) | Qwen3 8B prompt 149 -> 215 tok/s in Ollama | Done |
 | LLM-7 | DeltaNet conv-input concat (patch 107) | Qwen3.6 35B-A3B pp2048 244 -> 270 tok/s | Done |
@@ -556,26 +556,31 @@ Measured, and not worth pursuing unless something changes:
 
 ### SD-8: fused attention backward
 
-`tools/gfx803_fused_attention.hip` (`attn_bwd_dkdv`, `attn_bwd_dq`, and an
-LSE output from the forward), used by `gfx803-train` through `--sdpa`. A
-fp32 SD1.5 UNet forward and backward at 384 px spends ~97 of 387 ms in
+`tools/gfx803_fused_attention.hip` (`attn_bwd::attn_bwd_main`, `attn_bwd::attn_bwd_dq_reduce`, and an
+LSE output from the forward), used by `gfx803-train` through `--sdpa`. A fp32
+SD1.5 UNet forward and backward at 384 px spends ~97 of 387 ms in PyTorch's
 attention at the 48x48 level and 1.4 GB on its matrices; at 512 px it runs
 out of 8 GB without gradient checkpointing, and fits in 4.6 GB when the
-attention keeps no N x M state. Per call at 4096 tokens, head size 40:
-PyTorch forward and backward 59 ms and 2.6 GB extra, fused 7 + 43 ms with
-memory linear in N. Training (512 px, 4 accumulated, 40 steps, seed 42):
-3.37 -> 3.13 s/step, 7.6 -> 5.2 GB; 2.30 s/step at 7.0 GB with
-`--no-checkpointing`; identical loss.
+attention keeps no N x M state.
 
-Left: the backward runs at ~1.7 TFLOPS-equivalent with 32x32 tiles and
-scalar LDS reads; head size 80 at 1024 tokens is slower than PyTorch (9.3
-against 5.9 ms), so calls below 2M query-key pairs stay on PyTorch. In a
-512 px micro-step without checkpointing the five 64x64 backward calls are
-about 215 of ~575 ms, so this kernel is the training step's largest single
-lever. Register-tiling it (one wave per 32x32 tile, 4x4 S and dP per thread
-from float4 LDS reads) measured slower, 43 -> 70 ms: 180-250 VGPRs and the
-per-block LDS leave one or two waves per CU. A faster version has to keep
-several waves per CU on one K/V tile within 64 KiB of LDS.
+Design: a block of 2x2 waves owns 64 keys (32 for head size 80), keeps K and V
+in LDS and dK/dV in registers, and streams 64-row query tiles; S and dP are
+computed once per tile pair from float4 LDS reads (lane tiling as in the
+forward), P and dS move between lanes with `ds_bpermute`, LDS rows are
+XOR-swizzled instead of padded (padding would push head size 64 past 64 KiB),
+operands go through raw buffer loads (one 32-bit offset per access, rows past
+N read 0), and dQ is written per key block to scratch slabs that a second
+kernel adds in a fixed order. Per call at 4096 tokens, head size 40: 18.3 ms
+(4.1 TFLOPS-equivalent), against 43.2 ms for the previous two-kernel version
+that computed S and dP twice, and 59 ms plus 2.6 GB for PyTorch; 2304 tokens
+5.9 ms; head size 80 at 1024 tokens 2.9 ms (PyTorch 5.9). A two-kernel
+version without scratch built the same way measured 23.0 ms. Training (512
+px, 4 accumulated, 40 steps, seed 42): 3.37 -> 2.87 s/step, 7.6 -> 5.6 GB;
+2.03 s/step at 6.9 GB with `--no-checkpointing`; identical loss.
+
+Left: the slab scratch is 336 MB at 4096 tokens (537 MB at head size 64);
+the P/dS lane exchange (336 bpermutes per tile pair) is the largest
+remaining overhead.
 
 ### SD-6: multi-wave fused attention
 

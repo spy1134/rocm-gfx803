@@ -728,16 +728,21 @@ probability matrices for the backward pass: one SD1.5 self-attention at the
 forward and backward at 512 px runs out of 8 GB on that alone, which is why
 512 px training needs gradient checkpointing (an extra forward per step).
 The node's attention library now has a backward that recomputes the
-probabilities per 32x32 tile from Q, K and the forward's per-row log-sum-exp,
-so its memory grows with the token count; dK/dV and dQ are separate kernels
-because gfx803 has no global float atomic add. Its gradients match a float64
-reference within 1e-5 (fp32) and 5e-4 (fp16 inputs). `gfx803-train` runs
-sd-scripts with `--sdpa` and routes self-attentions of at least 2M query-key
-pairs through it (`training/gfx803_attn_launch.py`; `GFX803_ATTN_TRAIN=0`
-turns it off). SD1.5 LoRA, 512 px, batch 1, 4 accumulated, 40 steps, seed 42:
-3.37 s/step at a 7.6 GB card peak before, 3.13 s/step at 5.2 GB with it, and
-2.30 s/step at 7.0 GB with `--no-checkpointing`, which the fused attention
-makes possible; the loss matches the previous run at every step.
+probabilities from Q, K and the forward's per-row log-sum-exp, so its memory
+grows with the token count. One kernel computes S and dP once per tile pair
+and accumulates dK and dV in registers; gfx803 has no global float atomic add,
+so each key block writes its dQ partial sums to a scratch slab (336 MB for the
+64x64 level at batch 1, from PyTorch's allocator) and a second kernel adds the
+slabs in a fixed order. At 4096 tokens, head size 40, it takes 18.3 ms against
+59 ms for PyTorch's forward and backward with 2.6 GB of matrices. Its
+gradients match a float64 reference within 1e-5 (fp32) and 5e-4 (fp16
+inputs). `gfx803-train` runs sd-scripts with `--sdpa`, which routes every
+attention with head size 40, 64 or 80 through it
+(`training/gfx803_attn_launch.py`; `GFX803_ATTN_TRAIN=0` turns it off). SD1.5
+LoRA, 512 px, batch 1, 4 accumulated, 40 steps, seed 42: 3.37 s/step at a
+7.6 GB card peak before, 2.87 s/step at 5.6 GB with it, and 2.03 s/step at
+6.9 GB with `--no-checkpointing`, which the fused attention makes possible;
+the loss matches the previous run at every step.
 
 **SDXL.** With fp16, SDXL LoRA training fits in 8 GB on a headless machine.
 Measured training steps (LoRA dim 8, gradient checkpointing, cached text

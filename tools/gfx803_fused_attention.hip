@@ -938,147 +938,477 @@ static int check_args(const float* Q, const float* K, const float* V, const floa
 // Backward for training (fp32, contiguous [B, H, rows, D], head sizes 40/64/80).
 // PyTorch's attention backward keeps the full score and probability matrices
 // (2.6 GB extra for one SD1.5 self-attention at 512 px, batch 1), which is why
-// 512 px LoRA training needs gradient checkpointing on an 8 GB card. These
-// kernels recompute P from Q, K and the forward's per-row log-sum-exp instead,
-// so memory grows with N, not N*M. dK/dV and dQ are two kernels, each
-// parallel over its own tiles, because gfx803 has no global float atomic add.
-// ---------------------------------------------------------------------------
+// 512 px LoRA training needs gradient checkpointing on an 8 GB card. This
+// backward recomputes P from Q, K and the forward's per-row log-sum-exp, so its
+// memory grows with N, not N*M.
+//
+// Fused attention backward for gfx803, head sizes 40/64/80, fp32, contiguous [B*H, rows, D].
+// Inputs Q, K, V, dO, LSE (log2-domain log-sum-exp of the scaled scores per query row, as the
+// forward writes it), Dvec = rowsum(dO * O). Outputs dQ, dK, dV.
+//
+// S = QK^T and dP = dO V^T are computed once per (query, key) pair and feed all three gradients:
+// 5 GEMM-sized products per pair, where one kernel per gradient direction needs 7. A block owns
+// BK keys, keeps K and V in LDS for its whole life, streams the queries in BQ-row tiles and
+// keeps dK and dV in registers. dQ needs a sum over every key block, and gfx803 has no float
+// atomic add, so each block writes dQ summed over its own BK keys to a slab of a scratch buffer
+// and a second kernel adds the slabs in a fixed order (deterministic, and no CAS loops).
+//
+// Lane tiling follows the forward kernel (lane (tx, ty) = (lane & 7, lane >> 3) owns query rows
+// tx + 8i and keys ty + 8j of its wave's tile) so that S and dP come from float4 LDS reads with
+// one operand broadcast. The P and dS values another lane needs come through ds_bpermute from
+// the owning lane's registers: P and dS tiles in LDS (32 KiB per block) do not fit next to the
+// K, V, Q and dO tiles.
+#define LAUNCH(KERNEL, GRID, BLOCK, STREAM, ...) KERNEL<<<GRID, BLOCK, 0, STREAM>>>(__VA_ARGS__)
+
+// Raw buffer access: the descriptor lives in SGPRs and each access needs one 32-bit VGPR
+// offset, where a flat access needs a 64-bit VGPR address per distinct pointer, and the
+// compiler keeps those addresses live across the whole query loop next to the dK/dV
+// accumulators. An offset at or past the descriptor's byte count reads 0 and drops writes,
+// which is how rows past N are handled without branches.
+typedef int attnb_i32x4 __attribute__((ext_vector_type(4)));
+typedef float attnb_f32x4 __attribute__((ext_vector_type(4)));
+typedef float attnb_f32x2 __attribute__((ext_vector_type(2)));
+__device__ attnb_f32x4 attnb_bl4(attnb_i32x4 r, int vo, int so, int aux) __asm("llvm.amdgcn.raw.buffer.load.v4f32");
+__device__ float attnb_bl1(attnb_i32x4 r, int vo, int so, int aux) __asm("llvm.amdgcn.raw.buffer.load.f32");
+__device__ void attnb_bs4(attnb_f32x4 v, attnb_i32x4 r, int vo, int so, int aux) __asm("llvm.amdgcn.raw.buffer.store.v4f32");
+__device__ void attnb_bs2(attnb_f32x2 v, attnb_i32x4 r, int vo, int so, int aux) __asm("llvm.amdgcn.raw.buffer.store.v2f32");
+__device__ void attnb_bs1(float v, attnb_i32x4 r, int vo, int so, int aux) __asm("llvm.amdgcn.raw.buffer.store.f32");
+struct Buf { attnb_i32x4 r; };
+// Byte count in dword 2, stride 0, data format 32 in dword 3 (gfx8 treats a zero format as
+// an invalid descriptor). The range check covers the VGPR offset, not soffset, so all
+// variable offsets go into the VGPR operand. Callers pass block-uniform values, but the 64-bit
+// address arithmetic runs on the VALU on gfx8 and the compiler then cannot prove the result
+// uniform; readfirstlane states it, otherwise every access becomes a waterfall loop.
+__device__ __forceinline__ Buf make_buf(const void* base, unsigned bytes) {
+    const unsigned long long a = reinterpret_cast<unsigned long long>(base);
+    Buf b;
+    b.r.x = __builtin_amdgcn_readfirstlane((int)(unsigned)a);
+    b.r.y = __builtin_amdgcn_readfirstlane((int)((unsigned)(a >> 32) & 0xffffu));
+    b.r.z = __builtin_amdgcn_readfirstlane((int)bytes);
+    b.r.w = 0x00020000;
+    return b;
+}
+__device__ __forceinline__ float4 bload4(Buf b, int off) {
+    const attnb_f32x4 v = attnb_bl4(b.r, off, 0, 0);
+    return make_float4(v.x, v.y, v.z, v.w);
+}
+__device__ __forceinline__ float bload1(Buf b, int off) { return attnb_bl1(b.r, off, 0, 0); }
+__device__ __forceinline__ void bstore4(Buf b, int off, float4 v) {
+    attnb_f32x4 x; x.x = v.x; x.y = v.y; x.z = v.z; x.w = v.w;
+    attnb_bs4(x, b.r, off, 0, 0);
+}
+__device__ __forceinline__ void bstore2(Buf b, int off, float2 v) {
+    attnb_f32x2 x; x.x = v.x; x.y = v.y;
+    attnb_bs2(x, b.r, off, 0, 0);
+}
+__device__ __forceinline__ void bstore1(Buf b, int off, float v) { attnb_bs1(v, b.r, off, 0, 0); }
+#include <math.h>
+#include <stddef.h>
+#include <stdint.h>
+
+
 namespace attn_bwd {
 
-constexpr int BT = 32;   // keys or queries per tile
+template <bool B> struct Own { static constexpr bool value = B; };
 
-// S, P and dS for one 32x32 tile: thread t computes row t/8, columns 4*(t%8)..+3.
+// Chunk swizzle of a row: rows r..r+7 (r a multiple of 8) read at the same logical chunk fall
+// into 8 distinct 16-byte bank groups. Depends on r mod 8 only, so a row's swizzle is fixed by
+// the lane's tx or ty. The XOR stays inside the row because D/4 is a multiple of 2, 8 and 4.
+template <int D> __device__ __forceinline__ int swz(int r) {
+    return D == 40 ? ((r >> 2) & 1) : D == 64 ? (r & 7) : ((r >> 1) & 3);
+}
+// d-group of the dK/dV accumulators of lane tx. With the identity the dV/dK slice reads of the
+// 8 lanes of a pass collide 2-way (D=40), 8-way (D=64) or 4-way (D=80) under the swizzle above;
+// these permutations, found by exhaustive search over the 8! orders, make all 8 rotation
+// steps conflict-free.
+template <int D> __device__ __forceinline__ int dgroup(int t) {
+    constexpr uint32_t tab = D == 40 ? 0x67453210u : D == 64 ? 0x57136420u : 0x45762310u;
+    return (tab >> (4 * t)) & 7;
+}
+template <int D> __device__ __forceinline__ int pel(int e, int fr) { return (((e >> 2) ^ fr) << 2) | (e & 3); }
+
+__device__ __forceinline__ float4 ld4(const float* p) { return *reinterpret_cast<const float4*>(p); }
+__device__ __forceinline__ void st4(float* p, float4 v) { *reinterpret_cast<float4*>(p) = v; }
+
+// The D/8 elements of d-group g: chunks g, g+8, ... and then D/8 mod 4 elements from the
+// tail 32*(D/32) .. D-1, so every group has float4 reads for all but at most two elements.
 template <int D>
-__device__ __forceinline__ void tile_p_ds(float (*sQ)[D + 1], float (*sK)[D + 1],
-                                          float (*sdO)[D + 1], float (*sV)[D + 1],
-                                          const float* s_lse, const float* s_dvec, float scale_log2,
-                                          int qv, int kv, float (*sP)[BT + 1], float (*sdS)[BT + 1]) {
-    const int t = threadIdx.x, q = t >> 3, k0 = (t & 7) * 4;
-    float s[4] = {0, 0, 0, 0}, dp[4] = {0, 0, 0, 0};
-    #pragma unroll 8
-    for (int d = 0; d < D; ++d) {
-        const float qd = sQ[q][d], gd = sdO[q][d];
-        #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            s[j] += qd * sK[k0 + j][d];
-            dp[j] += gd * sV[k0 + j][d];
-        }
-    }
+__device__ __forceinline__ void load_slice(const float* row, int g, int fr, float (&o)[D / 8]) {
+    constexpr int DG = D / 8, NFC = DG / 4, RM = DG % 4;
     #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const bool ok = q < qv && k0 + j < kv;
-        const float p = ok ? exp2f(s[j] * scale_log2 - s_lse[q]) : 0.0f;
-        sP[q][k0 + j] = p;
-        sdS[q][k0 + j] = ok ? p * (dp[j] - s_dvec[q]) : 0.0f;
+    for (int c = 0; c < NFC; ++c) {
+        const float4 v = ld4(row + pel<D>(4 * (g + 8 * c), fr));
+        o[4 * c] = v.x; o[4 * c + 1] = v.y; o[4 * c + 2] = v.z; o[4 * c + 3] = v.w;
     }
+    if constexpr (RM == 1) o[4 * NFC] = row[pel<D>(32 * NFC + g, fr)];
+    if constexpr (RM == 2) {
+        const float2 v = *reinterpret_cast<const float2*>(row + pel<D>(32 * NFC + 2 * g, fr));
+        o[4 * NFC] = v.x; o[4 * NFC + 1] = v.y;
+    }
+}
+template <int D>
+__device__ __forceinline__ void store_slice(float* row, int g, int fr, const float (&o)[D / 8]) {
+    constexpr int DG = D / 8, NFC = DG / 4, RM = DG % 4;
+    #pragma unroll
+    for (int c = 0; c < NFC; ++c)
+        st4(row + pel<D>(4 * (g + 8 * c), fr), make_float4(o[4 * c], o[4 * c + 1], o[4 * c + 2], o[4 * c + 3]));
+    if constexpr (RM == 1) row[pel<D>(32 * NFC + g, fr)] = o[4 * NFC];
+    if constexpr (RM == 2)
+        *reinterpret_cast<float2*>(row + pel<D>(32 * NFC + 2 * g, fr)) = make_float2(o[4 * NFC], o[4 * NFC + 1]);
 }
 
 template <int D>
-__device__ __forceinline__ void load_rows(float (*dst)[D + 1], const float* src, int row0, int rows) {
-    for (int i = threadIdx.x; i < BT * D; i += 256) {
-        const int r = i / D, d = i - r * D;
-        dst[r][d] = row0 + r < rows ? src[(size_t)(row0 + r) * D + d] : 0.0f;
+__device__ __forceinline__ void bstore_slice(Buf b, int row_off, int g, const float (&o)[D / 8]) {
+    constexpr int DG = D / 8, NFC = DG / 4, RM = DG % 4;
+    #pragma unroll
+    for (int c = 0; c < NFC; ++c)
+        bstore4(b, row_off + 16 * (g + 8 * c), make_float4(o[4 * c], o[4 * c + 1], o[4 * c + 2], o[4 * c + 3]));
+    if constexpr (RM == 1) bstore1(b, row_off + 4 * (32 * NFC + g), o[4 * NFC]);
+    if constexpr (RM == 2) bstore2(b, row_off + 4 * (32 * NFC + 2 * g), make_float2(o[4 * NFC], o[4 * NFC + 1]));
+}
+
+// acc[i][j] = dot(a row 8i, b row 8j) for a 4 x JP lane tile. Plain a * b + c: gfx803 issues
+// fmaf()'s v_fma_f32 at a quarter of the rate of the v_mac_f32 this contracts to. Two steps per
+// iteration let the scheduler issue the second step's loads under the first step's FMAs; an
+// explicit double buffer across iterations costs about 100 more VGPRs with this compiler and
+// spills.
+template <int D, int JP>
+__device__ __forceinline__ void tile_dot(const float* a, const float* b, int fa, int fb, float (&acc)[4][JP]) {
+    #pragma unroll
+    for (int i = 0; i < 4; ++i)
+        #pragma unroll
+        for (int j = 0; j < JP; ++j) acc[i][j] = 0.0f;
+    #pragma unroll 2
+    for (int c = 0; c < D / 4; ++c) {
+        float4 x[4], y[JP];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) x[i] = ld4(a + 8 * i * D + ((c ^ fa) << 2));
+        #pragma unroll
+        for (int j = 0; j < JP; ++j) y[j] = ld4(b + 8 * j * D + ((c ^ fb) << 2));
+        #pragma unroll
+        for (int j = 0; j < JP; ++j)
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                acc[i][j] += x[i].x * y[j].x;
+                acc[i][j] += x[i].y * y[j].y;
+                acc[i][j] += x[i].z * y[j].z;
+                acc[i][j] += x[i].w * y[j].w;
+            }
     }
 }
 
-
-// dK = scale * dS^T Q, dV = P^T dO, one 32-key tile per block, looping over all query tiles.
-template <int D>
-__global__ void __launch_bounds__(256)
-attn_bwd_dkdv(const float* __restrict__ Q, const float* __restrict__ K, const float* __restrict__ V,
+// Block = 4 waves = WQ query groups x WK key groups. Wave (wq, wk) handles 32 query rows x KT
+// keys of each (BQ x BK) tile pair: 4 rows x KT/8 keys per lane in S/dP, KT/8 keys x D/8
+// elements per lane in dK/dV, 4 rows x D/8 elements per lane in dQ.
+template <int D, int KT, int WQ, int WK>
+__global__ void __launch_bounds__(256, 1)
+attn_bwd_main(const float* __restrict__ Q, const float* __restrict__ K, const float* __restrict__ V,
               const float* __restrict__ dO, const float* __restrict__ LSE, const float* __restrict__ DV,
-              float* __restrict__ dK, float* __restrict__ dVo, int N, int M, float scale) {
-    __shared__ float sQ[BT][D + 1], sK[BT][D + 1], sV[BT][D + 1], sdO[BT][D + 1];
-    __shared__ float sP[BT][BT + 1], sdS[BT][BT + 1], s_lse[BT], s_dvec[BT];
+              float* __restrict__ dK, float* __restrict__ dVo, float* __restrict__ dQp, long long slab,
+              int N, int M, float scale) {
+    constexpr int D4 = D / 4, DG = D / 8, JN = KT / 8, JP = JN < 4 ? JN : 4, NP = JN / JP;
+    constexpr int BK = KT * WK, BQ = 32 * WQ;
+    constexpr int QV4 = BQ * D4, QPT = (QV4 + 255) / 256;
+    static_assert(WQ * WK == 4, "four waves per block");
+    static_assert(D % 8 == 0 && KT % 8 == 0, "lane tiling");
+    static_assert(2 * (BK + BQ) * D * 4 <= 65536, "LDS");
+    static_assert(WK * BQ <= 2 * BQ, "dQ reduction must fit in the Q/dO tiles");
+    static_assert(WQ * BK <= 2 * (BK + BQ), "dK/dV reduction must fit in LDS");
+
+    __shared__ __attribute__((aligned(16))) float smem[2 * (BK + BQ) * D];
+    float* const sK = smem;
+    float* const sV = sK + BK * D;
+    float* const sQ = sV + BK * D;
+    float* const sG = sQ + BQ * D;
+
+    const int tid = threadIdx.x, w = tid >> 6, lane = tid & 63, tx = lane & 7, ty = lane >> 3;
+    const int wq = w % WQ, wk = w / WQ;
+    const int kb = blockIdx.x;
     const size_t bh = blockIdx.y;
-    const int k0 = blockIdx.x * BT, t = threadIdx.x;
+    const int k0 = kb * BK;
     Q += bh * N * D; dO += bh * N * D; LSE += bh * N; DV += bh * N;
     K += bh * M * D; V += bh * M * D; dK += bh * M * D; dVo += bh * M * D;
-    const float scale_log2 = scale * 1.4426950408889634f;
-    load_rows<D>(sK, K, k0, M);
-    load_rows<D>(sV, V, k0, M);
-    constexpr int PER = D / 8;
-    const int kk = t >> 3, dd = t & 7;
-    float aK[PER], aV[PER];
-    #pragma unroll
-    for (int j = 0; j < PER; ++j) aK[j] = aV[j] = 0.0f;
-    const int kv = M - k0 < BT ? M - k0 : BT;
-    for (int q0 = 0; q0 < N; q0 += BT) {
-        __syncthreads();
-        load_rows<D>(sQ, Q, q0, N);
-        load_rows<D>(sdO, dO, q0, N);
-        if (t < BT) {
-            s_lse[t] = q0 + t < N ? LSE[q0 + t] : 0.0f;
-            s_dvec[t] = q0 + t < N ? DV[q0 + t] : 0.0f;
+    float* const dQs = dQp + (size_t)kb * slab + bh * N * D;
+    const float sl = scale * 1.4426950408889634f;
+
+    // Rows past M stay zero so that their S and dP are finite before masking.
+    for (int v = tid; v < BK * D4; v += 256) {
+        const int r = v / D4, c = v - r * D4;
+        float4 a = make_float4(0.0f, 0.0f, 0.0f, 0.0f), b = a;
+        if (k0 + r < M) { a = ld4(K + (size_t)(k0 + r) * D + 4 * c); b = ld4(V + (size_t)(k0 + r) * D + 4 * c); }
+        const int o = r * D + ((c ^ swz<D>(r)) << 2);
+        st4(sK + o, a);
+        st4(sV + o, b);
+    }
+
+    float4 qreg[QPT], greg[QPT];
+    float lse_n[4], dv_n[4];
+    const int qrow = wq * 32 + tx;              // tile row of this lane's i = 0
+    const int krow = wk * KT + ty;              // block key of this lane's j = 0
+    // Rows past N read as zero: their S and dP are 0, so P = 1 and dS = 0 there, and P only
+    // meets their zero dO rows in dV. LSE and Dvec read as 0 for them, which keeps P finite.
+    auto load_tile = [&](int q0) __attribute__((always_inline)) {
+        const unsigned rem = (unsigned)(N - q0) * D * 4;
+        const Buf bq = make_buf(Q + (size_t)q0 * D, rem), bg = make_buf(dO + (size_t)q0 * D, rem);
+        #pragma unroll
+        for (int u = 0; u < QPT; ++u) {
+            const int v = tid + 256 * u;
+            if (QV4 % 256 == 0 || v < QV4) {
+                qreg[u] = bload4(bq, 16 * v);
+                greg[u] = bload4(bg, 16 * v);
+            }
         }
+        const Buf bl = make_buf(LSE + q0, (unsigned)(N - q0) * 4), bd = make_buf(DV + q0, (unsigned)(N - q0) * 4);
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            lse_n[i] = bload1(bl, 4 * (qrow + 8 * i));
+            dv_n[i] = bload1(bd, 4 * (qrow + 8 * i));
+        }
+    };
+    auto store_tile = [&]() __attribute__((always_inline)) {
+        #pragma unroll
+        for (int u = 0; u < QPT; ++u) {
+            const int v = tid + 256 * u;
+            if (QV4 % 256 == 0 || v < QV4) {
+                const int r = v / D4, c = v - r * D4;
+                const int o = r * D + ((c ^ swz<D>(r)) << 2);
+                st4(sQ + o, qreg[u]);
+                st4(sG + o, greg[u]);
+            }
+        }
+    };
+
+    unsigned kvalid = 0;
+    #pragma unroll
+    for (int j = 0; j < JN; ++j) kvalid |= (k0 + krow + 8 * j < M ? 1u : 0u) << j;
+    const int fq = swz<D>(tx), fk = swz<D>(ty);
+    const int gkv = dgroup<D>(tx);
+
+    float aK[JN][DG], aV[JN][DG];
+    #pragma unroll
+    for (int j = 0; j < JN; ++j)
+        #pragma unroll
+        for (int e = 0; e < DG; ++e) aK[j][e] = aV[j][e] = 0.0f;
+
+    const int nqt = (N + BQ - 1) / BQ;
+    load_tile(0);
+    for (int qt = 0; qt < nqt; ++qt) {
+        const int q0 = qt * BQ;
+        if (qt > 0) __syncthreads();
+        store_tile();
+        float lse[4], dvv[4];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) { lse[i] = lse_n[i]; dvv[i] = dv_n[i]; }
         __syncthreads();
-        const int qv = N - q0 < BT ? N - q0 : BT;
-        tile_p_ds<D>(sQ, sK, sdO, sV, s_lse, s_dvec, scale_log2, qv, kv, sP, sdS);
-        __syncthreads();
-        #pragma unroll 4
-        for (int q = 0; q < BT; ++q) {
-            const float p = sP[q][kk], ds = sdS[q][kk];
+
+        // Assigned by the first dQ product rather than zeroed here: zeroed accumulators get
+        // materialised before the S/dP products and hold their VGPRs through them.
+        float aQ[4][DG];
+
+        // The wave's KT keys go through S/dP, dV/dK and dQ in passes of 8*JP keys, so that
+        // only a 4 x JP tile of S and of dP is live next to the dK/dV accumulators.
+        #pragma unroll
+        for (int h = 0; h < NP; ++h) {
+            // S becomes P and G (dP) becomes dS in place.
+            float S[4][JP], G[4][JP];
+            tile_dot<D, JP>(sQ + qrow * D, sK + (krow + 8 * JP * h) * D, fq, fk, S);
+            tile_dot<D, JP>(sG + qrow * D, sV + (krow + 8 * JP * h) * D, fq, fk, G);
             #pragma unroll
-            for (int j = 0; j < PER; ++j) {
-                aV[j] += p * sdO[q][dd + 8 * j];
-                aK[j] += ds * sQ[q][dd + 8 * j];
+            for (int i = 0; i < 4; ++i)
+                #pragma unroll
+                for (int j = 0; j < JP; ++j) {
+                    const float p = (kvalid >> (JP * h + j)) & 1u ? exp2f(S[i][j] * sl - lse[i]) : 0.0f;
+                    G[i][j] = p * (G[i][j] - dvv[i]);
+                    S[i][j] = p;
+                }
+
+            // dV += P^T dO, dK += dS^T Q over the wave's 32 rows. Step s takes the rows of
+            // lane tx ^ s, whose P and dS for this lane's keys sit in the same registers there.
+            auto dvdk = [&](auto own, int s) __attribute__((always_inline)) {
+                const int ts = tx ^ s;
+                const int src = ((ty << 3) | ts) << 2;
+                const int fr = swz<D>(ts);
+                const float* xr = sQ + (wq * 32 + ts) * D;
+                const float* gr = sG + (wq * 32 + ts) * D;
+                auto fetch = [&](int i, float (&xs)[DG], float (&gs)[DG], float (&p)[JP], float (&ds)[JP])
+                    __attribute__((always_inline)) {
+                    load_slice<D>(xr + 8 * i * D, gkv, fr, xs);
+                    load_slice<D>(gr + 8 * i * D, gkv, fr, gs);
+                    #pragma unroll
+                    for (int j = 0; j < JP; ++j) {
+                        if constexpr (decltype(own)::value) { p[j] = S[i][j]; ds[j] = G[i][j]; }
+                        else { p[j] = lane_read(S[i][j], src); ds[j] = lane_read(G[i][j], src); }
+                    }
+                };
+                auto mac = [&](const float (&xs)[DG], const float (&gs)[DG], const float (&p)[JP], const float (&ds)[JP])
+                    __attribute__((always_inline)) {
+                    #pragma unroll
+                    for (int j = 0; j < JP; ++j)
+                        #pragma unroll
+                        for (int e = 0; e < DG; ++e) {
+                            aV[JP * h + j][e] += p[j] * gs[e];
+                            aK[JP * h + j][e] += ds[j] * xs[e];
+                        }
+                };
+                {
+                    #pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        float xs[DG], gs[DG], p[JP], ds[JP];
+                        fetch(i, xs, gs, p, ds);
+                        mac(xs, gs, p, ds);
+                    }
+                }
+            };
+            // Without a dQ pass the next tile's loads hide behind the last dV/dK pass instead.
+            dvdk(Own<true>{}, 0);
+            #pragma unroll 1
+            for (int s = 1; s < 8; ++s) dvdk(Own<false>{}, s);
+
+            // The Q/dO registers are free from here on; the loads hide behind the last dQ pass.
+            if (h == NP - 1 && qt + 1 < nqt) load_tile(q0 + BQ);
+
+            // dQ += dS K over this pass's keys. Step s takes the keys of lane ty ^ s.
+            auto dq = [&](auto own, int s) __attribute__((always_inline)) {
+                const int ys = ty ^ s;
+                const int src = ((ys << 3) | tx) << 2;
+                const int fr = swz<D>(ys);
+                const float* kr = sK + (krow - ty + ys + 8 * JP * h) * D;
+                auto fetch = [&](int j, float (&ks)[DG], float (&d)[4]) __attribute__((always_inline)) {
+                    load_slice<D>(kr + 8 * j * D, ty, fr, ks);
+                    #pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        if constexpr (decltype(own)::value) d[i] = G[i][j];
+                        else d[i] = lane_read(G[i][j], src);
+                    }
+                };
+                auto mac = [&](int j, const float (&ks)[DG], const float (&d)[4]) __attribute__((always_inline)) {
+                    #pragma unroll
+                    for (int i = 0; i < 4; ++i)
+                        #pragma unroll
+                        for (int e = 0; e < DG; ++e) {
+                            if (decltype(own)::value && h == 0 && j == 0) aQ[i][e] = d[i] * ks[e];
+                            else aQ[i][e] += d[i] * ks[e];
+                        }
+                };
+                {
+                    #pragma unroll
+                    for (int j = 0; j < JP; ++j) {
+                        float ks[DG], d[4];
+                        fetch(j, ks, d);
+                        mac(j, ks, d);
+                    }
+                }
+            };
+            dq(Own<true>{}, 0);
+            #pragma unroll 1
+            for (int s = 1; s < 8; ++s) dq(Own<false>{}, s);
+        }
+
+        const Buf bs = make_buf(dQs + (size_t)q0 * D, (unsigned)(N - q0) * D * 4);
+        if constexpr (WK == 1) {
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) bstore_slice<D>(bs, 4 * (qrow + 8 * i) * D, ty, aQ[i]);
+        } else {
+            // The WK waves of a query group hold partial sums over different keys; add them in
+            // the Q/dO tiles, which no wave reads after its dV/dK step.
+            __syncthreads();
+            float* const red = sQ;
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) store_slice<D>(red + (wk * BQ + qrow + 8 * i) * D, ty, fq, aQ[i]);
+            __syncthreads();
+            #pragma unroll
+            for (int u = 0; u < QPT; ++u) {
+                const int v = tid + 256 * u;
+                if (QV4 % 256 == 0 || v < QV4) {
+                    const int r = v / D4, c = v - r * D4;
+                    const int o = r * D + ((c ^ swz<D>(r)) << 2);
+                    float4 a = ld4(red + o);
+                    #pragma unroll
+                    for (int w2 = 1; w2 < WK; ++w2) {
+                        const float4 b = ld4(red + w2 * BQ * D + o);
+                        a.x += b.x; a.y += b.y; a.z += b.z; a.w += b.w;
+                    }
+                    bstore4(bs, 16 * v, a);
+                }
             }
         }
     }
-    if (k0 + kk < M) {
+
+    // dK and dV: add the WQ query groups' partial sums, one operand at a time to fit in LDS.
+    #pragma unroll 1
+    for (int pass = 0; pass < 2; ++pass) {
+        __syncthreads();
+        float* const red = smem;
         #pragma unroll
-        for (int j = 0; j < PER; ++j) {
-            dK[(size_t)(k0 + kk) * D + dd + 8 * j] = aK[j] * scale;
-            dVo[(size_t)(k0 + kk) * D + dd + 8 * j] = aV[j];
+        for (int j = 0; j < JN; ++j)
+            store_slice<D>(red + (wq * BK + krow + 8 * j) * D, gkv, fk, pass ? aV[j] : aK[j]);
+        __syncthreads();
+        float* const out = pass ? dVo : dK;
+        const float mul = pass ? 1.0f : scale;
+        for (int v = tid; v < BK * D4; v += 256) {
+            const int r = v / D4, c = v - r * D4;
+            const int o = r * D + ((c ^ swz<D>(r)) << 2);
+            float4 a = ld4(red + o);
+            #pragma unroll
+            for (int u = 1; u < WQ; ++u) {
+                const float4 b = ld4(red + u * BK * D + o);
+                a.x += b.x; a.y += b.y; a.z += b.z; a.w += b.w;
+            }
+            if (k0 + r < M) st4(out + (size_t)(k0 + r) * D + 4 * c, make_float4(a.x * mul, a.y * mul, a.z * mul, a.w * mul));
         }
     }
 }
 
-// dQ = scale * dS K, one 32-query tile per block, looping over all key tiles.
-template <int D>
+// dQ = scale * sum over key blocks of the slabs, in slab order.
 __global__ void __launch_bounds__(256)
-attn_bwd_dq(const float* __restrict__ Q, const float* __restrict__ K, const float* __restrict__ V,
-            const float* __restrict__ dO, const float* __restrict__ LSE, const float* __restrict__ DV,
-            float* __restrict__ dQ, int N, int M, float scale) {
-    __shared__ float sQ[BT][D + 1], sK[BT][D + 1], sV[BT][D + 1], sdO[BT][D + 1];
-    __shared__ float sP[BT][BT + 1], sdS[BT][BT + 1], s_lse[BT], s_dvec[BT];
-    const size_t bh = blockIdx.y;
-    const int q0 = blockIdx.x * BT, t = threadIdx.x;
-    Q += bh * N * D; dO += bh * N * D; LSE += bh * N; DV += bh * N; dQ += bh * N * D;
-    K += bh * M * D; V += bh * M * D;
-    const float scale_log2 = scale * 1.4426950408889634f;
-    load_rows<D>(sQ, Q, q0, N);
-    load_rows<D>(sdO, dO, q0, N);
-    if (t < BT) {
-        s_lse[t] = q0 + t < N ? LSE[q0 + t] : 0.0f;
-        s_dvec[t] = q0 + t < N ? DV[q0 + t] : 0.0f;
-    }
-    constexpr int PER = D / 8;
-    const int qq = t >> 3, dd = t & 7;
-    float aQ[PER];
-    #pragma unroll
-    for (int j = 0; j < PER; ++j) aQ[j] = 0.0f;
-    const int qv = N - q0 < BT ? N - q0 : BT;
-    for (int k0 = 0; k0 < M; k0 += BT) {
-        __syncthreads();
-        load_rows<D>(sK, K, k0, M);
-        load_rows<D>(sV, V, k0, M);
-        __syncthreads();
-        const int kv = M - k0 < BT ? M - k0 : BT;
-        tile_p_ds<D>(sQ, sK, sdO, sV, s_lse, s_dvec, scale_log2, qv, kv, sP, sdS);
-        __syncthreads();
-        #pragma unroll 4
-        for (int k = 0; k < BT; ++k) {
-            const float ds = sdS[qq][k];
-            #pragma unroll
-            for (int j = 0; j < PER; ++j) aQ[j] += ds * sK[k][dd + 8 * j];
+attn_bwd_dq_reduce(const float* __restrict__ part, float* __restrict__ dQ, long long n4, long long slab,
+                   int ns, float scale) {
+    for (long long e = (long long)blockIdx.x * 256 + threadIdx.x; e < n4; e += (long long)gridDim.x * 256) {
+        float4 a = ld4(part + 4 * e);
+        #pragma unroll 8
+        for (int s = 1; s < ns; ++s) {
+            const float4 b = ld4(part + s * slab + 4 * e);
+            a.x += b.x; a.y += b.y; a.z += b.z; a.w += b.w;
         }
-    }
-    if (q0 + qq < N) {
-        #pragma unroll
-        for (int j = 0; j < PER; ++j) dQ[(size_t)(q0 + qq) * D + dd + 8 * j] = aQ[j] * scale;
+        st4(dQ + 4 * e, make_float4(a.x * scale, a.y * scale, a.z * scale, a.w * scale));
     }
 }
+
+// Slabs are BH*N*D floats plus 64: for the usual power-of-two N the bare size is a multiple of
+// 8 KiB, which would put the same rows of all concurrently running blocks' slabs on one DRAM
+// channel.
+inline long long slab_floats(int BH, int N, int D) { return (long long)BH * N * D + 64; }
+
+template <int D, int KT, int WQ, int WK>
+size_t ws_bytes(int BH, int N, int M) {
+    const int ns = (M + KT * WK - 1) / (KT * WK);
+    return (size_t)ns * slab_floats(BH, N, D) * sizeof(float);
+}
+
+template <int D, int KT, int WQ, int WK>
+int run(const float* Q, const float* K, const float* V, const float* dO, const float* LSE, const float* DV,
+        float* dQ, float* dK, float* dV, int BH, int N, int M, float scale, float* ws, hipStream_t stream) {
+    constexpr int BK = KT * WK;
+    const int ns = (M + BK - 1) / BK;
+    const long long slab = slab_floats(BH, N, D);
+    (void)hipGetLastError();
+    auto kmain = &attn_bwd_main<D, KT, WQ, WK>;
+    LAUNCH(kmain, dim3(ns, BH), dim3(256), stream, Q, K, V, dO, LSE, DV, dK, dV, ws, slab, N, M, scale);
+    const long long n4 = (long long)BH * N * D / 4;
+    const long long blocks = (n4 + 255) / 256;
+    auto kred = &attn_bwd_dq_reduce;
+    LAUNCH(kred, dim3((unsigned)blocks), dim3(256), stream, ws, dQ, n4, slab, ns, scale);
+    return hipGetLastError() == hipSuccess ? 0 : -3;
+}
+
+
+// Default geometry per head size: 2 x 2 waves. 64 keys per block for D=40 and D=64 (dQ slabs
+// per 64 keys); D=80 takes 32 keys per block because 64 keys and 64 query rows of K, V, Q and dO
+// exceed 64 KiB.
+template <int D> struct Geo;
+template <> struct Geo<40> { static constexpr int KT = 32, WQ = 2, WK = 2; };
+template <> struct Geo<64> { static constexpr int KT = 32, WQ = 2, WK = 2; };
+template <> struct Geo<80> { static constexpr int KT = 16, WQ = 2, WK = 2; };
 
 }  // namespace attn_bwd
 
@@ -1150,21 +1480,37 @@ int gfx803_fused_attention_train_fwd(const float* Q, const float* K, const float
     return err == hipSuccess ? 0 : -3;
 }
 
+// Scratch the training backward needs, in bytes: the dQ partial sums of every
+// key block. The caller owns it so that a framework's allocator can serve it.
+size_t gfx803_fused_attention_train_ws_bytes(int B, int H, int N, int M, int D) {
+    using namespace attn_bwd;
+    const int BH = B * H;
+    if (D == 40) return ws_bytes<40, Geo<40>::KT, Geo<40>::WQ, Geo<40>::WK>(BH, N, M);
+    if (D == 64) return ws_bytes<64, Geo<64>::KT, Geo<64>::WQ, Geo<64>::WK>(BH, N, M);
+    if (D == 80) return ws_bytes<80, Geo<80>::KT, Geo<80>::WQ, Geo<80>::WK>(BH, N, M);
+    return 0;
+}
+
 // Training backward: dQ, dK, dV from Q, K, V, dO, the forward's LSE and
-// Dvec = rowsum(dO * O), all contiguous fp32.
+// Dvec = rowsum(dO * O), all contiguous fp32; ws of at least
+// gfx803_fused_attention_train_ws_bytes bytes.
 int gfx803_fused_attention_train_bwd(const float* Q, const float* K, const float* V, const float* dO,
                                      const float* LSE, const float* Dvec, float* dQ, float* dK, float* dV,
-                                     int B, int H, int N, int M, int D, float scale, hipStream_t stream) {
-    if (!Q || !K || !V || !dO || !LSE || !Dvec || !dQ || !dK || !dV || B <= 0 || H <= 0 || N <= 0 || M <= 0) return -1;
-    if (D != 40 && D != 64 && D != 80) return -4;
+                                     int B, int H, int N, int M, int D, float scale,
+                                     void* ws, size_t ws_size, hipStream_t stream) {
     using namespace attn_bwd;
-    dim3 gk((M + BT - 1) / BT, B * H), gq((N + BT - 1) / BT, B * H);
+    if (!Q || !K || !V || !dO || !LSE || !Dvec || !dQ || !dK || !dV || !ws || B <= 0 || H <= 0 || N <= 0 || M <= 0)
+        return -1;
+    if (D != 40 && D != 64 && D != 80) return -4;
+    if (ws_size < gfx803_fused_attention_train_ws_bytes(B, H, N, M, D)) return -5;
+    const int BH = B * H;
+    float* w = static_cast<float*>(ws);
     (void)hipGetLastError();
-#define GFX803_BWD(DD) do { \
-        attn_bwd_dkdv<DD><<<gk, 256, 0, stream>>>(Q, K, V, dO, LSE, Dvec, dK, dV, N, M, scale); \
-        attn_bwd_dq<DD><<<gq, 256, 0, stream>>>(Q, K, V, dO, LSE, Dvec, dQ, N, M, scale); } while (0)
-    if (D == 40) GFX803_BWD(40); else if (D == 64) GFX803_BWD(64); else GFX803_BWD(80);
-#undef GFX803_BWD
+    int rc;
+    if (D == 40) rc = run<40, Geo<40>::KT, Geo<40>::WQ, Geo<40>::WK>(Q, K, V, dO, LSE, Dvec, dQ, dK, dV, BH, N, M, scale, w, stream);
+    else if (D == 64) rc = run<64, Geo<64>::KT, Geo<64>::WQ, Geo<64>::WK>(Q, K, V, dO, LSE, Dvec, dQ, dK, dV, BH, N, M, scale, w, stream);
+    else rc = run<80, Geo<80>::KT, Geo<80>::WQ, Geo<80>::WK>(Q, K, V, dO, LSE, Dvec, dQ, dK, dV, BH, N, M, scale, w, stream);
+    if (rc != 0) return rc;
     return hipGetLastError() == hipSuccess ? 0 : -3;
 }
 

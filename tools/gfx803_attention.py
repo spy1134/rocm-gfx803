@@ -55,8 +55,10 @@ if _LIB_PATH and os.path.exists(_LIB_PATH):
             _lib.gfx803_fused_attention_train_fwd.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_int] * 5 + [
                 ctypes.c_float, ctypes.c_void_p]
             _lib.gfx803_fused_attention_train_fwd.restype = ctypes.c_int
+            _lib.gfx803_fused_attention_train_ws_bytes.argtypes = [ctypes.c_int] * 5
+            _lib.gfx803_fused_attention_train_ws_bytes.restype = ctypes.c_size_t
             _lib.gfx803_fused_attention_train_bwd.argtypes = [ctypes.c_void_p] * 9 + [ctypes.c_int] * 5 + [
-                ctypes.c_float, ctypes.c_void_p]
+                ctypes.c_float, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
             _lib.gfx803_fused_attention_train_bwd.restype = ctypes.c_int
     except Exception as e:
         sys.stderr.write(f"[gfx803_attention] Warning: Failed to load {_LIB_PATH}: {e}\n")
@@ -202,24 +204,26 @@ class _FusedAttentionTrain(torch.autograd.Function):
         dvec = (do * o).sum(-1).contiguous()
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
         B, H, N, D = q.shape
+        M = k.shape[2]
+        # The dQ partial sums of every key block: 336 MB for SD1.5's 64x64 level at batch 1.
+        # Taken from PyTorch's allocator so its VRAM cap and reuse apply.
+        ws_bytes = _lib.gfx803_fused_attention_train_ws_bytes(B, H, N, M, D)
+        ws = torch.empty(ws_bytes, device=q.device, dtype=torch.uint8)
         ret = _lib.gfx803_fused_attention_train_bwd(
             q.data_ptr(), k.data_ptr(), v.data_ptr(), do.data_ptr(), lse.data_ptr(), dvec.data_ptr(),
-            dq.data_ptr(), dk.data_ptr(), dv.data_ptr(), B, H, N, k.shape[2], D, ctypes.c_float(ctx.scale),
-            torch.cuda.current_stream().cuda_stream)
+            dq.data_ptr(), dk.data_ptr(), dv.data_ptr(), B, H, N, M, D, ctypes.c_float(ctx.scale),
+            ws.data_ptr(), ws_bytes, torch.cuda.current_stream().cuda_stream)
         if ret != 0:
             raise RuntimeError(f"gfx803_fused_attention_train_bwd failed with code {ret}")
         return dq.to(ctx.dtype), dk.to(ctx.dtype), dv.to(ctx.dtype), None
 
 
-# Below this many query x key pairs PyTorch's attention backward is as fast and
-# its stored matrices are small (SD1.5's 32x32 and 16x16 levels, cross-attention).
-_TRAIN_MIN_PAIRS = int(os.environ.get("GFX803_ATTN_TRAIN_MIN_PAIRS", str(1 << 21)))
 _TRAIN_ENABLED = os.environ.get("GFX803_ATTN_TRAIN", "1") != "0"
 
 
 def _train_eligible(q, k, v):
     return (_TRAIN_ENABLED and _lib is not None and hasattr(_lib, "gfx803_fused_attention_train_bwd")
-            and q.ndim == 4 and q.shape[-2] * k.shape[-2] >= _TRAIN_MIN_PAIRS
+            and q.ndim == 4
             and q.dtype in (torch.float32, torch.float16) and k.dtype == v.dtype == q.dtype)
 
 
