@@ -85,11 +85,33 @@ the node:
 Layouts are rocBLAS's column-major view: TN means op(A) = transposed,
 op(B) = not transposed.
 
+### SDXL inference
+
+Pony V6 (SDXL), 1024 px, CFG batch 2, fp16 UNet, the gfx803 node: one UNet
+step 3.36 s (ComfyUI: 3.4-3.5 s/it over 20 steps). By kernel: the shim's
+GEMMs 2.63 s (79%), fused attention 0.50 s (15%), elementwise and norms
+0.18 s, Winograd transforms 0.04 s. The GEMMs already run at 3.9-4.5 TFLOPS
+on every large shape (10240x2048x1280 4.06, 1280x2048x1280 4.49), so SDXL
+gains only from a faster main tile (BLAS-7); the cross-attention K/V
+projections of the 77-token context (n = 154, 1-2 TFLOPS) lose about 30 ms
+per step.
+
+The VAE decode at 1024 px is the other cost. With `--bf16-vae` its
+convolutions run on im2col GEMMs (there is no bf16 Winograd), and ComfyUI
+falls back to tiled decoding when the regular decode runs out of memory,
+which it does on some images and not others: 20-step images took 83 and
+99 s end to end with the same 67 s of sampling. With `--fp32-vae` the decode
+uses the F(2x2,3x3) solver and the shim and took 86 s with tiling (decode
+alone, tiled: bf16 24.6 s, fp32 12.2 s; outputs within 0.03 of each other
+on a 0-1 scale). MIOpen's first Find over the bf16 VAE shapes costs several
+minutes once, because its naive direct solver takes up to 1.5 s per call on
+the large decoder shapes.
+
 ### SD 1.5 LoRA training
 
 A 40-step fp32 run (34-image set, 512 px buckets, gradient checkpointing,
-batch 1, gradient accumulation 4) takes about 3.1 s per step at steady state
-(2.3 s without gradient checkpointing, SD-8).
+batch 1, gradient accumulation 4) takes about 2.9 s per step at steady state
+(2.0 s without gradient checkpointing, SD-8).
 GEMM FLOPs by layout for one UNet forward and backward with frozen weights,
 which is what LoRA training's base model does, at 384 px (512 px does not fit
 in 8 GB without gradient checkpointing):
