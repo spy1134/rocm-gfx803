@@ -1,48 +1,54 @@
 # tools/tc-staleness
 
-These are hardware probes for the gfx803 cross-dispatch coherence bug. On CIK
-(gfx7 and gfx8) the compute shader's TC (L1) is not maintained across a command
-boundary, and the CP ignores the AQL `SCACQUIRE` and `SCRELEASE` scope bits, which
-are ROCm's only expression of cross-dispatch coherence. Three failure directions
-follow, and all three are silent.
-`patches/rocm-systems/gfx803-tc-invalidate-acquire-mem.patch` closes them with the
-same PM4 `ACQUIRE_MEM` (`TC_ACTION_ENA|TC_WB_ACTION_ENA`) ring slot: ahead of each
-kernel dispatch, inside `releaseGpuMemoryFence()` before copy-engine work, and ahead
-of an event-record barrier for the benefit of the queue on the other side of that
-event. That patch header holds the mechanism, the evidence, the cost, and the one
-exposure that remains open (HIP graph replay).
+These are hardware probes for the gfx803 cross-dispatch coherence bug. On gfx7 and
+gfx8 the per-CU vector L1 is not invalidated between kernel dispatches, because the
+command processor ignores the AQL acquire and release fence scopes, which are
+ROCm's only expression of cross-dispatch coherence. A kernel that reads a page a
+copy kernel has just refilled, at a virtual address the allocator recycled, can be
+served the page's old contents, silently.
+`rocm6.4.4/patches/clr/clr-gfx8-tc-invalidate-6.4.4.patch` rebuilds `libamdhip64`
+with a PM4 `ACQUIRE_MEM` (vector L1 and scalar cache) ahead of each kernel
+dispatch; `CLR_GFX8_TC_INVALIDATE=0` switches it off in the same binary. The patch
+header holds the mechanism, the evidence, the cost and which cache bits matter.
 
-How to read the results. In the reader direction the new data is already in VRAM and
-only the kernel's view is stale, so it needs a recycled virtual address (torch's
-caching allocator recycles a handful per iteration. A raw `hipMalloc` program that
-never re-reads a cached VA does not reproduce it) and it survives `synchronize()`,
-`AMD_SERIALIZE_KERNEL=3`, SYSTEM-scope fences and GPUVM TLB invalidation. In the
-*copy-engine* direction the GPU's own answer is correct and only the host copy of
-it is wrong, so probes there have to compare an on-device error against a
-post-copy error -- that is exactly what `conbrace3.py` does.
+How to read the results. `probe_rocblas.py` is the probe that fails without the
+fix on this stack: about 500 small rocBLAS calls that each allocate, copy in,
+compute, copy out and free, stopping at case 225 when the L1 is stale (and
+passing all 511 with `NOFREE=1`, which proves the failure needs a recycled
+address). The PyTorch-level probes below are clean on ROCm 6.4.4 with the fix off
+as well, so a clean result from them says nothing about the fix; they stay as
+regression checks and for stacks where the bug shows up through PyTorch. The
+reader direction needs a recycled virtual address, survives `synchronize()`,
+`AMD_SERIALIZE_KERNEL=3`, SYSTEM-scope fences and GPUVM TLB invalidation, and is
+not an out-of-bounds read (`PAD_BYTES`/`PAD_FILL` show that). The copy-engine
+direction (the GPU's own answer correct, the host copy of it wrong) does not
+reproduce on 6.4.4, where ROCr uses no SDMA on gfx8 by default; `conbrace3.py`
+compares an on-device error against a post-copy error to tell the two apart.
 
 ## Running
 
 You need a gfx803 card and a HIP stack, and nothing else.
 
 ```sh
+python3 -u probe_rocblas.py --max-n 64 --reps 6   # stops at case 225 with CLR_GFX8_TC_INVALIDATE=0
+NOFREE=1 python3 -u probe_rocblas.py              # control: hipFree is a no-op, passes
 python3 probe.py --trials 40                      # default shape 2x128x64x128
-CLR_GFX8_TC_INVALIDATE=0 python3 probe.py         # bug must be visible
-CLR_GFX8_TC_INVALIDATE=1 python3 probe.py         # bug must be gone
-python3 probe.py --shape 4 256 128                # other bmm shapes also hit it
+python3 probe.py --shape 4 256 128                # other bmm shapes
 ```
 
-Exit code 0 = clean, 1 = stale reads present, so it drops into a script:
+`probe_rocblas.py` and `probe.py` exit 0 when clean and 1 when stale reads are present, so
+they drop into a script:
 
 ```sh
-CLR_GFX8_TC_INVALIDATE=0 python3 probe.py && echo "patch is not in effect"
-python3 probe.py || echo "regression: stale reads back"
+CLR_GFX8_TC_INVALIDATE=0 python3 -u probe_rocblas.py && echo "the probe does not detect the bug here"
+python3 -u probe_rocblas.py || echo "regression: stale reads back"
 ```
 
 ## Harnesses here
 
 | file | what it covers |
 |---|---|
+| `probe_rocblas.py` | rocBLAS level-1/2/3 calls against float64, each case allocating and freeing its buffers; the probe that isolates the bug. `_hip.py` is its ctypes layer |
 | `probe.py` | bmm, checked three ways (direct / frozen GPU->GPU copy / re-read) + repeat determinism |
 | `soak.py` | 527 checks across bmm, conv+silu+groupnorm, linear+layernorm+softmax, `scaled_dot_product_attention`, reductions (sum/amax/std/cumsum/sort/median/logsumexp) and gather/scatter_add, in fp16 and fp32 |
 | `train.py` | real training loop (4-conv + GroupNorm + SiLU + linear + LayerNorm, 60 Adam steps): loss vs an identical CPU run, bit-stability of the same seed, frozen-copy check on the gradients |
@@ -55,50 +61,23 @@ python3 probe.py || echo "regression: stale reads back"
 | `pinnedhost.py` | a kernel writes pinned host memory and the CPU reads it after a stream sync |
 | `wavesize_proof.hip` | rocSOLVER's wave-partial reduction pattern at `WarpSize` 32 and 64, see `patches/rocsolver/`. Build it with `hipcc --offload-arch=gfx803` |
 
-Run every one of them twice, once with `CLR_GFX8_TC_INVALIDATE=0` as a positive
-control, and the cross-stream ones (`multistream2`, `ms3`, `ms4`) also with
-`CLR_GFX8_TC_RECORD_FENCE=0`, which turns off only the event-record site. A clean result without that control proves nothing, because the reader
-direction is intermittent, in about 15 to 50 percent of trials. The end-to-end gate is
-`tools/correctness-suite/torch_op_suite.py`.
+Run each probe twice, once with `CLR_GFX8_TC_INVALIDATE=0` as the control. Only a probe
+that fails with the knob off can show the fix at work; on ROCm 6.4.4 that is
+`probe_rocblas.py`. The cross-stream ones (`multistream2`, `ms3`, `ms4`) also take
+`CLR_GFX8_TC_RECORD_FENCE=0`, which turns off only the event-record site. The end-to-end
+gate is `tools/correctness-suite/torch_op_suite.py`.
 
-## Expected results (gfx803, one binary, knob toggled)
+## Expected results (gfx803, ROCm 6.4.4, one binary, knob toggled)
 
 ```
-probe.py    (off) -> ~15/40 poisoned (stale first host read, stale bytes frozen
-                     into a GPU->GPU copy, back-to-back reads of one tensor differ)
-probe.py    (on)  -> 0/40
-soak.py     (off) -> ~91/527 checks fail (bmm, conv-silu-groupnorm,
-                     linear-layernorm-softmax, scaled_dot_product_attention)
-soak.py     (on)  -> 0/527
-train.py    (off) -> loss wrong vs CPU on most steps, gradient frozen-copy
-                     mismatches, same seed not reproducible
-train.py    (on)  -> loss bit-identical to the CPU trajectory, 0/60 mismatches,
-                     reproducible
-conbrace3   (off) -> ~90/240 anomalies, all classified copy_only
-conbrace3   (on)  -> 0/240
-op suite          -> 202/202 PASS, 0 BAD, 0 NONFINITE (13 failures with the knob
-                     off, 5 of them NONFINITE)
-multistream2      -> 0/1600 with the event-record site on, 5-11/240 with it off
-ms4.py            -> 0/2400 with the site on
-pinnedhost        -> 0/60
-ms3.py            -> the cross-stream case with each anomaly classified. The kinds
-                     are bad_gpu (the producer computed wrong), flush_too_early (a
-                     kernel clone read the right bytes, so only the copy engine was
-                     early), bad_copy and copy_race. Expected on gfx803: 0 anomalies
-                     in 2000 checks with CLR_GFX8_TC_RECORD_FENCE=1, 21 in 960 with
-                     it off. If you see flush_too_early, the writeback is not behind
-                     the producer's retirement, which is REASON 3 of the patch
-                     header; if you see bad_gpu, you are looking at a different bug
-ms4.py            -> ms3's shape, but the consumer copies into pinned host memory
-                     and a second arm fans two producer streams into one consumer
-                     (one pinned buffer and one stream pair are reused, because
-                     allocating a pinned tensor per iteration exhausts the pinned
-                     pool and wedges an SDMA ring). Expected: 0 anomalies in 2400
-                     checks with the site on
-graphprobe.py     -> a captured torch.cuda.CUDAGraph whose only op reads a buffer
-                     that something else wrote, replayed after (a) a copy-engine
-                     write and (b) a kernel on another stream. This is the one
-                     dispatch path with no ACQUIRE_MEM of its own
-                     (dispatchAqlPacketBatchFlat), so it is the probe for the
-                     patch header's remaining caveat
+probe_rocblas  (off) -> WRONG at case 225 (sgemm_strided_batched m=n=k=8 b=4, rel err 0.94)
+probe_rocblas  (on)  -> 511/511
+probe_rocblas  NOFREE=1, off -> 511/511
+probe.py, soak.py, conbrace3.py, ms3.py, graphprobe.py
+                     -> clean with the knob on and with it off (631 soak checks,
+                        40 probe trials, 240 conbrace3/ms3 checks, 300 graph checks)
 ```
+
+The correctness suite and the 20-step training run pass with the knob on. The
+probe results above were taken with the packet word 0x08400000.
+

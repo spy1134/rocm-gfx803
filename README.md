@@ -90,6 +90,10 @@ Without this project's changes, on these cards:
   boolean-mask indexing, `unique` and large sorts returned wrong results, failed
   to launch, or hung the GPU. The cause in several cases is one warp-size
   mismatch on 64-lane hardware.
+- rocBLAS, rocSOLVER and `torch.linalg` returned wrong numbers at random: the
+  card's vector L1 cache is not invalidated between kernel launches, so a
+  kernel could read the old contents of a recycled buffer. rocSOLVER and
+  rocSPARSE also shipped without any gfx803 code, so their kernels never ran.
 - Ollama read prompts about ten times slower than the card allows, generated
   text below its memory bandwidth, and could fill VRAM until the desktop stalled.
 

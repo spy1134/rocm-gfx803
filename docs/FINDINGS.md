@@ -339,6 +339,108 @@ read stale data when freed addresses are reused at once (ONNX Runtime's
 `ReduceSum` test), a path PyTorch, sd-scripts and llama.cpp do not take. What
 in the va-reuse-defer change faults on gfx803 is not investigated yet.
 
+### A kernel can read stale data from the vector L1 across dispatches
+
+Symptom: a rocBLAS call returns `rocblas_status_success` with wrong numbers.
+`rocblas_sgemm_strided_batched` with m=n=k=8 and batch 4 comes out with a
+relative error of 0.94, bit-identical on every run, at the same point of a
+sequence of about 500 small GEMM, GEMV and TRSM calls that each
+`hipMalloc`, copy in, compute, copy out and `hipFree`. The same sequence with
+`hipFree` turned into a no-op passes every case. A single set of buffers that is
+refilled with `hipMemcpy` before each call, with no `hipFree` at all, fails as
+well for small operands (see the measurements below). `torch.linalg` (LU, solve,
+inverse, QR, SVD, eigh) goes through the same calls and returned wrong factors
+that varied from run to run, and MIOpen's reduce kernels returned wrong sums in
+a sequence of calls on recycled buffers.
+
+Cause: the command processor of gfx803 (MEC firmware 730) does not
+invalidate the per-CU vector L1 cache at a dispatch boundary. ROCm expresses
+cross-dispatch coherence only through the fence scopes in the AQL packet
+header, and the LLVM memory model for GFX6 to GFX9 relies on the packet
+processor to act on them, so no code ever issues the cache invalidate itself.
+A kernel on a CU whose L1 still holds lines of a page that something else has
+rewritten since then reads the old bytes. The rewrite is a copy: copies of 16 KiB
+or less are shader copies that write through L2, and an address comes back
+either because the application refills the same buffer or because ROCr's
+fragment heap hands a freed 4 KiB page to the next `hipMalloc` of the same size,
+with no ioctl, unmap or TLB flush in between. Operands much larger than the 16 KiB
+L1 push the old lines out on their own, which is why big GEMMs were never
+affected. The wrong values are what
+was last at that address (a zero-padded and a NaN-padded buffer give different
+garbage at the same case, so this is not an out-of-bounds read), serialising
+launches does not cure it, and neither do SDMA, the SGEMM shim or the workspace
+size.
+
+Fix: `patches/clr/` rebuilds `libamdhip64` from ROCm/clr at the rocm-6.4.4 tag
+with one PM4 `ACQUIRE_MEM` packet, published in its own AQL ring slot ahead of
+every kernel dispatch, that invalidates the vector L1 and the scalar cache
+(`CP_COHER_CNTL` = `TCL1_ACTION_ENA | SH_KCACHE_ACTION_ENA`). Only the one
+library is replaced; the Ollama image carries the identical stock file, so
+the same rebuilt file fits it. `CLR_GFX8_TC_INVALIDATE=0` switches the packet off in the same
+binary, which is how the fix is measured against itself.
+
+Measured on the RX 590 with the stock HSA runtime, the same binary and only
+`CLR_GFX8_TC_INVALIDATE` toggled:
+
+| Test | Packet off | Packet on |
+| --- | --- | --- |
+| rocBLAS probe, 511 free-and-reallocate cases | stops at case 225 | passes |
+| `torch.linalg` through the rebuilt rocSOLVER, 204 cases up to n=257 | wrong | 204 of 204 |
+| MIOpen reduce kernels, 52 shapes (`rocm6.4.4/tools/reduce-harness`) | 12 fail | 0 fail |
+| same, with every call on one recycled address | 12 fail | 0 fail |
+| stock rocBLAS sgemm, fixed buffers, 40x72x800, 500 iterations | 499 iterations corrupt (about 6,000 wrong elements each) | 0 |
+| same, 32x32x32 | 499 iterations corrupt | 0 |
+| llama.cpp `test-backend-ops -o SOLVE_TRI` (triangular solve), 24 cases | 6 fail (matrices over 64x64) | 0 |
+| same, 16x16x16 | 492 iterations corrupt | 0 |
+| same, 768x768x3072 | 0 | 0 |
+
+The regression set (shim bit identity, conv checks, UNet check, rocPRIM and top-k
+ops, 20 training steps) passes without a GPU fault, and six 300-step LoRA training
+runs and the LLM generation canaries (dense and MoE, temperature 0) give the same
+results with the packet on and off. Decode on a 7B Q4_K model drops by 2.3% to 2.7% (33.5 to
+about 32.7 tokens/s) and prompt processing is unchanged. Which caches the packet
+touches matters: the vector L1 alone, the L1 plus scalar cache, and the L2 write-back
+plus invalidate pair all cure the probe at about the same decode cost; an L2
+invalidate without the write-back does not, with or without the L1 bit, and an
+empty word does not, and the full amdgpu set (adding the instruction cache)
+costs 7.3% of decode.
+
+The cost is per dispatch, not per byte: back-to-back empty kernels on one
+stream take 4.3 us each with the packet and 2.65 us without it, the same in a
+replayed HIP graph, and a 4096-block kernel pays the same 1.5 us. Workloads
+made of many small kernels pay the most: MoE decode issues about 1,450
+dispatches per token, an fp16 SD 1.5 step about 1,430 in ~400 ms.
+
+Open: why the L1-plus-L2-invalidate word fails while its neighbours pass, and
+why fp64 never fails. The probes in `tools/tc-staleness/` that go through
+PyTorch (`probe.py`, `soak.py`, the copy-engine and graph-replay probes) are
+clean on this stack with the packet off as well, so only the rocBLAS probe
+isolates the bug, together with the rocBLAS and reduce programs in the table.
+That MIOpen's reduce failures and rocBLAS's wrong results on small fp32 GEMMs
+(`KERNEL_BUGS.md`) are this bug follows from the table; whether the patches written
+for them (the va-reuse-defer runtime change, the small-shape rocBLAS patch) are
+still needed has not been tested. The faults of the patched HSA runtime and the
+intermittent training fault in section 10 have not been explained: six training
+runs with the fix were clean, which at the old fault rate of 2 in 16 is not
+evidence either way.
+
+### rocSOLVER and rocSPARSE had no gfx803 code
+
+ROCm's prebuilt `librocsolver` and `librocsparse` contain device code for gfx9
+and newer only. A kernel launch with no code object for the card is dropped
+without an error, and rocSOLVER does not check the launch status, so
+hipSOLVER returned success. The info and pivot arrays then kept whatever the
+allocator handed out (an `info` of 1094295552 is the bit pattern of 12.0f), and
+PyTorch's pivot unpacking indexed with the garbage until the GPU faulted.
+`torch.sparse.mm` returned a result with relative error 1.0.
+
+Both libraries are now built from source for gfx803 against the image's
+rocBLAS in their own Dockerfile stages and replace the shipped files
+(`patches/rocsolver/`, `patches/rocsparse/`). `torch.sparse.mm` has a
+relative error of 1.4e-7 and the `torch.linalg` check above passes. Cholesky
+and `lstsq` need MAGMA, which this PyTorch is built without, and are not
+supported. Sparse `coalesce` is still wrong for widths over 160.
+
 ## 5. PyTorch fixes and workarounds in the base image
 
 **int8 matmul.** `torch._int_mm` (int8 x int8 -> int32, used by anything that
@@ -823,15 +925,11 @@ a reproduction.
   That points at a kernel that builds a pointer from a wrongly read or stale
   upper half, or at a mapping that is briefly absent, and not at a plain
   out-of-bounds index. The kernel is not identified. Sections 2 and 4 describe
-  the two known sources of faults of this kind on this card.
+  the known sources of faults of this kind on this card; the stale vector L1 of
+  section 4 would produce a stale upper half, and this fault has not been
+  re-run with that fix.
 - Why images are slow to read: a 1080p image (about 2000 tokens) takes 56 s
   with Qwen3.5 9B, against about 15 s for 2000 text tokens.
-- llama.cpp's triangular solve (`SOLVE_TRI`) is wrong on the GPU for
-  matrices larger than 64x64 (6-7 of 17 test cases depending on the random
-  inputs, errors up to 20). The
-  64x64-and-smaller kernel passes, and the delta-net layers of Qwen3.5/3.6
-  solve 64x64 chunks, so no current model here hits it. Not yet compared
-  with another architecture.
 
 ## Tools
 
@@ -844,5 +942,10 @@ a reproduction.
 - [`tools/ComfyUI-gfx803-attention/`](../tools/ComfyUI-gfx803-attention/): the
   optional ComfyUI node with gfx803 attention, GroupNorm and GEGLU kernels
   (section 6); its kernel sources are in `tools/`.
+- [`tools/tc-staleness/`](../tools/tc-staleness/): probes for the stale vector L1
+  of section 4; `probe_rocblas.py` is the one that fails without the fix.
+- [`tools/correctness-suite/`](../tools/correctness-suite/): the operation
+  checks, including the BatchNorm and activation backward sweeps and
+  `pytorch/linalg_check.py`.
 - [`rocm6.4.4/training/gfx803_unet_check.py`](../rocm6.4.4/training/gfx803_unet_check.py):
   the op-by-op and whole-UNet check against a float64 CPU reference.

@@ -7,8 +7,9 @@ Docker images for Polaris cards -- RX 460, 470, 480, 550, 560, 570, 580, 590,
 plus the R9 Fury/Nano generation that shares the gfx803 ISA:
 
 - `Dockerfile` -> `rocm-gfx803:rocm6.4.4`, the base: ROCm 6.4.4 with rocBLAS,
-  MIOpen, MIGraphX, PyTorch 2.8 and ONNX Runtime built for gfx803, and the
-  SGEMM shim.
+  rocSOLVER, rocSPARSE, MIOpen, MIGraphX, PyTorch 2.8 and ONNX Runtime built
+  for gfx803, a HIP runtime that invalidates the vector L1 between kernel
+  launches, and the SGEMM shim.
 - `Dockerfile-ComfyUI` -> ComfyUI, sd-scripts and the training tools
   ([below](#comfyui-and-sd-15-lora-training)).
 - `Dockerfile-Ollama` -> Ollama with llama.cpp for gfx803
@@ -61,6 +62,9 @@ whole stack from source with the doorbell and other runtime patches.)
 | MIGraphX | `release/rocm-rel-6.4` | Prebuilt for gfx900+ only. |
 | PyTorch | `ROCm/pytorch` `release/2.8` | No gfx803 wheel has ever been published. torchvision and torchaudio are built alongside it. `patches/pytorch/` routes int8 matmul to rocBLAS (its default hipBLASLt path has no gfx803 kernels) and fixes five kernels that mix the 64-lane hardware wavefront with PyTorch's 32-lane `C10_WARP_SIZE` on gfx803 (layer_norm, top-k's scan, index_put, embedding backward) or lose their launch to a rocSPARSE symbol clash (rocPRIM: nonzero, masked indexing, unique, large sorts). Each header gives the cause and the check. |
 | ONNX Runtime | `v1.22.2` | Built against the MIGraphX above. |
+| rocSOLVER | `ROCm/rocSOLVER`, ROCm 6.4.4 | The prebuilt library has device code for gfx908 and newer only; its launches for gfx803 do nothing and report no error, so `torch.linalg` returned unmodified input and then faulted. Built from source for gfx803 ([`patches/rocsolver/`](patches/rocsolver/)). |
+| rocSPARSE | `ROCm/rocSPARSE`, ROCm 6.4.4 | Same cause: no gfx803 code, so `torch.sparse.mm` returned wrong values. Built for gfx803 ([`patches/rocsparse/`](patches/rocsparse/)). |
+| HIP runtime (`libamdhip64`) | `ROCm/clr` `rocm-6.4.4` | The command processor of gfx803 does not invalidate the per-CU vector L1 between kernel dispatches, so a kernel can read the old contents of a recycled buffer. The patch in [`patches/clr/`](patches/clr/) publishes a cache-invalidate packet before every dispatch; only this one library is replaced. |
 
 **MIOpen is built from source** at tag `rocm-6.4.4` with the patches in
 [`patches/miopen/`](patches/miopen/). It still carries its

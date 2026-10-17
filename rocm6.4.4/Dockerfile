@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # Polaris / gfx803 base image: MIGraphX + ONNX Runtime + PyTorch on ROCm 6.4.4,
-# with rocBLAS, MIOpen and the HSA runtime rebuilt for gfx803. User-facing docs
+# with rocBLAS, rocSOLVER, rocSPARSE, MIOpen, the HSA runtime and the HIP runtime rebuilt for gfx803. User-facing docs
 # (versions, building, caveats): README.md in this directory.
 #
 # Why ROCm 6.4.4 for gfx803 (RX 460/470/480/550/560/570/580/590):
@@ -32,6 +32,12 @@
 #                the gfx803 Tensile logic (Logic/asm_full/r9nano/*.yaml) is
 #                still in the tree, so `rmake.py -a gfx803` builds it back.
 #                The base image's prebuilt rocBLAS has no gfx803 code objects.
+#   rocSOLVER, rocSPARSE
+#             -- prebuilt with device code for gfx908 and newer only; launches for gfx803 do
+#                nothing and report no error.
+#   CLR       -- libamdhip64. The command processor of gfx803 does not invalidate the per-CU
+#                vector L1 between dispatches, so patches/clr/ adds a cache-invalidate packet
+#                before every kernel dispatch.
 #   MIGraphX  -- prebuilt for gfx900+ only.
 #   PyTorch   -- no gfx803 wheel has ever been published.
 #   ORT       -- built against the MIGraphX above.
@@ -536,6 +542,97 @@ RUN echo "Copying MIOpen gfx803 build into /opt/rocm..." \
 
 FROM ${MIOPEN_IMAGE} AS miopen-export
 
+# rocSOLVER rebuilt for gfx803. The base image's librocsolver has no gfx803
+# code object and rocSOLVER never checks its launches, so torch.linalg
+# (hipSOLVER -> rocSOLVER) silently returns the input unmodified. hipSOLVER is
+# not rebuilt: it is a host-side wrapper whose only dependencies are
+# librocsolver.so.0, librocblas.so.4 and libamdhip64.so.6 (all sonames, no
+# device code), so the stock libhipsolver resolves to the rebuilt library.
+#
+# Builds against rocblas-export, which carries the patched ROCr runtime and the
+# gfx803 rocBLAS. Only the library file leaves this stage.
+FROM python-base AS rocsolver-builder
+
+ARG ROCM_VERSION
+ARG ROCM_ARCH=gfx803
+ARG BUILD_PARALLEL_LEVEL
+
+COPY --from=rocblas-export /opt/rocm /opt/rocm
+
+# libfmt-dev: rocSOLVER does find_package(fmt REQUIRED) and the base image
+# ships no fmt. Header-only use (ROCSOLVER_EMBED_FMT), nothing linked.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake ninja-build build-essential pkg-config ccache libfmt-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# rocSOLVER has its own repository at 6.4.4; it moves into rocm-libraries later.
+RUN git clone --branch "rocm-${ROCM_VERSION}" --depth 1 \
+        https://github.com/ROCm/rocSOLVER.git /rocsolver-src
+
+COPY patches/rocsolver/build-rocsolver.sh /scripts/build-rocsolver.sh
+RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocsolver-ccache \
+    /scripts/build-rocsolver.sh configure
+RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocsolver-ccache \
+    /scripts/build-rocsolver.sh build \
+    && rm -rf /rs-build
+
+FROM scratch AS rocsolver-export
+COPY --from=rocsolver-builder /rs-out/ /
+
+# rocSPARSE rebuilt for gfx803. The library in the base image has no gfx803 code object and launches for a missing
+# architecture are dropped without an error, so sparse products on the GPU return wrong values silently.
+# Builds against the patched ROCr runtime and rocBLAS carried by rocblas-export. Only the library file leaves this stage.
+FROM python-base AS rocsparse-builder
+
+ARG ROCM_VERSION
+ARG ROCM_ARCH=gfx803
+ARG BUILD_PARALLEL_LEVEL
+
+COPY --from=rocblas-export /opt/rocm /opt/rocm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake ninja-build build-essential pkg-config ccache zstd \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --branch "rocm-${ROCM_VERSION}" --depth 1 \
+        https://github.com/ROCm/rocSPARSE.git /rocsparse-src
+
+COPY patches/rocsparse/build-rocsparse.sh /scripts/build-rocsparse.sh
+RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocsparse-ccache \
+    /scripts/build-rocsparse.sh configure
+RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocsparse-ccache \
+    /scripts/build-rocsparse.sh build \
+    && rm -rf /rsp-build
+
+FROM scratch AS rocsparse-export
+COPY --from=rocsparse-builder /rsp-out/ /
+
+# libamdhip64 rebuilt from ROCm/clr with the gfx8 cache-maintenance patch. The command processor of gfx803 does not
+# invalidate the per-CU vector L1 between dispatches, so a kernel can read the previous contents of a page that a copy
+# kernel has just refilled. The stage builds the one library and nothing else leaves it.
+FROM python-base AS clr-builder
+
+ARG ROCM_VERSION
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake ninja-build build-essential pkg-config ccache perl xxd rocm-llvm-dev \
+        libnuma-dev libdrm-dev libelf-dev libgl1-mesa-dev libx11-dev mesa-common-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip3 install CppHeaderParser
+
+RUN git clone --branch "rocm-${ROCM_VERSION}" --depth 1 https://github.com/ROCm/clr.git /clr-src \
+    && git clone --branch "rocm-${ROCM_VERSION}" --depth 1 https://github.com/ROCm/hip.git /hip-src
+
+COPY patches/clr/ /clr-patches/
+RUN --mount=type=cache,target=/root/.ccache,id=gfx803-clr-ccache \
+    sh /clr-patches/build-clr.sh prepare
+RUN --mount=type=cache,target=/root/.ccache,id=gfx803-clr-ccache \
+    sh /clr-patches/build-clr.sh build \
+    && rm -rf /clr-build
+
+FROM scratch AS clr-export
+COPY --from=clr-builder /clr-out/ /
+
 FROM python-base AS migraphx-builder
 
 ARG ROCM_VERSION
@@ -972,6 +1069,17 @@ COPY --from=miopen-export /opt/rocm/lib/libMIOpen.so.1.0.* /opt/rocm/lib/
 # takes its own ROCR_IMAGE/with-rocr-image input), not as the only place the
 # patch reaches this image.
 COPY --from=rocr-export /opt/rocm/lib/libhsa-runtime64.so* /opt/rocm/lib/
+
+# Rebuilt rocSOLVER (gfx803 code object). Only the library file: copying the
+# builder's /opt/rocm would revert the other rebuilt libraries to stock.
+COPY --from=rocsolver-export /librocsolver.so.0.4.* /opt/rocm/lib/
+
+# Rebuilt rocSPARSE (gfx803 code object); same reasoning as rocSOLVER above.
+COPY --from=rocsparse-export /librocsparse.so.1.0.* /opt/rocm/lib/
+
+# libamdhip64 with the gfx8 cache-maintenance patch; same reasoning as rocSOLVER above. Only the library file:
+# libhiprtc and the other HIP libraries from the same tree stay as in the base image.
+COPY --from=clr-export /libamdhip64.so.6.* /opt/rocm/lib/
 
 # rocm/dev-ubuntu-* doesn't register /opt/rocm/lib with the dynamic linker, so
 # libs are present on disk but unresolvable at runtime without this.

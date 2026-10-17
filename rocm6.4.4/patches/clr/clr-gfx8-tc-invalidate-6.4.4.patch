@@ -1,0 +1,286 @@
+ROCclr (gfx7/gfx8), ROCm 6.4.4: the command processor does not maintain the
+shader caches at a dispatch boundary. A kernel that reads a page which a copy
+kernel refilled a moment earlier can be served the page's previous contents out
+of its CU's vector L1. One PM4 ACQUIRE_MEM packet, published in its own AQL
+ring slot, invalidates the vector L1 and the scalar cache:
+
+  1. Ahead of every kernel dispatch (the reader direction that fails on 6.4.4).
+  2. Inside releaseGpuMemoryFence(), between its barrier and a second barrier.
+  3. Ahead of an event-record barrier.
+
+Sites 2 and 3 are written for a copy engine or the host reading data a kernel
+has not yet written back. That direction does not fail on 6.4.4: ROCr uses no
+SDMA on gfx8 by default and small copies are shader copies that go through L2.
+The packet word does not request an L2 writeback, so these two sites add no
+coverage for it.
+
+All three sites are gated on `dev().isa().versionMajor() <= 8` and on the new
+`CLR_GFX8_TC_INVALIDATE` flag (default on), so one binary measures both ways.
+Site 3 has its own flag, `CLR_GFX8_TC_RECORD_FENCE`.
+
+WHY
+---
+ROCm expresses cross-dispatch coherence only through the AQL packet header's
+SCACQUIRE and SCRELEASE fence scopes. rocvirtual.cpp states the contract it
+relies on: an agent-scope acquire "invalidates I, K and L1", a system-scope
+release "invalidates L1, L2 and flushes L2". The compiler relies on the same
+contract: the LLVM AMDGPU memory model for GFX6-GFX9 emits no cache
+maintenance at kernel entry because "the scalar and vector caches are
+invalidated between kernel dispatches by CP" (AMDGPUUsage.rst, "Memory Model
+GFX6-GFX9"). That contract is implemented in MEC firmware, and on gfx803 with
+MEC firmware 0x2da it is not honoured for the data caches: nothing in CLR or
+ROCr 6.4.4 ever emits TCL1_ACTION_ENA, and the only ACQUIRE_MEM the data path
+ever sees is ROCr's code-cache invalidate at code-object load
+(GpuAgent::InvalidateCodeCaches).
+
+The reproducer is a direct rocBLAS probe: about 500 small fp32 GEMM, GEMV and
+TRSM calls, each one doing hipMalloc, hipMemcpy H2D, the rocBLAS call,
+hipMemcpy D2H, hipFree. It fails deterministically at the same call every run
+(rocblas_sgemm_strided_batched m=n=k=8 batch 4, relative error 0.94,
+bit-identical), and passes all 511 cases when hipFree is a no-op, so the wrong
+answer needs a recycled address. The chain that recycles it is entirely in user
+space and entirely kernel-written:
+
+  * hipFree waits for every stream on the device before it releases the buffer
+    (hip_memory.cpp ihipFree: SyncAllStreams()), so no kernel is in flight when
+    the address comes back. This is not a free-before-completion race.
+  * ROCr sub-allocates ordinary VRAM below 2 MiB from a fragment heap
+    (amd_kfd_driver.cpp KfdDriver::AllocateMemory; simple_heap.h, best fit).
+    A freed 4 KiB page goes back on the free list and the next hipMalloc of the
+    same size gets the same virtual and the same physical page. No ioctl, no
+    unmap, no TLB flush, no VRAM clear is involved.
+  * Copies of 16 KiB or less go through CLR's shader copy path
+    (rocblit.cpp: totalSize <= sdmaCopyThreshold_, GPU_FORCE_BLIT_COPY_SIZE=16),
+    and ROCr does not use SDMA on gfx8 at all by default
+    (amd_gpu_agent.cpp: "User SDMA queues are unstable on gfx8"). The new data
+    therefore reaches the page through L2, where every CU sees it; only a CU
+    whose L1 still holds the page's old lines sees the old bytes.
+
+A full L2 writeback and invalidate is included for the other direction: the
+copy engine and the host read memory and never look at the shader caches, so a
+D2H copy of a buffer a kernel just wrote copies the pre-write bytes unless the
+dirty lines were pushed out first. ROCm 10.x on the same card showed exactly
+that (conv output right on the GPU, wrong in the host copy, in 64-float blocks),
+and the same slot in the same two places fixed it there.
+
+The CP_COHER_CNTL word requests TCL1_ACTION_ENA (the vector L1) and SH_KCACHE_ACTION_ENA
+(the scalar cache): 0x08400000. Measured with one library and a run-time override of the word
+(probe_rocblas.py, 511 cases): the vector L1 alone cures the probe, and so do the L1 and
+scalar-cache pair and the L2 pair the ROCm 10.x patch used (TC_ACTION_ENA with
+TC_WB_ACTION_ENA); the L2 invalidate without the writeback does not cure it, with or
+without the L1 bit, and neither does an empty word. Decode speed on a 7B Q4_K model against
+the knob switched off: L1 only -1.7% to -2.8%, L1 plus scalar cache -2.3%, the L2 pair
+-2.7%, the full amdgpu set (adding TC, TC_WB and SH_ICACHE) -7.3%; prefill is unchanged. The
+instruction cache is left out because ROCr invalidates it when a code object loads, and
+the L2 pair is left out because shader copies write through L2.
+
+WHAT
+----
+`rocclr/utils/flags.hpp`: `CLR_GFX8_TC_INVALIDATE` and `CLR_GFX8_TC_RECORD_FENCE`
+(both default on).
+
+`rocclr/device/rocm/rocvirtual.{hpp,cpp}`: `VirtualGPU::insertTcFence()` takes
+one 64-byte AQL slot with `hsa_queue_add_write_index_screlease`, waits for the
+slot to be free the way dispatchGenericAqlPacket does, and fills it with
+ACQUIRE_MEM (whole address range, poll interval 0xA), a NOP, and the trailing
+RELEASE_MEM whose EVENT_INDEX(AQL) retires the slot. This is the PM4-inside-an-
+AQL-slot protocol ROCr's gfx8 `AqlQueue::ExecutePM4()` uses, with the payload
+inlined instead of fetched through an indirect buffer. dword 0 is stored last
+with release semantics. The slot rings no doorbell: the packet the caller writes
+next has a higher ring index and its doorbell commits this slot too. ACQUIRE_MEM
+stalls the CP until the cache action is complete, so the next packet cannot
+launch ahead of it. Three call sites:
+
+  * `dispatchGenericAqlPacket()`, before the dispatch's ring index is taken,
+    for `hsa_kernel_dispatch_packet_t` only. In 6.4.4 the graph replay path
+    (`dispatchAqlPacket(uint8_t*, ...)`) also goes through this function one
+    packet at a time, so graph dispatches get the slot as well.
+  * `releaseGpuMemoryFence()`, between its barrier and a second barrier. The
+    writeback must follow the first barrier, which carries the dependency
+    signals of producers on other queues, and a barrier must follow the
+    writeback, because the following copy waits on the queue's current
+    completion signal.
+  * `submitMarker()`, ahead of the releasing barrier of an event record. The
+    raw slot only: no barrier, no completion signal, so it takes no part in the
+    marker's signal bookkeeping.
+
+COST: one 64-byte ring slot plus a full-range vector L1 and scalar cache
+invalidate per dispatch, on gfx7 and gfx8 only. Measured decode cost on a 7B Q4_K
+model is 2.3% to 2.7% (see above). The ROCm 10.x queue cap of 64 packets does not
+apply: ROC_AQL_QUEUE_SIZE is 16384 in 6.4.4.
+
+Applies to: ROCm/clr tag rocm-6.4.4 (commit 123eb5128769ba30fda8f84414421bc858e8c695),
+with `patch -p1` from the clr checkout root. Apply with
+clr-gfx8-tc-invalidate-6.4.4.sh.
+
+VERIFICATION (RX 590, gfx803, MEC firmware 730, image built with this patch):
+  * probe_rocblas.py, 511 cases: all pass with the flag on; with
+    CLR_GFX8_TC_INVALIDATE=0 on the same binary the run stops at case 225
+    (rocblas_sgemm_strided_batched m=n=k=8 batch 4, relative error 0.94).
+  * torch.linalg through rocSOLVER (tools/correctness-suite/pytorch/linalg_check.py):
+    204 of 204 cases up to n=257; before the patch the same run returned wrong
+    factorizations and, at n=64 to 129, a memory access fault.
+  * The correctness suite regression set (shim bit identity, conv checks, UNet
+    check, rocPRIM and top-k ops, 20 training steps) passes with no GPU fault.
+  * tools/tc-staleness: probe.py, soak.py, graphprobe.py, conbrace3.py and ms3.py
+    are clean with the flag on. They are also clean with it off on this stack, so
+    they do not isolate this bug; probe_rocblas.py does.
+  Not covered: the L2 writeback direction (no failure reproduces on 6.4.4), why the
+  L1 plus L2-invalidate word without writeback fails while the L1 word alone and
+  the L2 pair pass, and workloads other than the ones above.
+
+--- a/rocclr/device/rocm/rocvirtual.cpp
++++ b/rocclr/device/rocm/rocvirtual.cpp
+@@ -894,6 +894,72 @@
+ }
+ 
+ // ================================================================================================
++// gfx7/gfx8 only: publish one PM4 ACQUIRE_MEM in its own AQL ring slot, ahead of the packet the
++// caller is about to write.
++//
++// The LLVM memory model for GFX6-GFX9 and this file's own header comment both assume that the
++// packet processor invalidates the per-CU vector L1, the scalar K$ and the I$ at the start of
++// every dispatch whose acquire scope is agent or wider, and writes back and invalidates L2 at
++// system scope. On gfx803 with MEC firmware 0x2da that does not happen: a kernel reading a page
++// that a copy kernel just refilled through L2 is served the previous contents of that page out
++// of its CU's L1 whenever the same CU read the page before. ROCr's fragment heap hands a freed
++// page straight back to the next allocation of the same size, so any hipFree followed by a
++// hipMalloc of a small buffer sets this up.
++//
++// CP_COHER_CNTL asks for the vector L1 (TCL1) and the scalar cache (SH_KCACHE) only. The vector L1
++// is the cache that serves stale lines; invalidating it alone cures the probe, and adding the
++// scalar cache costs about half a percent. The L2 pair (TC, TC_WB) and the instruction cache are
++// left out: they added roughly five percent to decode time and are not needed by shader copies,
++// which write through L2; ROCr invalidates the instruction cache itself when a code object loads.
++//
++// The slot follows the gfx8 PM4-in-an-AQL-slot protocol that ROCr's AqlQueue::ExecutePM4 uses:
++// raw PM4, a NOP pad, and a trailing RELEASE_MEM with EVENT_INDEX(AQL) that retires the slot.
++// dword 0 is stored last with release semantics, so the CP never sees a half-written packet.
++// The slot rings no doorbell: the packet the caller writes next sits at a higher ring index and
++// its doorbell commits this slot as well. ACQUIRE_MEM stalls the CP until the cache action is
++// done, so the following packet cannot launch before it.
++bool VirtualGPU::insertTcFence() {
++  if (!CLR_GFX8_TC_INVALIDATE || dev().isa().versionMajor() > 8) return true;
++
++  constexpr uint32_t kSlotDwords = 16;
++  constexpr uint32_t kPm4Type3 = 3u << 30;
++  // ROCr's PM4_HDR sets SHADER_TYPE only for gfxip 7.
++  const uint32_t shaderType = (dev().isa().versionMajor() == 7) ? (1u << 1) : 0u;
++  const uint32_t acquireMemHdr = kPm4Type3 | ((7u - 2u) << 16) | (0x58u << 8) | shaderType;
++  const uint32_t nopHdr = kPm4Type3 | ((2u - 2u) << 16) | (0x10u << 8) | shaderType;
++  const uint32_t releaseMemHdr = kPm4Type3 | ((7u - 2u) << 16) | (0x49u << 8) | shaderType;
++  [[maybe_unused]] constexpr uint32_t kTcWbActionEna = 1u << 18;
++  constexpr uint32_t kTcl1ActionEna = 1u << 22;
++  [[maybe_unused]] constexpr uint32_t kTcActionEna = 1u << 23;
++  constexpr uint32_t kShKcacheActionEna = 1u << 27;
++  [[maybe_unused]] constexpr uint32_t kShIcacheActionEna = 1u << 29;
++  constexpr uint32_t kReleaseEventIndexAql = 7u << 8;
++
++  uint32_t slot[kSlotDwords] = {0};
++  slot[0] = acquireMemHdr;
++  slot[1] = kTcl1ActionEna | kShKcacheActionEna;
++  // CP_COHER_CNTL 0x08400000
++  slot[2] = 0xFFFFFFFFu;  // COHER_SIZE, in 256-byte granules
++  slot[3] = 0xFFu;        // COHER_SIZE_HI: whole address space
++  slot[6] = 0x0000000Au;  // poll interval, as gfx_v8_0_emit_mem_sync_compute uses
++  slot[7] = nopHdr;
++  slot[9] = releaseMemHdr;
++  slot[10] = kReleaseEventIndexAql;
++
++  const uint32_t queueMask = gpu_queue_->size - 1;
++  const uint64_t index = hsa_queue_add_write_index_screlease(gpu_queue_, 1);
++  while ((index - hsa_queue_load_read_index_scacquire(gpu_queue_)) >= queueMask) {
++    amd::Os::yield();
++  }
++
++  uint32_t* dst = reinterpret_cast<uint32_t*>(gpu_queue_->base_address) +
++                  ((index & queueMask) * kSlotDwords);
++  for (uint32_t i = 1; i < kSlotDwords; ++i) dst[i] = slot[i];
++  __atomic_store_n(dst, slot[0], __ATOMIC_RELEASE);
++  return true;
++}
++
++// ================================================================================================
+ template <typename AqlPacket>
+ bool VirtualGPU::dispatchGenericAqlPacket(
+   AqlPacket* packet, uint16_t header, uint16_t rest, bool blocking, bool attach_signal) {
+@@ -901,6 +967,11 @@
+   const uint32_t queueMask = queueSize - 1;
+   const uint32_t sw_queue_size = queueMask;
+ 
++  // The slot has to precede this packet in the ring, so it is taken before the index below.
++  if (std::is_same<AqlPacket, hsa_kernel_dispatch_packet_t>::value) {
++    if (!insertTcFence()) return false;
++  }
++
+   // Check for queue full and wait if needed.
+   uint64_t index = hsa_queue_add_write_index_screlease(gpu_queue_, 1);
+   uint64_t read = hsa_queue_load_read_index_relaxed(gpu_queue_);
+@@ -1258,6 +1329,16 @@
+   if (hasPendingDispatch_ || !Barriers().IsExternalSignalListEmpty()) {
+     // Dispatch barrier packet into the queue
+     dispatchBarrierPacket(kBarrierPacketHeader);
++
++    // gfx7/gfx8: the copy engine and the host read memory and never the shader caches.
++    // DmaBlitManager::readBuffer and ::writeBuffer both fence here before handing a transfer
++    // to the copy engine, so this one place covers every non-shader reader. The writeback
++    // must sit behind the barrier above, which carries the dependency signals of producers
++    // on other queues, and a second barrier must follow it, because the next copy waits on
++    // the queue's current completion signal and that has to be one that retires after the
++    // flush.
++    if (!insertTcFence()) return false;
++    dispatchBarrierPacket(kBarrierPacketHeader);
+     hasPendingDispatch_ = false;
+     retainExternalSignals_ = false;
+   }
+@@ -3685,6 +3766,16 @@
+             dispatchBarrierPacket(kNopPacketHeader, false);
+           }
+         } else {
++          // gfx7/gfx8: an event record is where another queue becomes allowed to read what
++          // this queue wrote. The writeback has to come from the queue that owns the dirty
++          // lines: the CP takes raw PM4 out of an AQL ring without consulting the AQL
++          // dependency chain, so a writeback on the reading queue cannot be ordered behind a
++          // kernel on this one. Raw slot only, so it stays out of the marker's signal
++          // bookkeeping.
++          if (CLR_GFX8_TC_RECORD_FENCE && !insertTcFence()) {
++            LogError("gfx8: TC writeback at event record failed");
++          }
++
+           // Submit a barrier with a cache flushes.
+           if (settings.barrier_value_packet_ && vcmd.profilingInfo().marker_ts_) {
+             dispatchBarrierValuePacket(kBarrierVendorPacketHeader, true);
+--- a/rocclr/device/rocm/rocvirtual.hpp
++++ b/rocclr/device/rocm/rocvirtual.hpp
+@@ -391,6 +391,13 @@
+    */
+   bool releaseGpuMemoryFence(bool skip_copy_wait = false);
+ 
++  //! gfx7/gfx8: publish an ACQUIRE_MEM ring slot (vector L1, K$ and I$ invalidate; L2
++  //! writeback and invalidate) ahead of the next packet, so a reader is not served stale
++  //! shader-cache lines and a copy engine does not read lines that were never written back.
++  //! No-op (and true) on other ISAs or when CLR_GFX8_TC_INVALIDATE=0. The slot publishes
++  //! no completion signal, which is what keeps it safe inside the marker path.
++  bool insertTcFence();
++
+   hsa_agent_t gpu_device() const { return gpu_device_; }
+   hsa_queue_t* gpu_queue() { return gpu_queue_; }
+ 
+--- a/rocclr/utils/flags.hpp
++++ b/rocclr/utils/flags.hpp
+@@ -181,6 +181,15 @@
+ release(uint, AMD_OPT_FLUSH, 1,                                               \
+         "Kernel flush option , 0x0 = Use system-scope fence operations."      \
+         "0x1 = Use device-scope fence operations when possible.")             \
++release(bool, CLR_GFX8_TC_INVALIDATE, true,                                   \
++        "gfx7/gfx8 only: emit a PM4 ACQUIRE_MEM (vector L1, K$, I$ invalidate; "   \
++        "L2 writeback and invalidate) ahead of every kernel dispatch and inside "  \
++        "the fence that precedes copy-engine work, because the CP does not act "   \
++        "on the AQL acquire and release fence scopes on these ASICs. 0 = off.")    \
++release(bool, CLR_GFX8_TC_RECORD_FENCE, true,                                 \
++        "gfx7/gfx8 only: also emit the ACQUIRE_MEM ahead of an event-record "      \
++        "barrier, so a queue that is about to be waited on publishes its "         \
++        "shader-cache lines in its own ring. 0 = off.")                            \
+ release(bool, AMD_DIRECT_DISPATCH, false,                                     \
+         "Enable direct kernel dispatch.")                                     \
+ release(uint, HIP_HIDDEN_FREE_MEM, 0,                                         \
