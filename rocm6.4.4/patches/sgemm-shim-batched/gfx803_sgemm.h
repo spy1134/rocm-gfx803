@@ -39,8 +39,9 @@
 // gfx803_sgemm_tile_g is the same tile again for the transposed layouts that
 // rocBLAS sees from nn.Linear and its weight gradients; see the comment there.
 // All of them take fp32 or fp16 operands (E below): fp16 values are widened to
-// fp32 right after the global load, so LDS, the multiply-adds and the sums are
-// the fp32 kernel's, and C is rounded to fp16 once. Polaris has no packed
+// fp32 when they are stored to LDS (gfx803_stage_d says why not earlier), so
+// LDS, the multiply-adds and the sums are the fp32 kernel's, and C is rounded
+// to fp16 once. Polaris has no packed
 // fp16 arithmetic, so fp16 cannot be faster per multiply-add than fp32; what
 // the fp16 path gains is the kernel itself. rocBLAS's fp16 kernels for gfx803
 // keep fp16 in LDS and widen inside the inner loop (10 v_cvt_f32_f16 per 16
@@ -48,6 +49,9 @@
 // which is why they run SD1.5/SDXL's linears 1.3-1.9x slower than the fp32
 // kernels here (2560x8192x320: 3.0 against 4.1 TFLOPS). Widening 16 values per
 // 512 multiply-adds at the LDS store costs about 3%.
+// gfx803_w_kernel computes a 64x64 (or 64x32) tile with one wavefront, an 8x8
+// (or 8x4) block per thread, and no barrier; it takes the fp16 batched calls
+// that gfx803_w_applies picks from the 64x64 tiles.
 // gfx803_sgemm_small_n_kernel takes GEMMs with at most 8 columns of C and
 // op(A) = T, a token-by-token decode step's nn.Linear, as a GEMV; it sums in
 // a different order than the tiles (see the comment there).
@@ -83,6 +87,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <type_traits>
 
 #define GFX803_SGEMM_TILE 16
 #define GFX803_SGEMM_MAX_GRID_YZ 65535
@@ -387,7 +392,7 @@ gfx803_sgemm_p_strided_batched_kernel(int M, int N, int K,
 // keep gfx803_sgemm_tile_p. TransA is a template parameter so the fetch has
 // no runtime branch on layout. The wide loads need no alignment (see
 // gfx803_ld), and edge tiles fall back to guarded scalar loads.
-template <int P, bool TransA, typename E>
+template <int P, bool TransA, typename E, bool D = false>
 __device__ __forceinline__ void gfx803_sgemm_tile_p_fast(int M, int N, int K,
                                                           float alpha,
                                                           const E* __restrict__ A, int lda,
@@ -420,6 +425,37 @@ __device__ __forceinline__ void gfx803_sgemm_tile_p_fast(int M, int N, int K,
 
     float4 pa_vec;
     float pb[4];
+    // Raw fp16 operands for D: see gfx803_stage_d for why the widening waits
+    // for the LDS store.
+    typedef E e4 __attribute__((ext_vector_type(4)));
+    e4 pa_raw;
+    E pb_raw[4];
+    auto fetch_d = [&](int k0) {
+        const int gk_a = k0 + k_a;
+        if constexpr (!TransA) {
+            const E* p = A + (size_t)gk_a * lda + gr_a;
+            if (gr_a + 3 < M && gk_a < K) {
+                pa_raw = *reinterpret_cast<const e4*>(p);
+            } else {
+                #pragma unroll
+                for (int e = 0; e < 4; e++) pa_raw[e] = (gr_a + e < M && gk_a < K) ? p[e] : E(0);
+            }
+        } else {
+            const E* p = A + (size_t)gr_a * lda + gk_a;
+            if (gr_a < M && gk_a + 3 < K) {
+                pa_raw = *reinterpret_cast<const e4*>(p);
+            } else {
+                #pragma unroll
+                for (int e = 0; e < 4; e++) pa_raw[e] = (gr_a < M && gk_a + e < K) ? p[e] : E(0);
+            }
+        }
+        const int gk = k0 + k_b;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const int gc = col0 + c_b_base + 16 * i;
+            pb_raw[i] = (gc < N && gk < K) ? B[(size_t)gc * ldb + gk] : E(0);
+        }
+    };
 
     auto fetch = [&](int k0) {
         int gk_a = k0 + k_a;
@@ -462,24 +498,40 @@ __device__ __forceinline__ void gfx803_sgemm_tile_p_fast(int M, int N, int K,
         for (int j = 0; j < P; j++) acc[i][j] = 0.0f;
 
     const int n_tiles = (K + KT - 1) / KT;
-    fetch(0);
+    auto fetch_any = [&](int k0) {
+        if constexpr (D) fetch_d(k0); else fetch(k0);
+    };
+    fetch_any(0);
     for (int t = 0; t < n_tiles; t++) {
-        if constexpr (!TransA) {
-            *reinterpret_cast<float4*>(&As[k_a][r_a]) = pa_vec;
+        if constexpr (D) {
+            if constexpr (!TransA) {
+                *reinterpret_cast<float4*>(&As[k_a][r_a]) =
+                    make_float4(static_cast<float>(pa_raw[0]), static_cast<float>(pa_raw[1]),
+                                static_cast<float>(pa_raw[2]), static_cast<float>(pa_raw[3]));
+            } else {
+                #pragma unroll
+                for (int e = 0; e < 4; e++) As[k_a + e][r_a] = static_cast<float>(pa_raw[e]);
+            }
+            #pragma unroll
+            for (int i = 0; i < 4; i++) Bs[k_b][c_b_base + 16 * i] = static_cast<float>(pb_raw[i]);
         } else {
-            As[k_a + 0][r_a] = pa_vec.x;
-            As[k_a + 1][r_a] = pa_vec.y;
-            As[k_a + 2][r_a] = pa_vec.z;
-            As[k_a + 3][r_a] = pa_vec.w;
-        }
+            if constexpr (!TransA) {
+                *reinterpret_cast<float4*>(&As[k_a][r_a]) = pa_vec;
+            } else {
+                As[k_a + 0][r_a] = pa_vec.x;
+                As[k_a + 1][r_a] = pa_vec.y;
+                As[k_a + 2][r_a] = pa_vec.z;
+                As[k_a + 3][r_a] = pa_vec.w;
+            }
 
-        #pragma unroll
-        for (int i = 0; i < 4; i++) {
-            Bs[k_b][c_b_base + 16 * i] = pb[i];
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                Bs[k_b][c_b_base + 16 * i] = pb[i];
+            }
         }
 
         __syncthreads();
-        if (t + 1 < n_tiles) fetch((t + 1) * KT);
+        if (t + 1 < n_tiles) fetch_any((t + 1) * KT);
 
         float av[2][P], bv[2][P];
         gfx803_vec<P>::unpack(*reinterpret_cast<const vec*>(&As[0][tx * P]), av[0]);
@@ -518,7 +570,7 @@ __device__ __forceinline__ void gfx803_sgemm_tile_p_fast(int M, int N, int K,
 // The 32x32 tile with the scheme of gfx803_sgemm_tile_p_fast. Each thread
 // fetches two values of A and two of B per K slice, so the wide loads are
 // float2.
-template <bool TransA, typename E>
+template <bool TransA, typename E, bool D = false>
 __device__ __forceinline__ void gfx803_sgemm_tile_p2_fast(int M, int N, int K,
                                                           float alpha,
                                                           const E* __restrict__ A, int lda,
@@ -545,6 +597,32 @@ __device__ __forceinline__ void gfx803_sgemm_tile_p2_fast(int M, int N, int K,
     const int gc_b = col0 + c_b;
 
     float2 pa, pb;
+    typedef E e2 __attribute__((ext_vector_type(2)));
+    e2 pa_raw, pb_raw;
+    auto fetch_d = [&](int k0) {
+        const int gk_a = k0 + k_a;
+        if constexpr (!TransA) {
+            const E* p = A + (size_t)gk_a * lda + gr_a;
+            if (gr_a + 1 < M && gk_a < K) {
+                pa_raw = *reinterpret_cast<const e2*>(p);
+            } else {
+                #pragma unroll
+                for (int e = 0; e < 2; e++) pa_raw[e] = (gr_a + e < M && gk_a < K) ? p[e] : E(0);
+            }
+        } else {
+            #pragma unroll
+            for (int e = 0; e < 2; e++)
+                pa_raw[e] = (gr_a + e < M && gk_a < K) ? A[(size_t)(gr_a + e) * lda + gk_a] : E(0);
+        }
+        const int gk_b = k0 + k_b;
+        const E* q = B + (size_t)gc_b * ldb + gk_b;
+        if (gc_b < N && gk_b + 1 < K) {
+            pb_raw = *reinterpret_cast<const e2*>(q);
+        } else {
+            #pragma unroll
+            for (int e = 0; e < 2; e++) pb_raw[e] = (gc_b < N && gk_b + e < K) ? q[e] : E(0);
+        }
+    };
 
     auto fetch = [&](int k0) {
         int gk_a = k0 + k_a;
@@ -582,15 +660,25 @@ __device__ __forceinline__ void gfx803_sgemm_tile_p2_fast(int M, int N, int K,
         for (int j = 0; j < P; j++) acc[i][j] = 0.0f;
 
     const int n_tiles = (K + KT - 1) / KT;
-    fetch(0);
+    auto fetch_any = [&](int k0) {
+        if constexpr (D) fetch_d(k0); else fetch(k0);
+    };
+    fetch_any(0);
     for (int t = 0; t < n_tiles; t++) {
-        *reinterpret_cast<float2*>(&As[k_a][r_a]) = pa;
+        if constexpr (D) {
+            *reinterpret_cast<float2*>(&As[k_a][r_a]) =
+                make_float2(static_cast<float>(pa_raw[0]), static_cast<float>(pa_raw[1]));
+            Bs[k_b + 0][c_b] = static_cast<float>(pb_raw[0]);
+            Bs[k_b + 1][c_b] = static_cast<float>(pb_raw[1]);
+        } else {
+            *reinterpret_cast<float2*>(&As[k_a][r_a]) = pa;
 
-        Bs[k_b + 0][c_b] = pb.x;
-        Bs[k_b + 1][c_b] = pb.y;
+            Bs[k_b + 0][c_b] = pb.x;
+            Bs[k_b + 1][c_b] = pb.y;
+        }
 
         __syncthreads();
-        if (t + 1 < n_tiles) fetch((t + 1) * KT);
+        if (t + 1 < n_tiles) fetch_any((t + 1) * KT);
 
         float av[2][P], bv[2][P];
         gfx803_vec<P>::unpack(*reinterpret_cast<const vec*>(&As[0][tx * P]), av[0]);
@@ -626,7 +714,7 @@ __device__ __forceinline__ void gfx803_sgemm_tile_p2_fast(int M, int N, int K,
     }
 }
 
-template <int P, bool TransA, typename T>
+template <int P, bool TransA, typename T, bool D = false>
 __global__ void __launch_bounds__(256)
 gfx803_sgemm_p_fast_kernel(int M, int N, int K,
                            float alpha,
@@ -634,10 +722,10 @@ gfx803_sgemm_p_fast_kernel(int M, int N, int K,
                            const T* __restrict__ B, int ldb,
                            float beta,
                            T* __restrict__ C, int ldc) {
-    gfx803_sgemm_tile_p_fast<P, TransA, T>(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+    gfx803_sgemm_tile_p_fast<P, TransA, T, D>(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
 }
 
-template <int P, bool TransA, typename T>
+template <int P, bool TransA, typename T, bool D = false>
 __global__ void __launch_bounds__(256)
 gfx803_sgemm_p_strided_batched_fast_kernel(int M, int N, int K,
                                            float alpha,
@@ -649,14 +737,14 @@ gfx803_sgemm_p_strided_batched_fast_kernel(int M, int N, int K,
                                            T* __restrict__ C, int ldc,
                                            int64_t strideC) {
     const int64_t b = (int64_t)blockIdx.z;
-    gfx803_sgemm_tile_p_fast<P, TransA, T>(M, N, K, alpha,
-                                          A + b * strideA, lda,
-                                          B + b * strideB, ldb,
-                                          beta,
-                                          C + b * strideC, ldc);
+    gfx803_sgemm_tile_p_fast<P, TransA, T, D>(M, N, K, alpha,
+                                             A + b * strideA, lda,
+                                             B + b * strideB, ldb,
+                                             beta,
+                                             C + b * strideC, ldc);
 }
 
-template <bool TransA, typename T>
+template <bool TransA, typename T, bool D = false>
 __global__ void __launch_bounds__(256)
 gfx803_sgemm_p2_fast_kernel(int M, int N, int K,
                             float alpha,
@@ -664,10 +752,10 @@ gfx803_sgemm_p2_fast_kernel(int M, int N, int K,
                             const T* __restrict__ B, int ldb,
                             float beta,
                             T* __restrict__ C, int ldc) {
-    gfx803_sgemm_tile_p2_fast<TransA, T>(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+    gfx803_sgemm_tile_p2_fast<TransA, T, D>(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
 }
 
-template <bool TransA, typename T>
+template <bool TransA, typename T, bool D = false>
 __global__ void __launch_bounds__(256)
 gfx803_sgemm_p2_strided_batched_fast_kernel(int M, int N, int K,
                                             float alpha,
@@ -679,11 +767,11 @@ gfx803_sgemm_p2_strided_batched_fast_kernel(int M, int N, int K,
                                             T* __restrict__ C, int ldc,
                                             int64_t strideC) {
     const int64_t b = (int64_t)blockIdx.z;
-    gfx803_sgemm_tile_p2_fast<TransA, T>(M, N, K, alpha,
-                                         A + b * strideA, lda,
-                                         B + b * strideB, ldb,
-                                         beta,
-                                         C + b * strideC, ldc);
+    gfx803_sgemm_tile_p2_fast<TransA, T, D>(M, N, K, alpha,
+                                            A + b * strideA, lda,
+                                            B + b * strideB, ldb,
+                                            beta,
+                                            C + b * strideC, ldc);
 }
 
 // One operand's Kx(16P) slice for gfx803_sgemm_tile_g, staged into LDS as
@@ -765,6 +853,90 @@ struct gfx803_stage {
     }
 };
 
+// gfx803_stage with the fetched values kept in storage type E until the LDS
+// store widens them. Widened right after the load, an fp16 value makes the
+// compiler wait for that load (s_waitcnt vmcnt(0)) inside the guarded fetch,
+// one load at a time, before the slice's multiply-adds start: the fp16 tiles
+// then pay four or five memory round trips per K slice that nothing in the
+// same wavefront overlaps. Kept raw, a value is first needed at the next
+// slice's LDS store, so the loads stay in flight during the multiply-adds, as
+// they do in the fp32 kernels. The same fp32 values reach LDS, so results are
+// bit-identical.
+template <int TT, int KT, bool KC, bool Scalar, typename E>
+struct gfx803_stage_d {
+    static constexpr int NV = TT * KT / 4 / 256;
+    static constexpr int NS = TT * KT / 256;
+    static constexpr int KQ = KT / 4;
+    static_assert(NV >= 1 && TT * KT % 1024 == 0, "slice must give every thread whole float4s");
+    typedef E e4 __attribute__((ext_vector_type(4)));
+    e4 v[NV];
+    E s[NS];
+
+    __device__ __forceinline__ void fetch(const E* __restrict__ X, int ld, int rows, int K,
+                                          int idx0, int k0, int tid) {
+        auto at = [](const E* p, bool ok) { return ok ? *p : E(0); };
+        if constexpr (KC && Scalar) {
+            #pragma unroll
+            for (int i = 0; i < NS; i++) {
+                int lin = tid + 256 * i;
+                int gr = idx0 + lin / KT, gk = k0 + lin % KT;
+                s[i] = at(X + (size_t)gr * ld + gk, gr < rows && gk < K);
+            }
+        } else if constexpr (KC) {
+            #pragma unroll
+            for (int i = 0; i < NV; i++) {
+                int lin = tid + 256 * i;
+                int gr = idx0 + lin / KQ, gk = k0 + (lin % KQ) * 4;
+                const E* p = X + (size_t)gr * ld + gk;
+                if (gr < rows && gk + 3 < K) {
+                    v[i] = *reinterpret_cast<const e4*>(p);
+                } else {
+                    #pragma unroll
+                    for (int e = 0; e < 4; e++) v[i][e] = at(p + e, gr < rows && gk + e < K);
+                }
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < NV; i++) {
+                int lin = tid + 256 * i;
+                int gr = idx0 + (lin % (TT / 4)) * 4, gk = k0 + lin / (TT / 4);
+                const E* p = X + (size_t)gk * ld + gr;
+                if (gr + 3 < rows && gk < K) {
+                    v[i] = *reinterpret_cast<const e4*>(p);
+                } else {
+                    #pragma unroll
+                    for (int e = 0; e < 4; e++) v[i][e] = at(p + e, gr + e < rows && gk < K);
+                }
+            }
+        }
+    }
+
+    template <int S>
+    __device__ __forceinline__ void store(float (*Xs)[S], int tid) const {
+        if constexpr (KC && Scalar) {
+            #pragma unroll
+            for (int i = 0; i < NS; i++) {
+                int lin = tid + 256 * i;
+                Xs[lin % KT][lin / KT] = static_cast<float>(s[i]);
+            }
+        } else if constexpr (KC) {
+            #pragma unroll
+            for (int i = 0; i < NV; i++) {
+                int lin = tid + 256 * i, r = lin / KQ, k = (lin % KQ) * 4;
+                #pragma unroll
+                for (int e = 0; e < 4; e++) Xs[k + e][r] = static_cast<float>(v[i][e]);
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < NV; i++) {
+                int lin = tid + 256 * i;
+                *reinterpret_cast<float4*>(&Xs[lin / (TT / 4)][(lin % (TT / 4)) * 4]) =
+                    make_float4(static_cast<float>(v[i][0]), static_cast<float>(v[i][1]),
+                                static_cast<float>(v[i][2]), static_cast<float>(v[i][3]));
+            }
+        }
+    }
+};
 // gfx803_sgemm_tile_p_fast for the transposed layouts. nn.Linear reaches
 // rocBLAS as op(A) = T, op(B) = N (40% of an SD1.5 step's GEMM FLOPs) and its
 // weight gradient as op(A) = N, op(B) = T; gfx803_sgemm_tile_p_fast stages a
@@ -786,7 +958,7 @@ struct gfx803_stage {
 // Every output still accumulates its products one at a time in increasing k,
 // so the result is bit-identical to the other tiles. See gfx803_sgemm_g_launch
 // for the shapes that keep the older kernels.
-template <int P, int KT, bool TransA, bool TransB, bool ScalarB, typename E>
+template <int P, int KT, bool TransA, bool TransB, bool ScalarB, typename E, bool D = false>
 __device__ __forceinline__ void gfx803_sgemm_tile_g(int GW, int M, int N, int K, float alpha,
                                                     const E* __restrict__ A, int lda,
                                                     const E* __restrict__ B, int ldb,
@@ -802,8 +974,8 @@ __device__ __forceinline__ void gfx803_sgemm_tile_g(int GW, int M, int N, int K,
     const int gw = gy - first < GW ? gy - first : GW, loc = blockIdx.x - grp * per;
     const int row0 = (loc / gw) * T, col0 = (first + loc % gw) * T;
 
-    gfx803_stage<T, KT, TransA, false, E> sa;
-    gfx803_stage<T, KT, !TransB, ScalarB, E> sb;
+    std::conditional_t<D, gfx803_stage_d<T, KT, TransA, false, E>, gfx803_stage<T, KT, TransA, false, E>> sa;
+    std::conditional_t<D, gfx803_stage_d<T, KT, !TransB, ScalarB, E>, gfx803_stage<T, KT, !TransB, ScalarB, E>> sb;
 
     float acc[P][P];
     #pragma unroll
@@ -855,15 +1027,15 @@ __device__ __forceinline__ void gfx803_sgemm_tile_g(int GW, int M, int N, int K,
     }
 }
 
-template <int P, int KT, bool TransA, bool TransB, bool ScalarB, typename E>
+template <int P, int KT, bool TransA, bool TransB, bool ScalarB, typename E, bool D = false>
 __global__ void __launch_bounds__(256)
 gfx803_sgemm_g_kernel(int GW, int M, int N, int K, float alpha,
                       const E* __restrict__ A, int lda, int64_t strideA,
                       const E* __restrict__ B, int ldb, int64_t strideB,
                       float beta, E* __restrict__ C, int ldc, int64_t strideC) {
     const int64_t b = (int64_t)blockIdx.z;
-    gfx803_sgemm_tile_g<P, KT, TransA, TransB, ScalarB, E>(GW, M, N, K, alpha, A + b * strideA, lda,
-                                                           B + b * strideB, ldb, beta, C + b * strideC, ldc);
+    gfx803_sgemm_tile_g<P, KT, TransA, TransB, ScalarB, E, D>(GW, M, N, K, alpha, A + b * strideA, lda,
+                                                              B + b * strideB, ldb, beta, C + b * strideC, ldc);
 }
 
 // Launches gfx803_sgemm_tile_g where it measured faster; returns false to
@@ -893,20 +1065,26 @@ gfx803_sgemm_g_kernel(int GW, int M, int N, int K, float alpha,
 // fp16 shape where the choice applies (1280x512x5120: 2.1 -> 3.5 TFLOPS;
 // 640x2048x2560: 2.8 -> 4.3, SD1.5's feed-forward output projections).
 template <typename E>
-inline bool gfx803_sgemm_g_launch(int tile, dim3 grid, hipStream_t stream, int M, int N, int K, float alpha,
-                                  const E* A, int lda, int64_t strideA, bool transA,
-                                  const E* B, int ldb, int64_t strideB, bool transB,
-                                  float beta, E* C, int ldc, int64_t strideC) {
+inline bool gfx803_sgemm_g_applies(int tile, int M, int K, int lda, bool transA, int ldb, bool transB) {
     auto camps = [](int ld) { return ((size_t)ld * sizeof(E)) % 8192 == 0; };
     const bool a_big = (size_t)M * K * sizeof(E) > (2u << 20);
     if (transB ? (camps(lda) && camps(ldb)) : (!transA || K <= 64 || !a_big || camps(lda) || camps(ldb)))
         return false;
-    if (tile == 16 || (tile == 32 && !transB)) return false;
+    return !(tile == 16 || (tile == 32 && !transB));
+}
+
+template <typename E, bool D = false>
+inline bool gfx803_sgemm_g_launch(int tile, dim3 grid, hipStream_t stream, int M, int N, int K, float alpha,
+                                  const E* A, int lda, int64_t strideA, bool transA,
+                                  const E* B, int ldb, int64_t strideB, bool transB,
+                                  float beta, E* C, int ldc, int64_t strideC) {
+    if (!gfx803_sgemm_g_applies<E>(tile, M, K, lda, transA, ldb, transB)) return false;
+    const bool a_big = (size_t)M * K * sizeof(E) > (2u << 20);
     const dim3 g1(grid.x * grid.y, 1, grid.z), block(GFX803_SGEMM_TILE, GFX803_SGEMM_TILE);
     const bool b_rows_aligned = transB || ((size_t)ldb * sizeof(E)) % 256 == 0;
     const int gw = transA && a_big && b_rows_aligned ? 8 : 1;
 #define GFX803_G(P, TA, TB, SB) \
-    hipLaunchKernelGGL((gfx803_sgemm_g_kernel<P, 32, TA, TB, SB, E>), g1, block, 0, stream, gw, M, N, K, alpha, \
+    hipLaunchKernelGGL((gfx803_sgemm_g_kernel<P, 32, TA, TB, SB, E, D>), g1, block, 0, stream, gw, M, N, K, alpha, \
                        A, lda, strideA, B, ldb, strideB, beta, C, ldc, strideC)
     if (tile == 32) {
         if (transA) GFX803_G(2, true, true, false); else GFX803_G(2, false, true, false);
@@ -1137,6 +1315,513 @@ inline int gfx803_sgemm_pick_tile(int M, int N, int K, int batch, bool half = fa
     return GFX803_SGEMM_TILE;
 }
 
+// One wavefront per tile: gfx803_w_kernel computes a 64 x (8*PN) tile of C
+// with 64 threads, each owning an 8 x PN block (PN = 8 or 4), and takes over
+// the calls gfx803_w_applies picks from the 16x16-thread 64x64 tiles.
+//
+// Why a different tile instead of tuning the 4x4-per-thread ones:
+//   - LDS bandwidth. A 4x4 block reads two float4 from LDS per 16
+//     multiply-adds. A wave64 ds_read_b128 returns 1 KiB and the LDS returns
+//     at most 128 bytes per clock to the whole CU, so at the full multiply-add
+//     rate of four SIMDs the 4x4 tiles need all of it, and every LDS store or
+//     conflict comes straight off the multiply-add rate. An 8x8 block reads
+//     four float4 per 64 multiply-adds (half the LDS bandwidth), 8x4 three
+//     per 32 (three quarters).
+//   - Barriers. gfx8 cannot back off a barrier, so the compiler drains every
+//     outstanding load (s_waitcnt vmcnt(0) lgkmcnt(0)) before each s_barrier,
+//     and the 16x16-thread tiles hit two of those per K slice. A workgroup of
+//     one wavefront needs none: LDS executes one wavefront's instructions in
+//     issue order, so a store issued after the reads of a buffer cannot
+//     overtake them, and reads issued after the store see it. gfx803_w_order
+//     only keeps the compiler from moving LDS accesses across that point; it
+//     emits no instruction.
+//   - Latency hiding inside the wavefront. LDS holds two 8-deep K pieces; the
+//     operands of the piece two ahead are loaded into registers in their
+//     storage type (fp16 stays fp16) while the current piece is multiplied,
+//     and widened only at the LDS store that follows that piece, so each
+//     global load has a whole piece (512 multiply-adds per lane) to arrive.
+//     The next K step's LDS reads are issued before the current step's 64 (or
+//     32) multiply-adds, which cover the LDS latency.
+// A tile on one wavefront lives on one SIMD, so a GEMM with few tiles
+// balances worse over the 4 * CUs SIMDs than the 16x16-thread tiles, whose
+// tile spreads over a CU's four SIMDs; gfx803_w_pick_pn takes the 64x32 tile
+// when that halves the imbalance.
+//
+// Every output still accumulates its K products one at a time in increasing
+// k in fp32 (v_mac_f32: product and sum each rounded, as in the other tiles),
+// then alpha * acc + beta * C rounded once. The K tail is padded with zero
+// products to a multiple of 8; the older tiles pad to 16 or 32, and a padded
+// +0 turns an accumulated -0 into +0, so pz adds one +0 where the tile this
+// replaces would have padded and this one does not. Results are then
+// bit-identical to the older tiles.
+#define GFX803_W_KH 8
+
+__device__ __forceinline__ void gfx803_w_order() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+    __builtin_amdgcn_wave_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+}
+
+__device__ const float gfx803_w_zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+// One operand's 8 x R piece (R = 64 rows of op(A), or 8*PN columns of
+// op(B)), fetched by the 64 lanes in 16-byte (or 8-byte) vectors along the
+// operand's contiguous index and stored to LDS as Xs[k][r]. KC: K is the
+// contiguous index.
+template <typename E, bool KC, int R>
+struct gfx803_w_op {
+    static constexpr int KH = GFX803_W_KH;
+    static constexpr int PER = R * KH / 64;
+    static constexpr int VW = PER < 16 / (int)sizeof(E) ? PER : 16 / (int)sizeof(E);
+    static constexpr int NV = PER / VW;
+    // Lane l's vector i sits at (r0 + DR*i, k0 + DK*i): the deltas are the
+    // same for every lane, so the other vectors' LDS stores are immediate
+    // offsets and their global addresses one uniform offset each. Registers
+    // per vector push the fp32 8x8 tile past 128 VGPRs, and the spill reload
+    // that follows waits (vmcnt counts in order) for the operand loads just
+    // issued.
+    static constexpr int KV = KC ? KH / VW : 1, RV = KC ? 1 : R / VW;
+    static constexpr int DR = KC ? 64 / KV : 0, DK = KC ? 0 : 64 / RV;
+    static_assert(PER % VW == 0 && (KC || VW % 4 == 0) && 64 % KV == 0 && 64 % RV == 0,
+                  "piece must split into whole vectors");
+    typedef E vec __attribute__((ext_vector_type(VW)));
+    struct raw { vec v[NV]; };
+    int r0, k0;
+    const E* p;
+    size_t off;
+    size_t step;
+
+    __device__ __forceinline__ explicit gfx803_w_op(int lane) {
+        if constexpr (KC) { r0 = lane / KV; k0 = lane % KV * VW; }
+        else { r0 = lane % RV * VW; k0 = lane / RV; }
+    }
+
+    __device__ __forceinline__ void init(const E* X, int ld, int row0) {
+        p = KC ? X + (size_t)(row0 + r0) * ld + k0 : X + (size_t)k0 * ld + (row0 + r0);
+        off = KC ? (size_t)DR * ld : (size_t)DK * ld;
+        step = KC ? (size_t)KH : (size_t)KH * ld;
+    }
+
+    // The tile and the piece lie inside the matrix: plain vector loads. The
+    // vectors need no alignment (see gfx803_ld).
+    __device__ __forceinline__ raw load() {
+        raw o;
+        #pragma unroll
+        for (int i = 0; i < NV; i++) o.v[i] = *reinterpret_cast<const vec*>(p + i * off);
+        p += step;
+        return o;
+    }
+
+    __device__ __forceinline__ void store(float (*Xs)[R], const raw& o) const {
+        #pragma unroll
+        for (int i = 0; i < NV; i++) {
+            if constexpr (KC) {
+                #pragma unroll
+                for (int e = 0; e < VW; e++) Xs[k0 + e][r0 + DR * i] = static_cast<float>(o.v[i][e]);
+            } else {
+                #pragma unroll
+                for (int q = 0; q < VW / 4; q++)
+                    *reinterpret_cast<float4*>(&Xs[k0 + DK * i][r0 + 4 * q]) =
+                        make_float4(static_cast<float>(o.v[i][4 * q + 0]), static_cast<float>(o.v[i][4 * q + 1]),
+                                    static_cast<float>(o.v[i][4 * q + 2]), static_cast<float>(o.v[i][4 * q + 3]));
+            }
+        }
+    }
+
+    // Edge tiles and the K tail, one element at a time. An element outside
+    // the matrix is read from gfx803_w_zero rather than selected to zero
+    // after the load: the compiler turns a select whose operand is a load
+    // into a per-lane branch around the load and waits for the load inside
+    // it, which serializes the fetch. The values stay unpacked so nothing
+    // touches them before the LDS store.
+    struct graw { E v[NV * VW]; };
+    __device__ __forceinline__ graw load_guarded(const E* X, int ld, int rows, int K, int row0, int kb) const {
+        graw o;
+        const E* zero = reinterpret_cast<const E*>(gfx803_w_zero);
+        #pragma unroll
+        for (int i = 0; i < NV; i++)
+            #pragma unroll
+            for (int e = 0; e < VW; e++) {
+                const int rr = row0 + r0 + DR * i + (KC ? 0 : e), kk = kb + k0 + DK * i + (KC ? e : 0);
+                const bool ok = rr < rows && kk < K;
+                const size_t idx = ok ? (KC ? (size_t)rr * ld + kk : (size_t)kk * ld + rr) : 0;
+                o.v[i * VW + e] = *(ok ? X + idx : zero);
+            }
+        return o;
+    }
+
+    __device__ __forceinline__ void store(float (*Xs)[R], const graw& o) const {
+        #pragma unroll
+        for (int i = 0; i < NV; i++) {
+            if constexpr (KC) {
+                #pragma unroll
+                for (int e = 0; e < VW; e++) Xs[k0 + e][r0 + DR * i] = static_cast<float>(o.v[i * VW + e]);
+            } else {
+                #pragma unroll
+                for (int q = 0; q < VW / 4; q++)
+                    *reinterpret_cast<float4*>(&Xs[k0 + DK * i][r0 + 4 * q]) =
+                        make_float4(static_cast<float>(o.v[i * VW + 4 * q + 0]),
+                                    static_cast<float>(o.v[i * VW + 4 * q + 1]),
+                                    static_cast<float>(o.v[i * VW + 4 * q + 2]),
+                                    static_cast<float>(o.v[i * VW + 4 * q + 3]));
+            }
+        }
+    }
+};
+
+// Lane (tx, ty) = (lane & 7, lane >> 3) owns rows tx*4 + {0..3} and
+// 32 + tx*4 + {0..3}, and columns ty*4 + {0..3} (and 32 + ty*4 + {0..3} for
+// PN = 8): every float4 LDS read covers 128 contiguous bytes across the 8
+// distinct addresses of a wavefront, one pass over the 32 banks.
+// G: guarded loads and stores (edge tile or K not a multiple of 8).
+// P2 (unguarded tiles, K % 16 == 0): each K-contiguous operand is fetched two
+// pieces at a time, the two loads back to back. One 8-deep piece of a
+// K-contiguous fp16 row is 16 bytes of a 64-byte line, and with eight
+// wavefronts per CU streaming 128 such rows each, the 16 KiB L1 drops the
+// line before the next piece reads it, so L2 delivers each line up to four
+// times; back-to-back loads use it twice per delivery. Costs four VGPRs per
+// such operand.
+template <typename E, bool TransA, bool TransB, int PN, bool G, bool P2 = false>
+__device__ __forceinline__ void gfx803_w_tile(int M, int N, int K, float alpha,
+                                              const E* __restrict__ A, int lda,
+                                              const E* __restrict__ B, int ldb,
+                                              float beta, E* __restrict__ C, int ldc,
+                                              int row0, int col0, int pz,
+                                              float (*As)[GFX803_W_KH][64],
+                                              float (*Bs)[GFX803_W_KH][8 * PN]) {
+    constexpr int TN = 8 * PN, KH = GFX803_W_KH;
+    typedef gfx803_w_op<E, TransA, 64> OA;
+    typedef gfx803_w_op<E, !TransB, TN> OB;
+    const int lane = threadIdx.x, tx = lane & 7, ty = lane >> 3;
+    OA oa(lane);
+    OB ob(lane);
+    if constexpr (!G) {
+        oa.init(A, lda, row0);
+        ob.init(B, ldb, col0);
+    }
+    auto load_a = [&](int h) {
+        if constexpr (G) return oa.load_guarded(A, lda, M, K, row0, KH * h);
+        else return oa.load();
+    };
+    auto load_b = [&](int h) {
+        if constexpr (G) return ob.load_guarded(B, ldb, N, K, col0, KH * h);
+        else return ob.load();
+    };
+
+    float acc[8][PN];
+    #pragma unroll
+    for (int i = 0; i < 8; i++)
+        #pragma unroll
+        for (int j = 0; j < PN; j++) acc[i][j] = 0.0f;
+
+    auto compute = [&](const float (*as)[64], const float (*bs)[TN]) {
+        float a[2][8], b[2][PN];
+        auto read = [&](int s, int kk) {
+#if GFX803_W_ABL_NO_LDS_READ
+            const int k = 0 * kk;
+#else
+            const int k = kk;
+#endif
+            const float4 x0 = *reinterpret_cast<const float4*>(&as[k][tx * 4]);
+            const float4 x1 = *reinterpret_cast<const float4*>(&as[k][32 + tx * 4]);
+            a[s][0] = x0.x; a[s][1] = x0.y; a[s][2] = x0.z; a[s][3] = x0.w;
+            a[s][4] = x1.x; a[s][5] = x1.y; a[s][6] = x1.z; a[s][7] = x1.w;
+            const float4 y0 = *reinterpret_cast<const float4*>(&bs[k][ty * 4]);
+            b[s][0] = y0.x; b[s][1] = y0.y; b[s][2] = y0.z; b[s][3] = y0.w;
+            if constexpr (PN == 8) {
+                const float4 y1 = *reinterpret_cast<const float4*>(&bs[k][32 + ty * 4]);
+                b[s][4] = y1.x; b[s][5] = y1.y; b[s][6] = y1.z; b[s][7] = y1.w;
+            }
+        };
+        read(0, 0);
+        #pragma unroll
+        for (int k = 0; k < KH; k++) {
+            if (k + 1 < KH) read((k + 1) & 1, k + 1);
+            #pragma unroll
+            for (int i = 0; i < 8; i++)
+                #pragma unroll
+                for (int j = 0; j < PN; j++) acc[i][j] += a[k & 1][i] * b[k & 1][j];
+            // Left free, the scheduler issues all eight steps' LDS reads first
+            // and groups the multiply-adds by accumulator, which keeps 128
+            // operand values live next to the 64 sums and spills.
+#if !GFX803_W_ABL_NO_LDS_READ
+            __builtin_amdgcn_sched_barrier(0);
+#endif
+        }
+    };
+
+    const int nh = (K + KH - 1) / KH;
+    {
+        auto ra0 = load_a(0);
+        auto rb0 = load_b(0);
+        decltype(ra0) ra1;
+        decltype(rb0) rb1;
+        if (nh > 1) {
+            ra1 = load_a(1);
+            rb1 = load_b(1);
+        }
+        oa.store(As[0], ra0);
+        ob.store(Bs[0], rb0);
+        if (nh > 1) {
+            oa.store(As[1], ra1);
+            ob.store(Bs[1], rb1);
+        }
+    }
+    if constexpr (P2 && !G) {
+        constexpr bool PA = TransA, PB = !TransB;
+        typename OA::raw a_lo, a_hi;
+        typename OB::raw b_lo, b_hi;
+        auto store_lo = [&](int buf) {
+            oa.store(As[buf], a_lo);
+            ob.store(Bs[buf], b_lo);
+        };
+        auto store_hi = [&](int buf) {
+            oa.store(As[buf], PA ? a_hi : a_lo);
+            ob.store(Bs[buf], PB ? b_hi : b_lo);
+        };
+        // Pieces 0 and 1 were stored above; nh is even.
+        if (nh > 2) {
+            a_lo = oa.load();
+            if constexpr (PA) a_hi = oa.load();
+            b_lo = ob.load();
+            if constexpr (PB) b_hi = ob.load();
+        }
+        int t = 0;
+        for (; t + 5 < nh; t += 2) {
+            gfx803_w_order();
+            compute(As[0], Bs[0]);
+            gfx803_w_order();
+            store_lo(0);
+            if constexpr (!PA) a_lo = oa.load();
+            if constexpr (!PB) b_lo = ob.load();
+            gfx803_w_order();
+            compute(As[1], Bs[1]);
+            gfx803_w_order();
+            store_hi(1);
+            a_lo = oa.load();
+            if constexpr (PA) a_hi = oa.load();
+            b_lo = ob.load();
+            if constexpr (PB) b_hi = ob.load();
+        }
+        if (t + 2 < nh) {
+            gfx803_w_order();
+            compute(As[0], Bs[0]);
+            gfx803_w_order();
+            store_lo(0);
+            if constexpr (!PA) a_lo = oa.load();
+            if constexpr (!PB) b_lo = ob.load();
+            gfx803_w_order();
+            compute(As[1], Bs[1]);
+            gfx803_w_order();
+            store_hi(1);
+            t += 2;
+        }
+        gfx803_w_order();
+        compute(As[0], Bs[0]);
+        gfx803_w_order();
+        compute(As[1], Bs[1]);
+    } else {
+        std::conditional_t<G, typename OA::graw, typename OA::raw> ra;
+        std::conditional_t<G, typename OB::graw, typename OB::raw> rb;
+        if (nh > 2) {
+            ra = load_a(2);
+            rb = load_b(2);
+        }
+        // The steady-state body is one basic block. With the LDS store and the
+        // next fetch under a branch, the compiler sinks the multiply-adds below
+        // that branch, which keeps all of a piece's LDS operands live at once
+        // and spills.
+        int t = 0;
+        for (; t + 3 < nh; t++) {
+            const int buf = t & 1;
+            gfx803_w_order();
+            compute(As[buf], Bs[buf]);
+            gfx803_w_order();
+#if !GFX803_W_ABL_NO_STORE
+            oa.store(As[buf], ra);
+            ob.store(Bs[buf], rb);
+#endif
+#if !GFX803_W_ABL_NO_FETCH
+            ra = load_a(t + 3);
+            rb = load_b(t + 3);
+#endif
+        }
+        if (t + 2 < nh) {
+            gfx803_w_order();
+            compute(As[t & 1], Bs[t & 1]);
+            gfx803_w_order();
+            oa.store(As[t & 1], ra);
+            ob.store(Bs[t & 1], rb);
+            t++;
+        }
+        for (; t < nh; t++) {
+            gfx803_w_order();
+            compute(As[t & 1], Bs[t & 1]);
+        }
+    }
+
+    if (pz) {
+        #pragma unroll
+        for (int i = 0; i < 8; i++)
+            #pragma unroll
+            for (int j = 0; j < PN; j++) acc[i][j] += 0.0f;
+    }
+
+    #pragma unroll
+    for (int j = 0; j < PN; j++) {
+        const int col = col0 + (j < 4 ? ty * 4 + j : 32 + ty * 4 + j - 4);
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const int row = row0 + (i < 4 ? tx * 4 + i : 32 + tx * 4 + i - 4);
+            if (!G || (row < M && col < N)) {
+                const size_t idx = (size_t)col * ldc + row;
+                C[idx] = static_cast<E>(alpha * acc[i][j] + (beta != 0.0f ? beta * static_cast<float>(C[idx]) : 0.0f));
+            }
+        }
+    }
+}
+
+// Edge = false: every tile of the launch is interior and K % 8 == 0, so no
+// tile runs the guarded code. P2 requires K % 16 == 0. Tile order as in
+// gfx803_sgemm_tile_g (GW column tiles walk the row tiles together).
+template <typename E, bool TransA, bool TransB, int PN, bool Edge, bool P2>
+__global__ void __launch_bounds__(64) __attribute__((amdgpu_waves_per_eu(2)))
+gfx803_w_kernel(int GW, int M, int N, int K, float alpha,
+                const E* __restrict__ A, int lda, int64_t strideA,
+                const E* __restrict__ B, int ldb, int64_t strideB,
+                float beta, E* __restrict__ C, int ldc, int64_t strideC, int pz) {
+    constexpr int TM = 64, TN = 8 * PN;
+    __shared__ float As[2][GFX803_W_KH][TM];
+    __shared__ float Bs[2][GFX803_W_KH][TN];
+    const int64_t b = (int64_t)blockIdx.z;
+    A += b * strideA;
+    B += b * strideB;
+    C += b * strideC;
+    const int gx = (M + TM - 1) / TM, gy = (N + TN - 1) / TN;
+    const int per = GW * gx, grp = blockIdx.x / per, first = grp * GW;
+    const int gw = gy - first < GW ? gy - first : GW, loc = blockIdx.x - grp * per;
+    const int row0 = (loc / gw) * TM, col0 = (first + loc % gw) * TN;
+    if (!Edge || (row0 + TM <= M && col0 + TN <= N && K % GFX803_W_KH == 0))
+        gfx803_w_tile<E, TransA, TransB, PN, false, P2>(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc,
+                                                        row0, col0, pz, As, Bs);
+    else
+        gfx803_w_tile<E, TransA, TransB, PN, true>(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc,
+                                                   row0, col0, pz, As, Bs);
+}
+
+inline long gfx803_sgemm_cus() {
+    static const long cus = [] {
+        int dev = 0, n = 0;
+        if (hipGetDevice(&dev) != hipSuccess ||
+            hipDeviceGetAttribute(&n, hipDeviceAttributeMultiprocessorCount, dev) != hipSuccess ||
+            n <= 0)
+            n = 36;
+        return (long)n;
+    }();
+    return cus;
+}
+
+// Tile width for gfx803_w_kernel: 64x64 tiles unless 64x32 tiles fill the
+// 4 * CUs SIMDs in markedly fewer rounds. A tile runs on one SIMD, so the
+// GEMM takes ceil(tiles / SIMDs) tile times; a 64x32 tile takes about half a
+// 64x64 tile's time, divided by its lower efficiency (three LDS reads per 32
+// multiply-adds against four per 64). An fp32 launch with edge tiles takes the
+// 64x32 tile: the fp32 64x64 edge kernel needs more than 128 VGPRs and
+// reloads a spilled value inside its loop, and since vector memory counts
+// complete in order, waiting for that reload also waits for the operand loads
+// just issued. GFX803_SGEMM_WAVE_PN=4 or 8 forces one.
+inline int gfx803_w_pick_pn(int M, int N, int K, int batch, size_t elem) {
+    static const long forced = gfx803_sgemm_env_long("GFX803_SGEMM_WAVE_PN", 0);
+    if (forced == 4 || forced == 8) return (int)forced;
+    if (elem == 4 && (M % 64 != 0 || N % 64 != 0 || K % GFX803_W_KH != 0)) return 4;
+    const double simds = 4.0 * gfx803_sgemm_cus();
+    const double gx = (M + 63) / 64;
+    const double t8 = gx * ((N + 63) / 64) * batch, t4 = gx * ((N + 31) / 32) * batch;
+    const double eff4 = 0.85;
+    return __builtin_ceil(t4 / simds) * 0.5 / eff4 < __builtin_ceil(t8 / simds) ? 4 : 8;
+}
+
+// Which calls gfx803_w_kernel takes from the 16x16-thread tiles. Without
+// barriers or a second wavefront in its workgroup, nothing overlaps a tile's
+// global loads with its multiply-adds except other tiles on the same SIMD, so
+// it wins only where a call has many tiles per SIMD. On an RX 590, fp16
+// strided-batched NN (MIOpen's conv-as-GEMM) with batch >= 8 and M >= 512 ran
+// up to 28% faster (SDXL 8192x320x640 b16: 13.6 -> 9.8 ms), a few such shapes
+// up to 18% slower, and the SDXL and SD1.5 UNet call logs' GEMM time dropped
+// 2%. Smaller or less batched shapes lose. On single GEMMs it lost up
+// to 3.3x (TN 1280x2048x5120: 6.6 -> 21.5 ms); on TN 1280x2048x1280 removing
+// its global fetch took it from 3.3 to 5.6 TFLOPS and removing its LDS reads
+// changed nothing. In fp32 batched NN it ran 0.5-2.8x the old time with no
+// pattern a rule could follow. GFX803_SGEMM_WAVE overrides the rule for timing: 0 = never, 1 =
+// every call given the 64x64 tile, 3 = also those given the 32x32 tile.
+inline bool gfx803_w_applies(int tile, int M, bool transA, bool transB, int batch, size_t elem) {
+    static const long mode = gfx803_sgemm_env_long("GFX803_SGEMM_WAVE", -1);
+    if (mode >= 0) return (mode == 1 && tile == 64) || (mode == 3 && tile >= 32);
+    return tile == 64 && elem == 2 && !transA && !transB && batch >= 8 && M >= 512;
+}
+
+// Runs a whole (strided-batched) GEMM on gfx803_w_kernel. kt_old is the K
+// slice depth of the tile the call would otherwise run on (16 or 32), for pz.
+// Returns false, launching nothing, when the grid would not fit.
+template <typename E>
+inline bool gfx803_w_gemm(int M, int N, int K, float alpha,
+                          const E* A, int lda, int64_t strideA, bool transA,
+                          const E* B, int ldb, int64_t strideB, bool transB,
+                          float beta, E* C, int ldc, int64_t strideC,
+                          int batch_count, int kt_old, hipStream_t stream, hipError_t* err) {
+    const int PN = gfx803_w_pick_pn(M, N, K, batch_count, sizeof(E)), TN = 8 * PN;
+    const long gx = (M + 63) / 64;
+    const long max_tiles = (0xffffffffL / 64) & ~0xffL;
+    if (gx > max_tiles) return false;
+    long gy_max = max_tiles / gx;
+    if (gy_max > (long)(0x7fffffff / TN)) gy_max = 0x7fffffff / TN;
+    const int max_cols = (int)(gy_max * TN);
+    const int pz = K % GFX803_W_KH == 0 && K % kt_old != 0;
+    const bool a_big = (size_t)M * K * sizeof(E) > (2u << 20);
+    const bool b_rows_aligned = transB || ((size_t)ldb * sizeof(E)) % 256 == 0;
+    static const long gw_env = gfx803_sgemm_env_long("GFX803_SGEMM_WAVE_GW", 0);
+    static const long kc2_env = gfx803_sgemm_env_long("GFX803_SGEMM_WAVE_KC2", 0);
+    const bool p2 = kc2_env != 0 && sizeof(E) == 2 && K % 16 == 0 && (transA || !transB);
+    const int GW = gw_env > 0 ? (int)gw_env : (transA && a_big && b_rows_aligned ? 8 : 1);
+    (void)hipGetLastError();
+    for (int c0 = 0; c0 < N; c0 += max_cols) {
+        const int cols = N - c0 < max_cols ? N - c0 : max_cols;
+        const E* Bc = B + (transB ? (int64_t)c0 : (int64_t)c0 * ldb);
+        E* Cc = C + (int64_t)c0 * ldc;
+        const unsigned tiles = (unsigned)(gx * ((cols + TN - 1) / TN));
+        const bool edge = M % 64 != 0 || cols % TN != 0 || K % GFX803_W_KH != 0;
+        for (int start = 0; start < batch_count; start += GFX803_SGEMM_MAX_GRID_YZ) {
+            int chunk = batch_count - start;
+            if (chunk > GFX803_SGEMM_MAX_GRID_YZ) chunk = GFX803_SGEMM_MAX_GRID_YZ;
+            const dim3 grid(tiles, 1, (unsigned)chunk);
+            const E* As = A + (int64_t)start * strideA;
+            const E* Bs = Bc + (int64_t)start * strideB;
+            E* Cs = Cc + (int64_t)start * strideC;
+#define GFX803_W(TA, TB, P, ED, P2) \
+    hipLaunchKernelGGL((gfx803_w_kernel<E, TA, TB, P, ED, P2>), grid, dim3(64), 0, stream, GW, M, cols, K, alpha, \
+                       As, lda, strideA, Bs, ldb, strideB, beta, Cs, ldc, strideC, pz)
+#define GFX803_W_2(TA, TB, P, ED) do { \
+        if (sizeof(E) == 2 && (TA || !TB) && p2) GFX803_W(TA, TB, P, ED, (sizeof(E) == 2 && (TA || !TB))); \
+        else GFX803_W(TA, TB, P, ED, false); \
+    } while (0)
+#define GFX803_W_E(TA, TB, P) do { if (edge) GFX803_W_2(TA, TB, P, true); else GFX803_W_2(TA, TB, P, false); } while (0)
+#define GFX803_W_P(TA, TB) do { if (PN == 8) GFX803_W_E(TA, TB, 8); else GFX803_W_E(TA, TB, 4); } while (0)
+            if (transA) {
+                if (transB) GFX803_W_P(true, true); else GFX803_W_P(true, false);
+            } else {
+                if (transB) GFX803_W_P(false, true); else GFX803_W_P(false, false);
+            }
+#undef GFX803_W_P
+#undef GFX803_W_E
+#undef GFX803_W_2
+#undef GFX803_W
+            *err = hipGetLastError();
+            if (*err != hipSuccess) return true;
+        }
+    }
+    *err = hipSuccess;
+    return true;
+}
 // C = beta * C, without reading A or B: what BLAS defines for alpha == 0 or
 // K == 0. Running the GEMM kernels instead would compute 0 * (A * B), which
 // turns an Inf or NaN anywhere in A or B into NaN in C. beta == 0 writes zeros
@@ -1197,6 +1882,13 @@ inline hipError_t gfx803_gemm_strided_batched(int M, int N, int K,
         return hipSuccess;
     }
     const int tile = gfx803_sgemm_pick_tile(M, N, K, batch_count, sizeof(T) == 2);
+    if (gfx803_w_applies(tile, M, transA, transB, batch_count, sizeof(T))) {
+        const int kt_old = gfx803_sgemm_g_applies<T>(tile, M, K, lda, transA, ldb, transB) ? 32 : GFX803_SGEMM_BIG_K;
+        hipError_t err;
+        if (gfx803_w_gemm<T>(M, N, K, alpha, A, lda, strideA, transA, B, ldb, strideB, transB, beta, C, ldc,
+                             strideC, batch_count, kt_old, stream, &err))
+            return err;
+    }
     const unsigned grid_x = (unsigned)((M + tile - 1) / tile);
     const int max_cols = GFX803_SGEMM_MAX_GRID_YZ * tile;
 
@@ -1214,45 +1906,59 @@ inline hipError_t gfx803_gemm_strided_batched(int M, int N, int K,
             const T* As = A + (int64_t)start * strideA;
             const T* Bs = Bc + (int64_t)start * strideB;
             T* Cs = Cc + (int64_t)start * strideC;
-            if (gfx803_sgemm_g_launch<T>(tile, grid, stream, M, cols, K, alpha, As, lda, strideA, transA,
-                                         Bs, ldb, strideB, transB, beta, Cs, ldc, strideC)) {
-            } else if (!transB && tile == 64) {
-                if (batch_count == 1) {
-                    if (!transA) {
-                        hipLaunchKernelGGL((gfx803_sgemm_p_fast_kernel<4, false, T>), grid, block, 0, stream,
-                                           M, cols, K, alpha, As, lda, Bs, ldb, beta, Cs, ldc);
+            auto fast = [&](auto defer_tag) -> bool {
+                constexpr bool D = decltype(defer_tag)::value;
+                if (gfx803_sgemm_g_launch<T, D>(tile, grid, stream, M, cols, K, alpha, As, lda, strideA, transA,
+                                                Bs, ldb, strideB, transB, beta, Cs, ldc, strideC))
+                    return true;
+                if (!transB && tile == 64) {
+                    if (batch_count == 1) {
+                        if (!transA) {
+                            hipLaunchKernelGGL((gfx803_sgemm_p_fast_kernel<4, false, T, D>), grid, block, 0, stream,
+                                               M, cols, K, alpha, As, lda, Bs, ldb, beta, Cs, ldc);
+                        } else {
+                            hipLaunchKernelGGL((gfx803_sgemm_p_fast_kernel<4, true, T, D>), grid, block, 0, stream,
+                                               M, cols, K, alpha, As, lda, Bs, ldb, beta, Cs, ldc);
+                        }
                     } else {
-                        hipLaunchKernelGGL((gfx803_sgemm_p_fast_kernel<4, true, T>), grid, block, 0, stream,
-                                           M, cols, K, alpha, As, lda, Bs, ldb, beta, Cs, ldc);
+                        if (!transA) {
+                            hipLaunchKernelGGL((gfx803_sgemm_p_strided_batched_fast_kernel<4, false, T, D>), grid, block, 0,
+                                               stream, M, cols, K, alpha, As, lda, strideA, Bs, ldb, strideB, beta, Cs,
+                                               ldc, strideC);
+                        } else {
+                            hipLaunchKernelGGL((gfx803_sgemm_p_strided_batched_fast_kernel<4, true, T, D>), grid, block, 0,
+                                               stream, M, cols, K, alpha, As, lda, strideA, Bs, ldb, strideB, beta, Cs,
+                                               ldc, strideC);
+                        }
                     }
-                } else {
-                    if (!transA) {
-                        hipLaunchKernelGGL((gfx803_sgemm_p_strided_batched_fast_kernel<4, false, T>), grid, block, 0, stream,
-                                           M, cols, K, alpha, As, lda, strideA, Bs, ldb, strideB, beta, Cs, ldc, strideC);
-                    } else {
-                        hipLaunchKernelGGL((gfx803_sgemm_p_strided_batched_fast_kernel<4, true, T>), grid, block, 0, stream,
-                                           M, cols, K, alpha, As, lda, strideA, Bs, ldb, strideB, beta, Cs, ldc, strideC);
-                    }
+                    return true;
                 }
-            } else if (!transB && tile == 32) {
-                if (batch_count == 1) {
-                    if (!transA) {
-                        hipLaunchKernelGGL((gfx803_sgemm_p2_fast_kernel<false, T>), grid, block, 0, stream,
-                                           M, cols, K, alpha, As, lda, Bs, ldb, beta, Cs, ldc);
+                if (!transB && tile == 32) {
+                    if (batch_count == 1) {
+                        if (!transA) {
+                            hipLaunchKernelGGL((gfx803_sgemm_p2_fast_kernel<false, T, D>), grid, block, 0, stream,
+                                               M, cols, K, alpha, As, lda, Bs, ldb, beta, Cs, ldc);
+                        } else {
+                            hipLaunchKernelGGL((gfx803_sgemm_p2_fast_kernel<true, T, D>), grid, block, 0, stream,
+                                               M, cols, K, alpha, As, lda, Bs, ldb, beta, Cs, ldc);
+                        }
                     } else {
-                        hipLaunchKernelGGL((gfx803_sgemm_p2_fast_kernel<true, T>), grid, block, 0, stream,
-                                           M, cols, K, alpha, As, lda, Bs, ldb, beta, Cs, ldc);
+                        if (!transA) {
+                            hipLaunchKernelGGL((gfx803_sgemm_p2_strided_batched_fast_kernel<false, T, D>), grid, block, 0,
+                                               stream, M, cols, K, alpha, As, lda, strideA, Bs, ldb, strideB, beta, Cs,
+                                               ldc, strideC);
+                        } else {
+                            hipLaunchKernelGGL((gfx803_sgemm_p2_strided_batched_fast_kernel<true, T, D>), grid, block, 0,
+                                               stream, M, cols, K, alpha, As, lda, strideA, Bs, ldb, strideB, beta, Cs,
+                                               ldc, strideC);
+                        }
                     }
-                } else {
-                    if (!transA) {
-                        hipLaunchKernelGGL((gfx803_sgemm_p2_strided_batched_fast_kernel<false, T>), grid, block, 0, stream,
-                                           M, cols, K, alpha, As, lda, strideA, Bs, ldb, strideB, beta, Cs, ldc, strideC);
-                    } else {
-                        hipLaunchKernelGGL((gfx803_sgemm_p2_strided_batched_fast_kernel<true, T>), grid, block, 0, stream,
-                                           M, cols, K, alpha, As, lda, strideA, Bs, ldb, strideB, beta, Cs, ldc, strideC);
-                    }
+                    return true;
                 }
-            } else {
+                return false;
+            };
+            const bool launched = fast(std::bool_constant<sizeof(T) == 2>());
+            if (!launched) {
                 if (batch_count == 1) {
                     auto kernel = tile == 64 ? gfx803_sgemm_p_kernel<4, T>
                                 : tile == 32 ? gfx803_sgemm_p_kernel<2, T>

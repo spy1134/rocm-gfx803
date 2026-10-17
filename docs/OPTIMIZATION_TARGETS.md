@@ -48,29 +48,29 @@ dimension is a multiple of 8 KiB still run on older kernels.
 
 One denoising step, fp16 UNet (ComfyUI's default on this card), 512 px,
 classifier-free guidance (batch 2), with the gfx803 node and a MIOpen
-find-db made by the current build: 393 ms (460 without the node). Time per
+find-db made by the current build: 360 ms (395 without the node). Time per
 module class (`tools/unet_breakdown.py`: CUDA events around every UNet
 module's forward, each module's time exclusive of its children):
 
 | What | Time | How it runs | Efficiency |
 | --- | --- | --- | --- |
-| Convolutions | 144 ms (36%) | MIOpen `ConvHipWinogradF2x3`: input/output transforms in HIP kernels around a strided-batched GEMM in the shim (NN, 438 GFLOP per step) | GEMM/transform split not measured at fp16 |
-| Linear layers (attention projections, feed-forward, proj in/out) | 128 ms (32%) | shim fast tiles with fp16 storage, TN layout (all 184 linears per step) | ~3.6 TFLOPS |
-| Attention, excluding its projections | 92 ms (23%) | node's multi-wave fused kernel reading the fp16 projections in place, 32 calls per step; 64x64 self-attention 14.3 ms per call (fp32 copies) | ~2.5 TFLOPS (252 GFLOP) |
+| Convolutions | 127 ms (35%) | MIOpen `ConvHipWinogradF2x3`: input/output transforms in HIP kernels around a strided-batched GEMM in the shim (NN, 438 GFLOP per step) | transforms 26 ms by kernel time, the GEMM the rest |
+| Linear layers (attention projections, feed-forward, proj in/out) | 112 ms (31%) | shim fast tiles with fp16 storage, TN layout (all 184 linears per step) | ~4.2 TFLOPS |
+| Attention, excluding its projections | 91 ms (25%) | node's multi-wave fused kernel reading the fp16 projections in place, 32 calls per step; 64x64 self-attention 14.3 ms per call (fp32 copies) | ~2.5 TFLOPS (252 GFLOP) |
 | GroupNorm, LayerNorm, SiLU | 10 ms (3%) | | |
 | Residuals, reshapes, launch gaps | ~14 ms (4%) | estimate: step time minus the hooked modules | |
 
-By kernel (PyTorch profiler, same step, 388 ms of kernel time): the shim's
-GEMMs 236 ms (60%: linears, the Winograd solver's batched GEMMs and 1x1
-convolutions, ~917 GFLOP at ~3.9 TFLOPS on average), fused attention 85 ms,
-elementwise kernels, norms and casts ~45 ms, the Winograd filter transform
+By kernel (PyTorch profiler, same step, 353 ms of kernel time): the shim's
+GEMMs 202 ms (57%: linears, the Winograd solver's batched GEMMs and 1x1
+convolutions, ~917 GFLOP at ~4.5 TFLOPS on average), fused attention 87 ms,
+elementwise kernels, norms and casts ~38 ms, the Winograd filter transform
 17 ms and its input and output transforms 9 ms. The filter transform runs on
 every call (48 per step) although the weights do not change between steps;
 see "Ruled out".
 
 A find-db written before a build added `ConvHipWinogradF2x3` for fp16 keeps
-its fp16 3x3 records on `GemmFwdRest`, and convolutions then take 287 ms per
-step instead of 144.
+its fp16 3x3 records on `GemmFwdRest`, and convolutions then take about twice
+as long.
 
 GEMM FLOPs per step by layout (shim call log, after a warm-up pass), without
 the node:
@@ -88,13 +88,12 @@ op(B) = not transposed.
 ### SDXL inference
 
 Pony V6 (SDXL), 1024 px, CFG batch 2, fp16 UNet, the gfx803 node: one UNet
-step 3.36 s (ComfyUI: 3.4-3.5 s/it over 20 steps). By kernel: the shim's
-GEMMs 2.63 s (79%), fused attention 0.50 s (15%), elementwise and norms
-0.18 s, Winograd transforms 0.04 s. The GEMMs already run at 3.9-4.5 TFLOPS
-on every large shape (10240x2048x1280 4.06, 1280x2048x1280 4.49), so SDXL
-gains only from a faster main tile (BLAS-7); the cross-attention K/V
-projections of the 77-token context (n = 154, 1-2 TFLOPS) lose about 30 ms
-per step.
+step 2.96-3.00 s. By kernel: the shim's GEMMs 2.23 s (75%), fused attention
+0.50 s (17%), elementwise and norms 0.18 s, Winograd transforms 0.04 s. The
+linears, 1.84 s of the GEMM time, run at 5.0-5.2 TFLOPS on the large shapes
+(10240x2048x1280 5.16, 1280x2048x1280 4.99), so SDXL gains mainly from a
+faster TN tile (BLAS-7); the cross-attention K/V projections of the 77-token
+context (n = 154, 1.1-2.5 TFLOPS) lose about 30 ms per step.
 
 The VAE decode at 1024 px is the other cost. With `--bf16-vae` its
 convolutions run on im2col GEMMs (there is no bf16 Winograd), and ComfyUI
@@ -156,14 +155,14 @@ Open targets in recommended order, then the rest.
 | LLM-8 | MoE generation with experts in system RAM | see LLM-8; 39.1 ms per token on Qwen3.6 35B-A3B; sync removal gains ~0.06 ms; CPU/GPU split pipelining is main lever | Open, measured |
 | PT-2 | PyTorch kernels that mix the host's 64-lane warp size with the device's 32 | correctness: wrong results or a GPU reset | Done: one more kernel fixed (embedding backward); the rest match the CPU |
 | SD-7 | Fused Winograd F(2x2, 3x3) | fp16 SD at most ~9 ms per step (2%); fp32 and training unmeasured | Open, low |
-| BLAS-7 | Shim GEMM efficiency at SD 1.5 / SDXL shapes | GEMMs are 236 ms (60%) of an fp16 SD 1.5 step at ~3.9 TFLOPS on average; two fp16 dispatch fixes took the step 415 -> 399 ms | Open, measured |
+| BLAS-7 | Shim GEMM efficiency at SD 1.5 / SDXL shapes | GEMMs are 202 ms (57%) of an fp16 SD 1.5 step at ~4.5 TFLOPS on average; fp16 dispatch fixes, later fp16 widening and a one-wavefront tile for batched NN took the step 415 -> 360 ms, SDXL 3.34 -> 2.98 s | Open, measured |
 | LLM-5 | The unexplained gap in decoded tokens | mul_mat_vec_q is at bandwidth bound (~198 GB/s); ~3.4 ms/token recoverable via attn_v and small-kernel fusion | Open, measured |
 | SD-2 | Winograd F(4x4, 3x3) | unmeasured; only after SD-7 | Open |
 | SD-1 | Winograd weight gradients | full fine-tuning and LoCon only | Open |
 | LLM-3 | mmvq vs mmq for 9-16 tokens | speculative/parallel decoding | Open |
 | LLM-1b | SDWA dot product losses (2-token decode) | 1-11% on 2-token decode | Open, minor |
 | SD-8 | Fused attention backward for training | SD1.5 LoRA 512 px 3.37 -> 2.87 s/step and 7.6 -> 5.6 GB; 2.03 s/step without gradient checkpointing | Done |
-| SD-6 | Multi-wave fused attention | SD 1.5 fp16 step attention 161 -> 92 ms (step 460 -> 393 ms); SDXL self-attention 2.9x | Done |
+| SD-6 | Multi-wave fused attention | SD 1.5 fp16 step attention 129 -> 91 ms (step 395 -> 360 ms); SDXL self-attention 2.9x | Done |
 | LLM-4 | llama.cpp prompts through dequantize + fp32 SGEMM (patch 106) | Qwen3 8B prompt 149 -> 215 tok/s in Ollama | Done |
 | LLM-7 | DeltaNet conv-input concat (patch 107) | Qwen3.6 35B-A3B pp2048 244 -> 270 tok/s | Done |
 | BLAS-4 | Shim: fp16 operands on the fast tiles, all layouts | fp16 SD 1.5 step 602 -> 483 ms; 31 GEMM cases median 1.5x | Done |
@@ -409,8 +408,8 @@ CPU float64, the 3-image VAE latent check, the UNet check, a training run.
 
 ### BLAS-7: shim GEMM efficiency at SD shapes
 
-**Why.** The shim's GEMMs are 236 ms (60%) of an fp16 SD 1.5 step: about
-917 GFLOP at ~3.9 TFLOPS on average, a little over half the card's FMA peak.
+**Why.** The shim's GEMMs are 202 ms (57%) of an fp16 SD 1.5 step: about
+917 GFLOP at ~4.5 TFLOPS on average, about two thirds of the card's FMA peak.
 Each further 0.5 TFLOPS on average is about 25 ms per step, and training's
 GEMMs gain as well.
 
@@ -430,26 +429,51 @@ fp16 for M = 32 (the Winograd GEMMs at the smallest latent:
 to fp16 only; every tile and staging accumulates in the same order, so
 outputs are bit-identical. fp16 SD 1.5 step 415 -> 399 ms.
 
+The fp16 tiles widened each operand to fp32 right after its global load. The
+compiler then waits for that load (`s_waitcnt vmcnt(0)`) inside the fetch,
+one load at a time, before the slice's multiply-adds start, so every K slice
+paid four or five memory round trips that nothing overlapped. The values now
+stay fp16 in registers until the next slice's LDS store, and the loads stay
+in flight during the multiply-adds as they do at fp32. A one-wavefront tile
+(`gfx803_w_kernel`: 64x64, an 8x8 block per thread, no barriers) takes the
+fp16 strided-batched NN calls with batch >= 8 and M >= 512, the Winograd
+solver's GEMMs at the larger latents (SDXL 8192x320x640 b16: 13.6 -> 9.8 ms).
+Outputs are bit-identical to the previous kernels on 478 cases (all layouts,
+odd sizes, padded leading dimensions, offset pointers, batches, the SD
+shapes). GEMM time over the shim call logs, fp16: SD 1.5 707 -> 620 ms,
+SDXL 2426 -> 2120 ms; fp32 unchanged. fp16 UNet step: SD 1.5 392 -> 360 ms
+(457 -> 395 ms without the node, whose split attention also runs batched
+GEMMs), SDXL 3.34 -> 2.98 s.
+
 **Left, by time lost per step against 4.8 TFLOPS** (each shape timed alone):
-the 30 TN 1280x512x1280 linears per step at 3.8 TFLOPS (~3 ms), TN with
-n = 128/154 (cross-attention K/V projections and the 16x16 level) at
-1.0-2.0 TFLOPS (~3 ms), the batch-2 NN 1x1 convolutions with m = 64-256 at
-2.0-3.6 TFLOPS (~3 ms), and the Winograd GEMMs with m = 512 at 3.8 TFLOPS
-(~2 ms). None alone is more than 1% of the step; a broader gain needs a
-faster main tile rather than more dispatch rules.
+TN with n = 128/154 (cross-attention K/V projections and the 16x16 level)
+at 1.0-4.3 TFLOPS (~3 ms), the batch-2 NN 1x1 convolutions with m = 64-256
+at 2.0-4.6 TFLOPS (~1.3 ms), and the 30 TN 1280x512x1280 linears per step at
+4.3 TFLOPS (~1.2 ms). None alone is more than 1% of the step; a broader gain
+needs a faster main tile rather than more dispatch rules.
 
 **Measured, not adopted.** Ablating a 64x64 4x4-per-thread NN tile (2048^3,
 fp32) attributes its time to the global fetch more than to LDS: removing the
 fetch 3.96 -> 5.06 TFLOPS, removing the LDS reads 3.96 -> 4.52, removing the
-barrier 3.96 -> 4.25, a pure multiply-add loop 6.35. Larger register tiles
-(8x4, 8x8 per thread) did not help at SD sizes (fewer workgroups, one wave
-per SIMD); 32-deep K slices halved the speed (LDS limits a CU to one
-workgroup). Fetching two slices ahead with LDS double-buffered gains 5-20% on
-single fp16 GEMMs (2048x640x640 3.1 -> 3.6 TFLOPS) but loses 5-15% on the
-batched Winograd and 1x1-convolution GEMMs that make up the step's NN time
-(116 -> 126 ms per step) and on fp32, so the shim keeps its kernels. Beyond
-~4 TFLOPS on this tile the remaining lever is instruction-level scheduling,
-not tile shape.
+barrier 3.96 -> 4.25, a pure multiply-add loop 6.35. 8x4 and 8x8 blocks per
+thread inside the 16x16-thread workgroup did not help at SD sizes (fewer
+workgroups, one wave per SIMD); 32-deep K slices halved the speed (LDS limits
+a CU to one workgroup). Fetching two slices ahead with LDS double-buffered
+gains 5-20% on single fp16 GEMMs (2048x640x640 3.1 -> 3.6 TFLOPS) but loses
+5-15% on the batched Winograd and 1x1-convolution GEMMs that make up the
+step's NN time (116 -> 126 ms per step) and on fp32.
+
+The one-wavefront tile, run on every call the 64x64 tile serves, loses on
+single GEMMs: SDXL's fp16 GEMM time 2426 -> 3513 ms, TN 1280x2048x5120 6.6 ->
+21.5 ms per call. On TN 1280x2048x1280 it reaches 3.3 TFLOPS against the old
+tile's 4.5; removing its global fetch takes it to 5.6 and removing its LDS
+stores to 5.7, while removing its LDS reads changes nothing. With no second
+wavefront in the workgroup, only other tiles on the same SIMD can hide its
+loads, which a batched call supplies and a single GEMM at SD sizes does not.
+Fetching two K rows per load (`GFX803_SGEMM_WAVE_KC2=1`) recovers part of it
+(TN 1280x2048x5120 12.3 ms) but not enough; 64x32 tiles and tile grouping did
+not change the picture. At fp32 it runs batched NN at 0.5-2.8x the old time
+with no shape pattern, so fp32 keeps the old tiles.
 
 ### LLM-5: the unexplained part of a decoded token
 
@@ -612,7 +636,7 @@ values move between lanes with `ds_bpermute` instead of an LDS tile, and the
 next K/V tile is prefetched into registers. Per call: SD 1.5 64x64
 self-attention (CFG batch 2, head size 40) 26.3 -> 14.3 ms, 32x32 (head
 size 80) 1.95 -> 0.84 ms, SDXL 4096-token self-attention (head size 64)
-35.0 -> 12.2 ms; SD 1.5 step attention 161 ms (ComfyUI's own) -> 92 ms.
+35.0 -> 12.2 ms; SD 1.5 step attention 129 ms (ComfyUI's own) -> 91 ms.
 The kernel reads Q, K and V in ComfyUI's [b, tokens, heads*D] fp16 layout
 and writes the output there, which saves the transposes, fp32 casts and
 output copy around every call (160 launches per step, 99 -> 92 ms); the K/V

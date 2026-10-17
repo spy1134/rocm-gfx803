@@ -56,6 +56,17 @@
 //   GFX803_SGEMM_MIN_TILES32=N         tiles of C up (0 = always, -1 = never),
 //                                      for benchmarking; see
 //                                      gfx803_sgemm_pick_tile for the defaults
+//   GFX803_SGEMM_WAVE=N             -- one-wavefront tiles (gfx803_w_kernel)
+//                                      for 0: no call, 1: every call given the
+//                                      64x64 tile, 3: also those given the
+//                                      32x32 tile; unset: gfx803_w_applies's
+//                                      rule. Outputs are bit-identical either
+//                                      way; for benchmarking
+//   GFX803_SGEMM_WAVE_PN=4|8        -- force the 64x32 or 64x64 one-wavefront
+//                                      tile instead of the tile-count rule
+//   GFX803_SGEMM_WAVE_GW=N          -- tile group width for gfx803_w_kernel
+//   GFX803_SGEMM_WAVE_KC2=1         -- fp16 one-wavefront tiles fetch two K
+//                                      rows per load
 #define ROCBLAS_BETA_FEATURES_API
 #include <rocblas/rocblas.h>
 #include <hip/hip_runtime.h>
