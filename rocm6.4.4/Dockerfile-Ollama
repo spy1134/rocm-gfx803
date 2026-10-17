@@ -56,9 +56,17 @@ RUN cmake -S llama/server --preset cpu \
     && { grep -q ggml_backend_sched_prefetch_split \
              build/llama-server-cpu/_deps/llama_cpp-src/ggml/src/ggml-backend.cpp \
          || { echo "108-moe-expert-prefetch.patch was not applied" >&2; exit 1; }; } \
+    && { grep -q ggml_backend_sched_host_inputs_end \
+             build/llama-server-cpu/_deps/llama_cpp-src/ggml/src/ggml-backend.cpp \
+         && grep -q moe_expand_after_weights \
+             build/llama-server-cpu/_deps/llama_cpp-src/src/models/qwen35moe.cpp \
+         && grep -q moe_expand_after_weights \
+             build/llama-server-cpu/_deps/llama_cpp-src/src/models/qwen3next.cpp \
+         || { echo "112-moe-shared-expert-overlap.patch was not applied" >&2; exit 1; }; } \
     && cmake --build build/llama-server-cpu --parallel "$(nproc)" \
     && cmake --install build/llama-server-cpu --component llama-server --strip \
     && { grep -q GGML_SCHED_EXPERT_PREFETCH dist/lib/ollama/libggml-base.so.0.* \
+         && grep -q GGML_SCHED_EARLY_HOST_INPUTS dist/lib/ollama/libggml-base.so.0.* \
          || { echo "the installed libggml-base.so lacks the scheduler patches" >&2; exit 1; }; }
 
 # Ollama applies every *.patch under llama/compat to the llama.cpp source it

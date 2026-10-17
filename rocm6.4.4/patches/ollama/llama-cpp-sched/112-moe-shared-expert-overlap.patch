@@ -1,0 +1,378 @@
+llama.cpp (as fetched by Ollama v0.35.1, llama.cpp b11232, applied after
+108): with MoE experts in system RAM, the GPU sits idle while the CPU
+computes each layer's routed experts, and the shared expert waits for them.
+Not gfx803-specific code; measured on gfx803.
+
+WHY
+---
+Token generation with the routed experts in host memory (Qwen3.6 35B-A3B or
+Qwen3-Coder-Next on an 8 GB card) alternates per layer between a GPU split
+(attention or DeltaNet, the router, top-k) and a CPU split (the routed
+experts). The model graphs build the shared expert after the routed
+experts, so the scheduler places it in the GPU split that follows the CPU
+split, and before the CPU split starts the scheduler synchronizes the whole
+GPU stream. The shared expert therefore runs while the CPU waits, and the
+GPU idles for the whole CPU split. Its input is the FFN input, the same as
+the router's, so nothing makes it wait for the routed experts. On an RX 590
+the shared expert is about 80 us of GPU work per layer, 40 layers per
+token; leaving it out of the graph (wrong output, timing only) took
+Qwen3.6 35B-A3B generation from 23.8 to 25.2 tok/s.
+
+The qwen35moe and qwen3next graphs now add the gated shared expert right
+after the router weights (build_moe_ffn expands
+moe_expand_after_weights). The scheduler computes a device split that is
+followed by a host split in two parts: the head ends with the last node the
+host split reads (a view's data belongs to the tensor it points into),
+plus the nodes right after it that consume it, which keeps the CUDA
+backend's fused top-k MoE routing in one graph. An event after the head
+lets the host split copy its inputs while the tail (the shared expert)
+still runs, and the CPU experts overlap it. The next device split waits
+for an event recorded after the tail instead of synchronizing the stream:
+the guarantee is the same, and on HIP a stream synchronization right after
+a graph launch costs about 15 us more on every layer. Each graph
+evaluation starts with no recorded events, so an event from an earlier
+graph is never taken for one from the current graph.
+
+Nothing is computed differently: the same kernels run on the same inputs,
+in a different order on the stream. GGML_SCHED_EARLY_HOST_INPUTS=0
+computes every split in one part again.
+
+VERIFIED ON REAL HARDWARE (RX 590, llama-bench, Qwen3.6 35B-A3B heretic
+Q4_K_M, -ncmoe 99, tg128, 5 repetitions, two rounds each, tok/s):
+
+| HSA_ENABLE_SDMA | overlap off   | overlap on    |
+| --------------- | ------------- | ------------- |
+| 0               | 24.53 / 24.44 | 25.32 / 25.17 |
+| 1               | 24.56 / 24.72 | 25.52 / 25.71 |
+
+llama-perplexity (4 chunks of 512, all experts in host memory, -ub 1 and
+-ub 16) with the overlap on against the GPU logits with it off: PPL
+10.141204 and 10.148967 in both, mean KLD 0.000000, same top token 100%,
+also with HSA_ENABLE_SDMA=1. Qwen3-Coder-Next takes the same path but was
+not measured: it pins 51.5 GiB of RAM. No GPU faults in any run.
+diff -ru a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+--- a/ggml/src/ggml-backend.cpp	2026-10-17 02:07:57.691913115 -0700
++++ b/ggml/src/ggml-backend.cpp	2026-10-17 02:08:44.619193931 -0700
+@@ -850,6 +850,12 @@
+     bool                  expert_compute_recorded[GGML_SCHED_MAX_BACKENDS][2];
+     int                 * expert_split_slot; // [splits_capacity]: slot of each split, -1 = none
+     int                   expert_split_slot_cap;
++
++    // early host inputs: see ggml_backend_sched_host_inputs_end
++    ggml_backend_event_t  host_inputs_ready[GGML_SCHED_MAX_BACKENDS];
++    int                   host_inputs_split[GGML_SCHED_MAX_BACKENDS]; // split the event is recorded for, -1 = none
++    ggml_backend_event_t  tail_done[GGML_SCHED_MAX_BACKENDS];
++    bool                  tail_pending[GGML_SCHED_MAX_BACKENDS];      // tail_done follows the last work on the stream
+ };
+ 
+ #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
+@@ -1841,6 +1847,56 @@
+     return true;
+ }
+ 
++// A device split followed by a host split (with MoE experts in system RAM: attention and routing on the
++// GPU, then the routed experts on the CPU) is computed in two parts when the host split reads only part
++// of it. The host split's inputs are copied once the head is done, and the CPU computes while the GPU
++// runs the tail (the shared expert). Returns the number of nodes in the head, or the split's node count
++// when there is no such split.
++static int ggml_backend_sched_host_inputs_end(ggml_backend_sched_t sched, int split_id) {
++    const struct ggml_backend_sched_split * split = &sched->splits[split_id];
++    const int n_nodes = split->graph.n_nodes;
++    if (!sched->host_inputs_ready[split->backend_id] || split_id + 1 >= sched->n_splits) {
++        return n_nodes;
++    }
++    const struct ggml_backend_sched_split * next = &sched->splits[split_id + 1];
++    if (!ggml_backend_buft_is_host(sched->bufts[next->backend_id])) {
++        return n_nodes;
++    }
++
++    // a view computes nothing: the host split's copy reads the tensor the view points into
++    int last = -1;
++    for (int j = 0; j < n_nodes; j++) {
++        for (int i = 0; i < next->n_inputs; i++) {
++            const struct ggml_tensor * input = next->inputs[i];
++            if (split->graph.nodes[j] == (input->view_src ? input->view_src : input)) {
++                last = j;
++            }
++        }
++    }
++    if (last < 0) {
++        return n_nodes;
++    }
++
++    // the nodes right after it that consume it stay in the head: a backend fuses such a chain (top-k
++    // MoE routing: argsort, get_rows, weight normalization) only when it is computed in one graph
++    int end = last + 1;
++    while (end < n_nodes) {
++        const struct ggml_tensor * t = split->graph.nodes[end];
++        bool consumes = false;
++        for (int k = 0; k < GGML_MAX_SRC && t->src[k] && !consumes; k++) {
++            const struct ggml_tensor * src = t->src[k]->view_src ? t->src[k]->view_src : t->src[k];
++            for (int j = last; j < end && !consumes; j++) {
++                consumes = split->graph.nodes[j] == src || split->graph.nodes[j] == t->src[k];
++            }
++        }
++        if (!consumes) {
++            break;
++        }
++        end++;
++    }
++    return end;
++}
++
+ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+     GGML_ASSERT(sched);
+     struct ggml_backend_sched_split * splits = sched->splits;
+@@ -1851,6 +1907,11 @@
+ 
+     int prev_backend_id = -1;
+ 
++    for (int b = 0; b < sched->n_backends; b++) {
++        sched->host_inputs_split[b] = -1;
++        sched->tail_pending[b]      = false;
++    }
++
+     {
+         const int first = ggml_backend_sched_next_prefetch_split(sched, 0);
+         if (first >= 0) {
+@@ -1895,6 +1956,11 @@
+                 // wait for the split backend to finish using the input before overwriting it
+                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
++                } else if (sched->tail_pending[split_backend_id]) {
++                    // same guarantee as a stream synchronization, which on HIP costs about 15 us more
++                    // right after a graph launch, on the critical path of every MoE layer
++                    ggml_backend_event_synchronize(sched->tail_done[split_backend_id]);
++                    sched->tail_pending[split_backend_id] = false;
+                 } else {
+                     ggml_backend_synchronize(split_backend);
+                 }
+@@ -1992,7 +2058,12 @@
+                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
+                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
+                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+-                        ggml_backend_synchronize(input_backend);
++                        const int input_backend_id = ggml_backend_sched_backend_id(sched, input_backend);
++                        if (input_backend_id >= 0 && sched->host_inputs_split[input_backend_id] == split_id) {
++                            ggml_backend_event_synchronize(sched->host_inputs_ready[input_backend_id]);
++                        } else {
++                            ggml_backend_synchronize(input_backend);
++                        }
+                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                         } else {
+@@ -2008,7 +2079,25 @@
+         if (expert_slot >= 0) {
+             ggml_backend_event_wait(split_backend, sched->expert_copy_done[split_backend_id][expert_slot]);
+         }
+-        if (!sched->callback_eval) {
++        sched->tail_pending[split_backend_id]      = false;
++        sched->host_inputs_split[split_backend_id] = -1;
++        const int head_end = sched->callback_eval ? split->graph.n_nodes : ggml_backend_sched_host_inputs_end(sched, split_id);
++        if (head_end < split->graph.n_nodes) {
++            struct ggml_cgraph head = ggml_graph_view(&split->graph, 0, head_end);
++            struct ggml_cgraph tail = ggml_graph_view(&split->graph, head_end, split->graph.n_nodes);
++            enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &head);
++            if (ec != GGML_STATUS_SUCCESS) {
++                return ec;
++            }
++            ggml_backend_event_record(sched->host_inputs_ready[split_backend_id], split_backend);
++            sched->host_inputs_split[split_backend_id] = split_id + 1;
++            ec = ggml_backend_graph_compute_async(split_backend, &tail);
++            if (ec != GGML_STATUS_SUCCESS) {
++                return ec;
++            }
++            ggml_backend_event_record(sched->tail_done[split_backend_id], split_backend);
++            sched->tail_pending[split_backend_id] = true;
++        } else if (!sched->callback_eval) {
+             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+             if (ec != GGML_STATUS_SUCCESS) {
+                 return ec;
+@@ -2129,6 +2218,26 @@
+                 sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
+             }
+         }
++
++        sched->host_inputs_ready[b] = NULL;
++        sched->tail_done[b]         = NULL;
++        sched->host_inputs_split[b] = -1;
++        sched->tail_pending[b]      = false;
++        const char * early = getenv("GGML_SCHED_EARLY_HOST_INPUTS");
++        if (!ggml_backend_buft_is_host(sched->bufts[b]) && !(early && early[0] == '0')) {
++            sched->host_inputs_ready[b] = ggml_backend_event_new(backends[b]->device);
++            sched->tail_done[b]         = ggml_backend_event_new(backends[b]->device);
++            if (!sched->host_inputs_ready[b] || !sched->tail_done[b]) {
++                if (sched->host_inputs_ready[b]) {
++                    ggml_backend_event_free(sched->host_inputs_ready[b]);
++                }
++                if (sched->tail_done[b]) {
++                    ggml_backend_event_free(sched->tail_done[b]);
++                }
++                sched->host_inputs_ready[b] = NULL;
++                sched->tail_done[b]         = NULL;
++            }
++        }
+     }
+ 
+     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
+@@ -2162,6 +2271,8 @@
+             ggml_backend_event_free(sched->expert_compute_done[b][s]);
+         }
+         ggml_backend_free(sched->expert_copy_backend[b]);
++        ggml_backend_event_free(sched->host_inputs_ready[b]);
++        ggml_backend_event_free(sched->tail_done[b]);
+     }
+     free(sched->expert_split_slot);
+     ggml_gallocr_free(sched->galloc);
+diff -ru a/src/llama-graph.cpp b/src/llama-graph.cpp
+--- a/src/llama-graph.cpp	2026-10-17 02:07:57.513774501 -0700
++++ b/src/llama-graph.cpp	2026-10-17 02:09:08.126238964 -0700
+@@ -2162,6 +2162,9 @@
+ 
+     //call early so that topk-moe can be used
+     ggml_build_forward_expand(gf, weights);
++    if (moe_expand_after_weights) {
++        ggml_build_forward_expand(gf, moe_expand_after_weights);
++    }
+ 
+     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+ 
+diff -ru a/src/llama-graph.h b/src/llama-graph.h
+--- a/src/llama-graph.h	2026-10-17 02:07:57.567107669 -0700
++++ b/src/llama-graph.h	2026-10-17 02:09:08.124439457 -0700
+@@ -985,6 +985,9 @@
+ };
+ 
+ struct llm_graph_context {
++    // added to the graph by build_moe_ffn right after the router weights, before the expert matmuls
++    mutable ggml_tensor * moe_expand_after_weights = nullptr;
++
+     const llm_arch arch;
+ 
+     const llama_hparams & hparams;
+diff -ru a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+--- a/src/models/qwen35moe.cpp	2026-10-17 02:07:57.630440812 -0700
++++ b/src/models/qwen35moe.cpp	2026-10-17 02:09:13.744774552 -0700
+@@ -495,26 +495,10 @@
+     // Check if this is an MoE layer
+     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
+ 
+-    ggml_tensor * moe_out =
+-        build_moe_ffn(cur,
+-            model.layers[il].ffn_gate_inp,
+-            model.layers[il].ffn_up_exps,
+-            model.layers[il].ffn_gate_exps,
+-            model.layers[il].ffn_down_exps,
+-            nullptr,
+-            n_expert, n_expert_used,
+-            LLM_FFN_SILU, true,
+-            hparams.expert_weights_scale,
+-            LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
+-            nullptr, model.layers[il].ffn_gate_up_exps,
+-            model.layers[il].ffn_up_exps_s,
+-            model.layers[il].ffn_gate_exps_s,
+-            model.layers[il].ffn_down_exps_s);
+-    cb(moe_out, "ffn_moe_out", il);
+-
++    ggml_tensor * ffn_shexp = nullptr;
+     // Add shared experts if present - following Qwen3Next reference implementation
+     if (model.layers[il].ffn_up_shexp != nullptr) {
+-        ggml_tensor * ffn_shexp =
++        ffn_shexp =
+             build_ffn(cur,
+                 model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
+                 model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
+@@ -537,7 +521,30 @@
+         // Apply the gate to the shared expert output
+         ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
+         cb(ffn_shexp, "ffn_shexp_gated", il);
++    }
++
++    // expanded right after the router, so on the GPU it runs while the CPU computes the experts
++    // held in system RAM, instead of after them
++    moe_expand_after_weights = ffn_shexp;
++    ggml_tensor * moe_out =
++        build_moe_ffn(cur,
++            model.layers[il].ffn_gate_inp,
++            model.layers[il].ffn_up_exps,
++            model.layers[il].ffn_gate_exps,
++            model.layers[il].ffn_down_exps,
++            nullptr,
++            n_expert, n_expert_used,
++            LLM_FFN_SILU, true,
++            hparams.expert_weights_scale,
++            LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
++            nullptr, model.layers[il].ffn_gate_up_exps,
++            model.layers[il].ffn_up_exps_s,
++            model.layers[il].ffn_gate_exps_s,
++            model.layers[il].ffn_down_exps_s);
++    moe_expand_after_weights = nullptr;
++    cb(moe_out, "ffn_moe_out", il);
+ 
++    if (ffn_shexp != nullptr) {
+         cur = ggml_add(ctx0, moe_out, ffn_shexp);
+         cb(cur, "ffn_out", il);
+     } else {
+diff -ru a/src/models/qwen3next.cpp b/src/models/qwen3next.cpp
+--- a/src/models/qwen3next.cpp	2026-10-17 02:07:57.680440656 -0700
++++ b/src/models/qwen3next.cpp	2026-10-17 02:09:13.745371581 -0700
+@@ -566,26 +566,10 @@
+     // Check if this is an MoE layer
+     if (model.layers[il].ffn_gate_inp != nullptr) {
+         // MoE branch
+-        ggml_tensor * moe_out =
+-            build_moe_ffn(cur,
+-                model.layers[il].ffn_gate_inp,
+-                model.layers[il].ffn_up_exps,
+-                model.layers[il].ffn_gate_exps,
+-                model.layers[il].ffn_down_exps,
+-                nullptr,
+-                n_expert, n_expert_used,
+-                LLM_FFN_SILU, true,
+-                hparams.expert_weights_scale,
+-                LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
+-                nullptr, model.layers[il].ffn_gate_up_exps,
+-                model.layers[il].ffn_up_exps_s,
+-                model.layers[il].ffn_gate_exps_s,
+-                model.layers[il].ffn_down_exps_s);
+-        cb(moe_out, "ffn_moe_out", il);
+-
++        ggml_tensor * ffn_shexp = nullptr;
+         // Add shared experts if present - following Qwen3Next reference implementation
+         if (model.layers[il].ffn_up_shexp != nullptr) {
+-            ggml_tensor * ffn_shexp =
++            ffn_shexp =
+                 build_ffn(cur,
+                     model.layers[il].ffn_up_shexp,   NULL, model.layers[il].ffn_up_shexp_s,
+                     model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
+@@ -605,7 +589,30 @@
+ 
+             ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
+             cb(ffn_shexp, "ffn_shexp_gated", il);
++        }
++
++        // expanded right after the router, so on the GPU it runs while the CPU computes the experts
++        // held in system RAM, instead of after them
++        moe_expand_after_weights = ffn_shexp;
++        ggml_tensor * moe_out =
++            build_moe_ffn(cur,
++                model.layers[il].ffn_gate_inp,
++                model.layers[il].ffn_up_exps,
++                model.layers[il].ffn_gate_exps,
++                model.layers[il].ffn_down_exps,
++                nullptr,
++                n_expert, n_expert_used,
++                LLM_FFN_SILU, true,
++                hparams.expert_weights_scale,
++                LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
++                nullptr, model.layers[il].ffn_gate_up_exps,
++                model.layers[il].ffn_up_exps_s,
++                model.layers[il].ffn_gate_exps_s,
++                model.layers[il].ffn_down_exps_s);
++        moe_expand_after_weights = nullptr;
++        cb(moe_out, "ffn_moe_out", il);
+ 
++        if (ffn_shexp != nullptr) {
+             cur = ggml_add(ctx0, moe_out, ffn_shexp);
+             cb(cur, "ffn_out", il);
+         } else {
