@@ -174,7 +174,7 @@ are not built from this fork.)
 
 ```
 docker build -t rocm-gfx803:rocm6.4.4 -f Dockerfile .
-docker build -t rocm-gfx803-comfyui:latest -f Dockerfile-ComfyUI .
+docker build --build-context tools=../tools -t rocm-gfx803-comfyui:latest -f Dockerfile-ComfyUI .
 docker build -t rocm-gfx803-ollama:latest -f Dockerfile-Ollama .
 ```
 
@@ -243,13 +243,13 @@ directory:
 
 ```
 docker build -t rocm-gfx803:rocm6.4.4 -f Dockerfile .
-docker build -t rocm-gfx803-comfyui:latest -f Dockerfile-ComfyUI .
+docker build --build-context tools=../tools -t rocm-gfx803-comfyui:latest -f Dockerfile-ComfyUI .
 ```
 
 Optional: `../tools/ComfyUI-gfx803-attention/install.sh` adds a custom node
 with gfx803 kernels for attention, GroupNorm and GEGLU, which makes an SD 1.5
-fp32 step about 19% faster (697 -> 567 ms at 512 px) and avoids the 2.3 GB
-score matrix PyTorch's attention allocates. It compiles the kernels with the
+fp16 step about 15% faster (460 -> 393 ms at 512 px) and avoids the 2.3 GB score matrix PyTorch's attention
+allocates. It compiles the kernels with the
 base image's `hipcc` when the host has none and copies the node into
 `ComfyUI/custom_nodes/`; restart ComfyUI afterwards. The node acts only on
 inference (calls that need gradients go to PyTorch), so training is
@@ -323,7 +323,11 @@ and `vae-ft-mse-840000-ema-pruned` from `ComfyUI/models/vae/`, fp32, AdamW at
 (`--resume-run`); a run whose loss turns NaN stops, drops the NaN checkpoints
 and resumes from the last clean state. A healthy SD 1.5 LoRA loss sits around
 0.1-0.2. On an RX 590, a step (4 accumulated images of up to 512x512) takes
-about 4 seconds.
+about 3.1 seconds at a 5.2 GB card peak, or 2.3 seconds with
+`--no-checkpointing`, which raises the peak to 7.0 GB and leaves no room for a
+desktop on an 8 GB card. The UNet's attention runs through the fused kernels
+in `tools/gfx803_fused_attention.hip`, whose backward keeps no N x M matrices
+(`GFX803_ATTN_TRAIN=0` uses PyTorch's attention instead).
 
 `gfx803-train` caps PyTorch's VRAM. Uncapped, PyTorch keeps the memory it
 frees and grows until the card is full, whatever training needs: an SD 1.5 run

@@ -135,6 +135,10 @@ Training
       --warmup N           LR warmup steps [$WARMUP]
       --scheduler NAME     LR scheduler [$SCHEDULER]
       --fresh-latents      delete cached latents and re-encode them
+      --no-checkpointing   keep activations instead of recomputing them in the
+                           backward pass: about 30% faster at 512 px, but the
+                           peak rises from about 5.2 to 7.0 GB, which leaves
+                           no room for a desktop on an 8 GB card
 
 GPU stack and diagnostics
       --runtime stock|patched
@@ -636,6 +640,7 @@ while [ $# -gt 0 ]; do
         --warmup) WARMUP=$2; shift 2 ;;
         --scheduler) SCHEDULER=$2; shift 2 ;;
         --fresh-latents) FRESH_LATENTS=1; shift ;;
+        --no-checkpointing) NO_CHECKPOINTING=1; shift ;;
         --runtime) RUNTIME=$2; DIAG_ARGS+=("$1" "$2"); shift 2 ;;
         --shim) SHIM=$2; DIAG_ARGS+=("$1" "$2"); shift 2 ;;
         --no-batched) NO_BATCHED=1; DIAG_ARGS+=("$1"); shift ;;
@@ -799,7 +804,7 @@ LOG_FILE="$(run_dir "$RUN_NAME")/train.log"
 setup_gpu_env
 
 CMD=(env "${GPU_ENV[@]}" "$ACCELERATE" launch --num_processes=1 --num_machines=1 --mixed_precision=no --dynamo_backend=no
-    "$TRAINING_DIR/gfx803_vram_cap.py" "$SD_SCRIPTS/train_network.py"
+    "$TRAINING_DIR/gfx803_attn_launch.py" "$TRAINING_DIR/gfx803_vram_cap.py" "$SD_SCRIPTS/train_network.py"
     --pretrained_model_name_or_path="$MODEL_PATH"
     --train_data_dir="$DATA_DIR"
     --output_dir="$SEG_DIR"
@@ -816,12 +821,13 @@ CMD=(env "${GPU_ENV[@]}" "$ACCELERATE" launch --num_processes=1 --num_machines=1
     --max_train_steps="$SEG_STEPS"
     --save_every_n_steps="$SAVE_EVERY" --save_state
     --train_batch_size="$BATCH" --gradient_accumulation_steps="$GRAD_ACCUM"
-    --gradient_checkpointing
+    --sdpa
     --network_module=networks.lora
     --network_dim="$DIM" --network_alpha="$ALPHA"
     --caption_extension=.txt --shuffle_caption --keep_tokens=1 --max_token_length=225
     --max_data_loader_n_workers=0
     --logging_dir="$(run_dir "$RUN_NAME")/tb" --log_with=tensorboard)
+[ "${NO_CHECKPOINTING:-0}" = 1 ] || CMD+=(--gradient_checkpointing)
 [ -n "$VAE_PATH" ] && CMD+=(--vae="$VAE_PATH")
 if [ "$TRAIN_TE" = 1 ]; then
     CMD+=(--text_encoder_lr="$TE_LR")

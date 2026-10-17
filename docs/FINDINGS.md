@@ -682,7 +682,7 @@ norms, softmax, attention) match a float64 CPU result from the same fp16
 inputs to 2-9e-4, and rocBLAS accumulates fp16 GEMMs in fp32. The SD1.5 and
 SDXL UNets in fp16 match fp32 to about 1e-3.
 
-**Two slow paths, both fixed.**
+**Three slow paths, all fixed.**
 
 - fp16 3x3 convolutions had only MIOpen's GEMM path, 1.2-1.75x slower than
   fp32 Winograd forward and far slower backward. `ConvHipWinogradF2x3` now
@@ -696,12 +696,48 @@ SDXL UNets in fp16 match fp32 to about 1e-3.
   attention, and fp16 SD1.5 training ran at 7.7 s/step because of it. The SGEMM
   shim now takes those calls (and all strided-batched fp16 calls) onto its own
   kernels with fp16 storage; fp32 results are unchanged, bit for bit.
+- rocBLAS's fp16 GEMMs in the other layouts (TN, NN and TT: `nn.Linear` and its
+  relatives) run a Tensile kernel that widens each fp16 operand to fp32 inside
+  the inner loop, about 1.6 times the vector instructions per multiply-add of the
+  shim's fp32 tiles, so they ran 1.3-1.9x slower than fp32 GEMMs of the same
+  shape on the shim. The shim's fast tiles now read fp16 operands directly (a
+  wide load, one widening convert, fp32 accumulation, one rounding at the
+  store) and take all four layouts and the batched calls. Across 31 GEMM
+  cases they are 1.0-2.4x faster than before (median 1.5x) with the same error
+  against float64 (4.2e-4 at worst); an fp16 product that overflows gives
+  infinities in the same places as rocBLAS. The fp16 SD1.5 UNet step (512 px,
+  CFG batch of 2, the attention node loaded) takes 483 ms against 602 ms: the
+  convolutions go from 228 to 147 ms (their Winograd GEMMs are fp16 batched
+  GEMMs) and the linear layers from 176 to 137 ms; attention does not run on
+  these tiles (section 6). A seeded UNet step differs from a fp32 run by 0.6-0.9%
+  before and after. Two of the shim's dispatch rules were tuned on fp32
+  operands and lost at fp16, so they now apply to fp32 only: single-float
+  staging of B for op(A) = T with K >= 2048 (SD1.5's feed-forward output
+  projections, 1280x512x5120: 2.1 -> 3.5 TFLOPS) and the 64x64 tile for
+  M = 32 (the Winograd GEMMs at the smallest latent: 0.86 -> 0.63 ms). The
+  outputs are bit-identical; the fp16 step goes from 415 to 399 ms. `tools/unet_breakdown.py` prints the split by operation.
 
 **Training.** SD1.5 LoRA, 512 px, 20 steps: fp32 4.10 s/step at a 7.6 GB card
 peak; fp16 4.40 s/step at 5.9 GB, same loss. fp16 is no faster (gfx803 runs
 fp16 arithmetic at the fp32 rate), but it frees about 1.7 GB, enough for 512 px
-training beside a desktop. Gradient checkpointing still cannot be turned off
-at 512 px in either precision.
+training beside a desktop.
+
+**Attention in training.** PyTorch's attention keeps the full score and
+probability matrices for the backward pass: one SD1.5 self-attention at the
+64x64 level (8 heads, 4096 tokens) holds 2.6 GB extra, and an fp32 UNet
+forward and backward at 512 px runs out of 8 GB on that alone, which is why
+512 px training needs gradient checkpointing (an extra forward per step).
+The node's attention library now has a backward that recomputes the
+probabilities per 32x32 tile from Q, K and the forward's per-row log-sum-exp,
+so its memory grows with the token count; dK/dV and dQ are separate kernels
+because gfx803 has no global float atomic add. Its gradients match a float64
+reference within 1e-5 (fp32) and 5e-4 (fp16 inputs). `gfx803-train` runs
+sd-scripts with `--sdpa` and routes self-attentions of at least 2M query-key
+pairs through it (`training/gfx803_attn_launch.py`; `GFX803_ATTN_TRAIN=0`
+turns it off). SD1.5 LoRA, 512 px, batch 1, 4 accumulated, 40 steps, seed 42:
+3.37 s/step at a 7.6 GB card peak before, 3.13 s/step at 5.2 GB with it, and
+2.30 s/step at 7.0 GB with `--no-checkpointing`, which the fused attention
+makes possible; the loss matches the previous run at every step.
 
 **SDXL.** With fp16, SDXL LoRA training fits in 8 GB on a headless machine.
 Measured training steps (LoRA dim 8, gradient checkpointing, cached text

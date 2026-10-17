@@ -179,7 +179,7 @@ build() {
   # readable; the full log has everything if something goes wrong. Success is
   # docker build's own exit status: the filter finds nothing to show when every
   # step comes from the cache.
-  docker build --progress=plain -t "$tag" -f "$DIR/$file" "$DIR" 2>&1 | tee "$log" \
+  docker build --progress=plain --build-context tools="$DIR/../tools" -t "$tag" -f "$DIR/$file" "$DIR" 2>&1 | tee "$log" \
     | { grep --line-buffered -E '^#[0-9]+ \[[^]]+\] ' | sed -u -E 's/^#[0-9]+ /  /' | cut -c1-100; true; }
   if [ "${PIPESTATUS[0]}" -eq 0 ]; then
     echo "  ${G}done${N} in $(( (SECONDS - start) / 60 )) min"

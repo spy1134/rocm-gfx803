@@ -91,6 +91,15 @@ RUN pip check || true
 RUN mkdir -p /home/gfx803 /opt/ComfyUI/temp \
     && chmod 1777 /home/gfx803 /opt/ComfyUI/temp
 
+# Fused attention for training, from tools/ (named build context "tools"):
+# gfx803-train.sh runs sd-scripts' attention through it, see
+# training/gfx803_attn_launch.py.
+COPY --from=tools gfx803_fused_attention.hip gfx803_attention.py /opt/gfx803-attn/
+RUN hipcc -O3 -shared -fPIC --offload-arch=gfx803 -o /opt/gfx803-attn/libgfx803_attn.so \
+        /opt/gfx803-attn/gfx803_fused_attention.hip \
+    && nm -D --defined-only /opt/gfx803-attn/libgfx803_attn.so | grep -qw gfx803_fused_attention_train_bwd \
+    || { echo "libgfx803_attn.so lacks the training entry points" >&2; exit 1; }
+
 # Training wrapper and GPU-vs-CPU checks. Last, so
 # editing them rebuilds only this layer.
 COPY training/ /opt/gfx803-training/
