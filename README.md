@@ -20,7 +20,7 @@ without this project's patches.
 | Workload | Before | Now | Speedup |
 | --- | --- | --- | --- |
 | SD 1.5 image, 20 steps at 512 px (ComfyUI, fp32) | 35 s | 10.5 s | 3.3x |
-| SD 1.5 LoRA training step (4 images, 512 px) | 12.1 s | 3.4 s | 3.6x |
+| SD 1.5 LoRA training step (4 images, 512 px; fp16 mixed precision now, fp32 before) | 12.1 s | 2.5 s | 4.9x |
 | SD 1.5 UNet step in fp16 (ComfyUI default, 512 px, batch of 2), before and after the fp16 GEMM change | 602 ms | 483 ms | 1.25x |
 | Ollama prompt processing (Qwen3 8B, Q4_K_M) | 14 tokens/s | 223 tokens/s | 16x |
 | A coding agent's first request (12,000-token prompt) | 18 min | 71 s | 15x |
@@ -43,12 +43,14 @@ architecture:
 - **Language models.** Prompt processing uses fp32 GEMMs on the shim instead of
   emulated int8 dot products, and generation kernels were rewritten to avoid
   register spills. MoE prompts prefetch experts over the card's DMA engines
-  while the GPU computes.
+  while the GPU computes, and MoE generation with the experts in system RAM
+  runs the shared expert on the GPU while the CPU computes the routed ones.
 
 Text generation is limited mainly by memory bandwidth, so it had the least room
 to improve. Its gain grows with context length (20.9 to 26.5 tokens/s at 8,000
-tokens). Some changes show up as capacity rather than speed: fp16 training uses
-1.7 GB less VRAM, which makes SDXL LoRA training fit on 8 GB, and an 8-bit KV
+tokens). Some changes show up as capacity rather than speed: fp16 training, the
+default, uses 2.2 GB less VRAM than fp32, which lets SD 1.5 training run beside a
+desktop and makes SDXL LoRA training fit on 8 GB, and an 8-bit KV
 cache keeps a 16k-context Qwen3 8B entirely on the card.
 [`docs/FINDINGS.md`](docs/FINDINGS.md) has the measurements behind each number,
 and [`docs/OPTIMIZATION_TARGETS.md`](docs/OPTIMIZATION_TARGETS.md) lists what

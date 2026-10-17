@@ -112,6 +112,7 @@ run with wrong numbers, not a crash. "It runs" was never taken as evidence.
 | llama.cpp DeltaNet concat reads 32 KiB-strided | Fixed (all GPUs) | 9 | `patches/ollama/llama-cpp/107-*` |
 | MoE prompts: the GPU idles while each layer's experts cross PCIe | Fixed (all GPUs; needs SDMA copies on gfx803) | 9 | `patches/ollama/llama-cpp-sched/108-*`, `HSA_ENABLE_SDMA=1` in Dockerfile-Ollama |
 | MoE generation: one GPU round trip per tensor handed to the CPU experts | Patch kept but not applied: with SDMA on it ends in a GPU reset | 9 | `patches/ollama/unapplied/` |
+| MoE generation: the GPU idles during the CPU experts, the shared expert waits for them | Faster (all GPUs) | 9 | `patches/ollama/llama-cpp-sched/112-*` |
 | Ollama rejects argument-less tools | Fixed (all GPUs) | 9 | `patches/ollama/ollama/` |
 | llama.cpp reserves a vision projector's memory on the wrong device | Fixed (all GPUs) | 9 | `patches/ollama/llama-cpp-server/` |
 | Ollama keeps stale free-memory figures on slow-starting GPUs | Fixed (all GPUs) | 9 | `patches/ollama/ollama/` |
@@ -727,11 +728,29 @@ SDXL UNets in fp16 match fp32 to about 1e-3.
   SD 1.5 and from 3.34 to 2.98 s at SDXL. The same tile on single GEMMs runs
   up to 3.3x slower (nothing in its workgroup hides its loads), and at fp32 it
   is erratic, so it takes only those batched fp16 calls.
+  A two-wavefront 64x128 tile takes the fp16 TN calls with at least three
+  rounds of its tiles over the CUs: both TN operands are contiguous in K, the
+  one-wavefront tile's 8-deep pieces read a quarter of each 64-byte line, and
+  the two wavefronts share 16-deep slices instead (SDXL TN 10240x2048x1280
+  10.4 -> 8.6 ms, 5120x8192x640 13.9 -> 10.1 ms). Bit-identical; fp16 UNet
+  step SDXL 2.98 -> 2.84 s, SD 1.5 359 -> 355 ms.
 
-**Training.** SD1.5 LoRA, 512 px, 20 steps: fp32 4.10 s/step at a 7.6 GB card
-peak; fp16 4.40 s/step at 5.9 GB, same loss. fp16 is no faster (gfx803 runs
-fp16 arithmetic at the fp32 rate), but it frees about 1.7 GB, enough for 512 px
-training beside a desktop.
+**Training.** SD1.5 LoRA, 512 px, batch 1 with gradient accumulation 4,
+steps 5-20 of a 20-step run with a warm find-db, card peak VRAM:
+
+| | gradient checkpointing | without |
+| --- | --- | --- |
+| fp32 | 2.87 s/step, 5.8 GB | 2.07 s/step, 7.1 GB |
+| fp16 mixed precision (`gfx803-train`'s default) | 2.47 s/step, 3.6 GB | 1.73 s/step, 4.9 GB |
+
+gfx803 runs fp16 arithmetic at the fp32 rate, so the 14-16% comes from the
+halved memory traffic of the fp16 GEMM tiles and the widening deferred to the
+LDS store; the 2.2 GB saved is enough to train without gradient
+checkpointing beside a desktop. The 20-step losses of the four runs
+(0.16-0.22) are within run-to-run variation; no longer run compared fp16
+against fp32 training quality. `gfx803-train` trains in fp16 mixed precision
+(the frozen model in fp16, fp32 LoRA weights, loss scaling) unless given
+`--precision fp32`.
 
 **Attention in training.** PyTorch's attention keeps the full score and
 probability matrices for the backward pass: one SD1.5 self-attention at the
@@ -750,7 +769,7 @@ gradients match a float64 reference within 1e-5 (fp32) and 5e-4 (fp16
 inputs). `gfx803-train` runs sd-scripts with `--sdpa`, which routes every
 attention with head size 40, 64 or 80 through it
 (`training/gfx803_attn_launch.py`; `GFX803_ATTN_TRAIN=0` turns it off). SD1.5
-LoRA, 512 px, batch 1, 4 accumulated, 40 steps, seed 42: 3.37 s/step at a
+LoRA, fp32, 512 px, batch 1, 4 accumulated, 40 steps, seed 42: 3.37 s/step at a
 7.6 GB card peak before, 2.87 s/step at 5.6 GB with it, and 2.03 s/step at
 6.9 GB with `--no-checkpointing`, which the fused attention makes possible;
 the loss matches the previous run at every step.
@@ -927,6 +946,31 @@ bullets are the original findings (patches 100-105); the rest build on them.
   on and off), and it gives no speedup in the image (28 to 31 tokens/s with and
   without it). The cause of the SDMA timeout is not understood. The rest of a
   generated token's time is in docs/OPTIMIZATION_TARGETS.md (LLM-8).
+- **The GPU idled through every CPU expert split, and the shared expert
+  waited for it.** In the same generation, each layer runs attention and
+  the router on the GPU, then the routed experts on the CPU (about 0.44 ms),
+  and the scheduler synchronizes the GPU stream before the CPU starts. The
+  Qwen3.5/3.6 and Qwen3-Next graphs built the shared expert after the routed
+  experts, so it ran after them, about 80 us per layer, although its input
+  is the router's. Leaving it out of the graph (timing only) took Qwen3.6
+  35B-A3B from 23.8 to 25.2 tok/s. `112-moe-shared-expert-overlap.patch`
+  adds the gated shared expert to the graph right after the router weights,
+  and the scheduler computes such a GPU split in two parts: an event after
+  the last node the CPU split reads (with views resolved to the tensor they
+  point into, and the consuming nodes right after it kept in the same part
+  so the fused top-k routing kernel stays fused) lets the CPU copy its
+  inputs and start while the GPU runs the shared expert. The next GPU split
+  waits for an event recorded after that part rather than synchronizing the
+  stream, which on HIP costs about 15 us more right after a graph launch.
+  llama-bench with every expert in RAM, tg128: 24.5 -> 25.2 tok/s with
+  `HSA_ENABLE_SDMA=0`, 24.6 -> 25.6 with SDMA; through Ollama 25.3 -> 26.2.
+  Logits are unchanged: llama-perplexity at 1- and 16-token batches gives
+  the same PPL to the last digit with the overlap on and off, mean KLD 0,
+  same top token 100%, with SDMA on and off, and Ollama's greedy output is
+  identical. Unlike 109, it keeps the scheduler's synchronous copies and
+  changes only what they wait for (an event instead of the whole stream); no
+  SDMA fault occurred in any run. `GGML_SCHED_EARLY_HOST_INPUTS=0` disables
+  it.
 
 Upstream llama.cpp has no equivalent of the third fix; issue
 [#27796](https://github.com/ggml-org/llama.cpp/issues/27796) reports the same

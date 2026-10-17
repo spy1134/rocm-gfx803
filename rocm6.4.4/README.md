@@ -317,15 +317,16 @@ trigger word or style respond to prompts but overfits quickly. It costs about
 
 The defaults are
 the SD 1.5 base checkpoint at `ComfyUI/models/checkpoints/SD15/v1-5-pruned-emaonly.safetensors`
-and `vae-ft-mse-840000-ema-pruned` from `ComfyUI/models/vae/`, fp32, AdamW at
-1e-4, LoRA dim and alpha 8, 1200 steps with a checkpoint and resume state every
-100. Each run is recorded under `workspace/runs/<name>/` and can be resumed
+and `vae-ft-mse-840000-ema-pruned` from `ComfyUI/models/vae/`, fp16 mixed
+precision, AdamW at 1e-4, LoRA dim and alpha 8, 1200 steps with a checkpoint and
+resume state every 100. Each run is recorded under `workspace/runs/<name>/` and can be resumed
 (`--resume-run`); a run whose loss turns NaN stops, drops the NaN checkpoints
 and resumes from the last clean state. A healthy SD 1.5 LoRA loss sits around
 0.1-0.2. On an RX 590, a step (4 accumulated images of up to 512x512) takes
-about 2.9 seconds at a 5.6 GB card peak, or 2.0 seconds with
-`--no-checkpointing`, which raises the peak to 6.9 GB and leaves no room for a
-desktop on an 8 GB card. The UNet's attention runs through the fused kernels
+about 2.5 seconds at a 3.6 GB card peak, or 1.7 seconds at 4.9 GB with
+`--no-checkpointing`. `--precision fp32` keeps every weight and activation in
+fp32: 2.9 seconds at 5.8 GB, or 2.1 seconds at 7.1 GB without checkpointing,
+which leaves no room for a desktop on an 8 GB card. The UNet's attention runs through the fused kernels
 in `tools/gfx803_fused_attention.hip`, whose backward keeps no N x M matrices
 (`GFX803_ATTN_TRAIN=0` uses PyTorch's attention instead).
 
@@ -342,16 +343,20 @@ a connected display is left little headroom and stops only if the cap would be
 under 3 GB. `--vram-reserve MIB`, `--vram-cap MIB|none` and the
 `GFX803_VRAM_RESERVE`/`GFX803_VRAM_CAP` variables override it.
 
-An 8 GB card cannot hold 512x512 SD 1.5 training and a typical desktop at
-once: training needs about 6.6 GB under PyTorch plus about 1 GB of runtime
-overhead, and a desktop holds 300-700 MiB. Train from a
-text-console login (Ctrl+Alt+F2) after stopping the display manager
-(`sudo systemctl stop display-manager`); start the desktop again with
+A desktop on the card holds 300-700 MiB, and the HIP runtime adds about 1 GB
+to what PyTorch uses. fp16 training at 512x512 fits beside a desktop with or
+without gradient checkpointing; fp32 without checkpointing does not. For that,
+train from a text-console login (Ctrl+Alt+F2) after stopping the display
+manager (`sudo systemctl stop display-manager`); start the desktop again with
 `sudo systemctl start display-manager`.
 
-`gfx803-train` trains in fp32, the most thoroughly checked precision on gfx803.
-fp16 training works too (section 8 of `docs/FINDINGS.md` has the measurements:
-1.7 GB less VRAM at similar speed) but is run with sd-scripts directly. To check the card, the image and
+`gfx803-train` trains with fp16 mixed precision: the frozen model runs in fp16,
+the LoRA weights stay fp32, and the loss is scaled against fp16 underflow. It is
+14-16% faster than fp32 and needs 2.2 GB less VRAM (section 8 of
+`docs/FINDINGS.md`). `--precision fp32` trains in fp32, the most thoroughly
+checked precision on gfx803; the two have not been compared over a full-length
+run. A resumed run keeps the precision it started with (runs recorded before
+the option existed resume in fp32). To check the card, the image and
 the shim together, `training/gfx803_unet_check.py` compares fp32 attention,
 linear, convolution and normalization (forward and backward) and the whole UNet
 against a float64 CPU reference:
@@ -515,6 +520,16 @@ measurements and a reproduction. In short:
   writes over it. Generation: Qwen3 8B 30.1 -> 30.3-30.8 tok/s, Qwen3.6
   35B-A3B with experts in system RAM 24.0-24.2 -> 24.5-24.6 tok/s; outputs
   unchanged (same perplexity to the last digit through the same path).
+- **112-moe-shared-expert-overlap.patch**: when a MoE model keeps its routed
+  experts in system RAM, the GPU sat idle while the CPU computed each layer's
+  experts, and the layer's shared expert, which does not depend on them, ran
+  only afterwards. The Qwen3.5/3.6 and Qwen3-Next graphs now place the shared
+  expert right after the router, and the scheduler lets the CPU start on its
+  inputs as soon as the router is done, so the shared expert runs during the
+  CPU's work. Qwen3.6 35B-A3B generation through Ollama 25.3 -> 26.2 tok/s
+  (llama-bench with every expert in RAM: 24.6 -> 25.6), identical outputs.
+  Like 108, it is in `patches/ollama/llama-cpp-sched/`, because both the
+  scheduler and the model graphs are compiled into the CPU build.
 
 `patches/ollama/unapplied/` holds `109-sched-batched-host-copies.patch`, which is
 not built: with the scheduler patched and `HSA_ENABLE_SDMA=1`, MoE generation
@@ -551,9 +566,9 @@ GPU:
 The llama.cpp kernel patches 100-104 and 106 are gfx803-only by construction:
 each takes effect only for `GGML_CUDA_CC_GCN4` or `__gfx803__` and is sized from
 gfx803 register and bandwidth measurements. 105 changes q5_K's dot product for
-every GPU, with the same arithmetic. 107, 108, 090 and the two Ollama
-patches fix problems that are not specific to any GPU (107 and 108 were measured
-on gfx803 only).
+every GPU, with the same arithmetic. 107, 108, 112, 090 and the two Ollama
+patches fix problems that are not specific to any GPU (107, 108 and 112 were
+measured on gfx803 only).
 Upstream llama.cpp master (checked 2026-10-03, b11382) still has the vec
 kernel 102 replaces on gfx803, unchanged; llama.cpp issue
 [#27796](https://github.com/ggml-org/llama.cpp/issues/27796) reports the same

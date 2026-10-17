@@ -88,12 +88,13 @@ op(B) = not transposed.
 ### SDXL inference
 
 Pony V6 (SDXL), 1024 px, CFG batch 2, fp16 UNet, the gfx803 node: one UNet
-step 2.96-3.00 s. By kernel: the shim's GEMMs 2.23 s (75%), fused attention
-0.50 s (17%), elementwise and norms 0.18 s, Winograd transforms 0.04 s. The
-linears, 1.84 s of the GEMM time, run at 5.0-5.2 TFLOPS on the large shapes
-(10240x2048x1280 5.16, 1280x2048x1280 4.99), so SDXL gains mainly from a
-faster TN tile (BLAS-7); the cross-attention K/V projections of the 77-token
-context (n = 154, 1.1-2.5 TFLOPS) lose about 30 ms per step.
+step 2.84 s. By kernel, before the two-wavefront TN tile (BLAS-7; step
+2.98 s then): the shim's GEMMs 2.23 s (75%), fused attention 0.50 s (17%),
+elementwise and norms 0.18 s, Winograd transforms 0.04 s. The large linears
+now run at 5.3-6.3 TFLOPS (10240x2048x1280 6.25, 5120x8192x640 5.31); the
+1280-wide ones with few tiles stay on the 64x64 tile at 4.3-5.0, and the
+cross-attention K/V projections of the 77-token context (n = 154, 1.1-2.5
+TFLOPS) lose about 30 ms per step.
 
 The VAE decode at 1024 px is the other cost. With `--bf16-vae` its
 convolutions run on im2col GEMMs (there is no bf16 Winograd), and ComfyUI
@@ -108,21 +109,20 @@ the large decoder shapes.
 
 ### SD 1.5 LoRA training
 
-A 40-step fp32 run (34-image set, 512 px buckets, gradient checkpointing,
-batch 1, gradient accumulation 4) takes about 2.9 s per step at steady state
-(2.0 s without gradient checkpointing, SD-8).
+A run with `gfx803-train`'s defaults (fp16 mixed precision, 512 px buckets,
+gradient checkpointing, batch 1, gradient accumulation 4) takes about 2.5 s
+per step at steady state, 1.7 s without gradient checkpointing; in fp32,
+2.9 and 2.1 s (TRAIN-1). Attention runs on the fused forward and backward
+kernels (SD-8).
 GEMM FLOPs by layout for one UNet forward and backward with frozen weights,
-which is what LoRA training's base model does, at 384 px (512 px does not fit
-in 8 GB without gradient checkpointing):
+which is what LoRA training's base model does, at 384 px (fp32; the shares
+do not depend on the precision):
 
 | Layout | Share |
 | --- | --- |
 | NN | 50% |
 | TN | 24% (forward linears, attention) |
 | NT | 26% (backward of convolutions, linears and attention) |
-
-Training's attention runs as plain bmm with a stored score matrix, since the
-node is forward-only.
 
 ### llama.cpp decode (token generation)
 
@@ -152,15 +152,17 @@ Open targets in recommended order, then the rest.
 | Target | Area | Expected gain | Status |
 | --- | --- | --- | --- |
 | LLM-6 | MoE prompts: expert copies, MUL_MAT_ID, dense parts | expert copies now overlap compute (patch 108: pp2048 295 -> 367 tok/s); pp2048 SDMA profiling hung GPU; fused dequant unmeasured | Open, first |
-| LLM-8 | MoE generation with experts in system RAM | see LLM-8; 39.1 ms per token on Qwen3.6 35B-A3B; sync removal gains ~0.06 ms; CPU/GPU split pipelining is main lever | Open, measured |
+| LLM-8 | MoE generation with experts in system RAM | shared expert now overlaps the CPU experts (patch 112: Ollama 25.3 -> 26.2 tok/s); left: the fp32 router matvec ~0.5 ms, the hand-offs, CPU experts at ~80% of DDR4 bandwidth | Open, measured |
 | PT-2 | PyTorch kernels that mix the host's 64-lane warp size with the device's 32 | correctness: wrong results or a GPU reset | Done: one more kernel fixed (embedding backward); the rest match the CPU |
 | SD-7 | Fused Winograd F(2x2, 3x3) | fp16 SD at most ~9 ms per step (2%); fp32 and training unmeasured | Open, low |
-| BLAS-7 | Shim GEMM efficiency at SD 1.5 / SDXL shapes | GEMMs are 202 ms (57%) of an fp16 SD 1.5 step at ~4.5 TFLOPS on average; fp16 dispatch fixes, later fp16 widening and a one-wavefront tile for batched NN took the step 415 -> 360 ms, SDXL 3.34 -> 2.98 s | Open, measured |
+| BLAS-7 | Shim GEMM efficiency at SD 1.5 / SDXL shapes | GEMMs are 202 ms (57%) of an fp16 SD 1.5 step at ~4.5 TFLOPS on average; fp16 dispatch fixes, fp16 widening, a one-wavefront tile for batched NN and a two-wavefront TN tile took the step 415 -> 355 ms, SDXL 3.34 -> 2.84 s | Open, measured |
+| SD-9 | SDXL attention | 0.50 s (17%) of an SDXL fp16 step on the fused kernel at ~2.5 TFLOPS; no kernel work at head size 64 and 4096 tokens beyond SD-6 | Open, measured |
 | LLM-5 | The unexplained gap in decoded tokens | mul_mat_vec_q is at bandwidth bound (~198 GB/s); ~3.4 ms/token recoverable via attn_v and small-kernel fusion | Open, measured |
 | SD-2 | Winograd F(4x4, 3x3) | unmeasured; only after SD-7 | Open |
 | SD-1 | Winograd weight gradients | full fine-tuning and LoCon only | Open |
 | LLM-3 | mmvq vs mmq for 9-16 tokens | speculative/parallel decoding | Open |
 | LLM-1b | SDWA dot product losses (2-token decode) | 1-11% on 2-token decode | Open, minor |
+| TRAIN-1 | fp16 LoRA training against fp32 | 2.87 -> 2.47 s/step, 5.8 -> 3.6 GB; without checkpointing 2.07 -> 1.73 s/step, 7.1 -> 4.9 GB | Done (fp16 is `gfx803-train`'s default) |
 | SD-8 | Fused attention backward for training | SD1.5 LoRA 512 px 3.37 -> 2.87 s/step and 7.6 -> 5.6 GB; 2.03 s/step without gradient checkpointing | Done |
 | SD-6 | Multi-wave fused attention | SD 1.5 fp16 step attention 129 -> 91 ms (step 395 -> 360 ms); SDXL self-attention 2.9x | Done |
 | LLM-4 | llama.cpp prompts through dequantize + fp32 SGEMM (patch 106) | Qwen3 8B prompt 149 -> 215 tok/s in Ollama | Done |
@@ -297,9 +299,17 @@ more.
 Converting the synchronous CPU-to-GPU return copy (0.97 ms) to asynchronous
 stream ordering bounds recoverable time to 0.97 ms (estimate ~0.5 ms). The token
 decomposes into ~17 ms GPU compute, ~17 ms CPU compute, and ~8 ms serial
-hand-off. The primary lever is overlapping CPU and GPU execution within or
-across layers (pipelining the GPU shared expert or attention while the CPU
-computes routed experts), not synchronization removal.
+hand-off. Within a layer only the shared expert is independent of the routed
+experts: attention and the router feed them, and the next layer needs their
+sum. Patch 112 (FINDINGS section 9) runs the shared expert while the CPU
+computes the routed experts, which reaches the bound measured by leaving the
+shared expert out (tg128 24.6 -> 25.6 tok/s with SDMA, Ollama 25.3 -> 26.2).
+Overlap across tokens is not possible in single-sequence generation. The
+shared expert's small matrix-vector products above now run behind the CPU
+split (about 80 us against 440 us per layer), so their speed no longer
+counts; the fp32 router (~0.5 ms per token) and attention still do. What is
+left is that kernel time, the hand-offs, and the CPU experts' own speed (at
+most ~3.5 ms).
 
 ### PT-2: audit PyTorch's warp-size mixing
 
@@ -445,12 +455,35 @@ SDXL 2426 -> 2120 ms; fp32 unchanged. fp16 UNet step: SD 1.5 392 -> 360 ms
 (457 -> 395 ms without the node, whose split attention also runs batched
 GEMMs), SDXL 3.34 -> 2.98 s.
 
+A two-wavefront tile (`gfx803_w2_kernel`: 64x128, 128 threads, each
+wavefront a 64x64 half with 8x8 per thread, sharing the A piece) takes fp16
+TN calls with whole tiles and at least three rounds of tiles over the CUs
+(M/64 * N/128 * batch >= 3 * 4 * CUs). In TN both operands are contiguous in
+K, and the one-wavefront tile's 8-deep pieces read 16 bytes of each 64-byte
+line, so L2 delivers each line up to four times; a wider fetch in one
+wavefront does not fit (two pieces at a time already take 127 VGPRs). The
+two wavefronts share a 16-deep slice's fetch, hold the next slice in 12
+VGPRs while multiplying the current one out of one 12 KiB LDS buffer, and
+synchronize twice per slice; each barrier's drain of outstanding loads
+comes after a whole slice of multiply-adds. SDXL's large linears: TN
+5120x8192x640 13.9 -> 10.1 ms, 10240x2048x1280 10.4 -> 8.6 ms (6.25
+TFLOPS), 2560x8192x320 2.84 -> 2.37 ms. Bit-identical on the 478 cases with
+the tile forced on every call it supports, and on 25 more with K a multiple
+of 16 but not 32, padded leading dimensions, offsets and batches. fp16 UNet
+step: SDXL 2.98 -> 2.84 s, SD 1.5 359 -> 355 ms.
+
 **Left, by time lost per step against 4.8 TFLOPS** (each shape timed alone):
 TN with n = 128/154 (cross-attention K/V projections and the 16x16 level)
 at 1.0-4.3 TFLOPS (~3 ms), the batch-2 NN 1x1 convolutions with m = 64-256
 at 2.0-4.6 TFLOPS (~1.3 ms), and the 30 TN 1280x512x1280 linears per step at
 4.3 TFLOPS (~1.2 ms). None alone is more than 1% of the step; a broader gain
-needs a faster main tile rather than more dispatch rules.
+needs a faster main tile rather than more dispatch rules. The two-wavefront
+tile loses where a call has fewer than three rounds of its tiles (TN
+1280x512x1280 0.41 -> 0.51 ms, 640x2048x640 0.38 -> 0.44) and on the
+K = 5120 linears even with enough tiles (1280x2048x5120 6.3 -> 9.2 ms;
+cause unmeasured: those rows are 10 KiB apart). A 64x64 two-wavefront
+variant for the small-tile-count calls, and the K = 5120 loss, are what is
+left of the TN linears.
 
 **Measured, not adopted.** Ablating a 64x64 4x4-per-thread NN tile (2048^3,
 fp32) attributes its time to the global fetch more than to LDS: removing the
@@ -599,6 +632,17 @@ Measured, and not worth pursuing unless something changes:
   (~4 ms out of a 3.4 s training step, ~0.1%), which does not justify a patch.
 
 ## Done
+
+### TRAIN-1: fp16 LoRA training
+
+SD 1.5 LoRA at 512 px with `--mixed_precision=fp16` against fp32, steps 5-20
+of a 20-step run with a warm find-db: 2.87 -> 2.47 s/step with gradient
+checkpointing (card peak 5.8 -> 3.6 GB), 2.07 -> 1.73 s/step without (7.1 ->
+4.9 GB). The gain is memory traffic: the fp16 GEMM tiles (BLAS-4, BLAS-7)
+read half the bytes, and the arithmetic runs at the fp32 rate either way.
+Without gradient checkpointing, fp16 fits beside a desktop. `gfx803-train`
+trains in fp16 by default; `--precision fp32` remains, and no full-length run
+has compared the two for training quality (FINDINGS section 8).
 
 ### SD-8: fused attention backward
 
