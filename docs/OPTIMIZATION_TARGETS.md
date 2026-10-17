@@ -17,6 +17,7 @@ fixes are documented in [`FINDINGS.md`](FINDINGS.md).
 | | RX 590 (Polaris 30) | What it means for kernels |
 | --- | --- | --- |
 | fp32 | 36 CUs, 2304 lanes, ~1.55 GHz: ~7.1 TFLOPS (FMA) | The card's real strength. Measure GEMM-shaped work against it. |
+| fp32 multiply-add | `v_mac_f32` / `v_mad_f32` full rate; the fused `v_fma_f32` a quarter of it (894 against 3,540 G operations per second) | Write `a * b + c`, never `fmaf()`: the compiler contracts it to `v_mac_f32` because fp32 denormals are flushed on gfx8. The fused form remains in division and transcendental sequences, outside inner loops. |
 | fp16 | same rate as fp32 | No packed fp16 math (`v_pk_*`): fp16 halves memory traffic and storage, not arithmetic time. |
 | Integer dot products | none | No `v_dot4`/`dp4a`. Quantized dot products are ALU sequences; 24-bit integer multiplies (`v_mul_i32_i24`) are full rate, and SDWA byte/word operand selects are free. |
 | Matrix cores | none | Every GEMM is plain FMA from registers. |
@@ -37,30 +38,39 @@ the data is reused from registers and LDS. Almost everything expensive in
 these workloads is matrix multiplication: linear layers, convolutions (as
 Winograd plus a batched GEMM), attention (two GEMMs around a softmax) and LLM
 prompt processing. Making all of it run like the shim's best GEMM kernel does
-is the main lever. The pipelined tiles now cover the NN, TN and NT layouts
-(BLAS-1, BLAS-2, BLAS-5); shapes whose leading dimension is a multiple of
-8 KiB still run on older kernels.
+is the main lever. The pipelined tiles now cover the NN, TN and NT layouts,
+fp32 and fp16 (BLAS-1, BLAS-2, BLAS-4, BLAS-5); shapes whose leading
+dimension is a multiple of 8 KiB still run on older kernels.
 
 ## Where the time goes
 
 ### SD 1.5 inference
 
-One denoising step, fp32, 512 px, classifier-free guidance (batch 2), ComfyUI
-with `--use-split-cross-attention` and the gfx803 node: 526 ms (644 without
-the node). Time per module class, from CUDA events around every UNet module's
-forward, measured at 566 ms per step, before BLAS-5 took the linear layers'
-TN GEMMs from ~2.7 to 3.6-4.4 TFLOPS:
+One denoising step, fp16 UNet (ComfyUI's default on this card), 512 px,
+classifier-free guidance (batch 2), with the gfx803 node and a MIOpen
+find-db made by the current build: 393 ms (460 without the node). Time per
+module class (`tools/unet_breakdown.py`: CUDA events around every UNet
+module's forward, each module's time exclusive of its children):
 
 | What | Time | How it runs | Efficiency |
 | --- | --- | --- | --- |
-| Linear layers (attention projections, feed-forward, proj in/out) | 172 ms (30%) | shim, TN layout (all 184 linears per step) | ~2.7 TFLOPS |
-| Convolutions | 182 ms (32%) | MIOpen `ConvHipWinogradF2x3`: input/output transforms in HIP kernels around a strided-batched GEMM in the shim (NN, 438 GFLOP per step, ~97 ms at ~4.5 TFLOPS) | ~85 ms is outside the GEMM |
-| Attention, excluding its projections | ~150 ms (~26%) | node's fused kernel; 64x64 self-attention is 26 ms per call, 5 calls per step | ~1.65 TFLOPS |
-| GroupNorm, LayerNorm, SiLU, the rest | ~13 ms (2%) | | |
+| Convolutions | 144 ms (36%) | MIOpen `ConvHipWinogradF2x3`: input/output transforms in HIP kernels around a strided-batched GEMM in the shim (NN, 438 GFLOP per step) | GEMM/transform split not measured at fp16 |
+| Linear layers (attention projections, feed-forward, proj in/out) | 128 ms (32%) | shim fast tiles with fp16 storage, TN layout (all 184 linears per step) | ~3.6 TFLOPS |
+| Attention, excluding its projections | 92 ms (23%) | node's multi-wave fused kernel reading the fp16 projections in place, 32 calls per step; 64x64 self-attention 14.3 ms per call (fp32 copies) | ~2.5 TFLOPS (252 GFLOP) |
+| GroupNorm, LayerNorm, SiLU | 10 ms (3%) | | |
+| Residuals, reshapes, launch gaps | ~14 ms (4%) | estimate: step time minus the hooked modules | |
 
-The attention row is an estimate: CrossAttention modules measured 220 ms
-including their own projections, and the projections' share was taken from
-their FLOP counts.
+By kernel (PyTorch profiler, same step, 388 ms of kernel time): the shim's
+GEMMs 236 ms (60%: linears, the Winograd solver's batched GEMMs and 1x1
+convolutions, ~917 GFLOP at ~3.9 TFLOPS on average), fused attention 85 ms,
+elementwise kernels, norms and casts ~45 ms, the Winograd filter transform
+17 ms and its input and output transforms 9 ms. The filter transform runs on
+every call (48 per step) although the weights do not change between steps;
+see "Ruled out".
+
+A find-db written before a build added `ConvHipWinogradF2x3` for fp16 keeps
+its fp16 3x3 records on `GemmFwdRest`, and convolutions then take 287 ms per
+step instead of 144.
 
 GEMM FLOPs per step by layout (shim call log, after a warm-up pass), without
 the node:
@@ -77,8 +87,9 @@ op(B) = not transposed.
 
 ### SD 1.5 LoRA training
 
-A 20-step fp32 run (34-image set, 512 px buckets, gradient checkpointing,
-batch 1, gradient accumulation 4) takes about 3.4 s per step at steady state.
+A 40-step fp32 run (34-image set, 512 px buckets, gradient checkpointing,
+batch 1, gradient accumulation 4) takes about 3.1 s per step at steady state
+(2.3 s without gradient checkpointing, SD-8).
 GEMM FLOPs by layout for one UNet forward and backward with frozen weights,
 which is what LoRA training's base model does, at 384 px (512 px does not fit
 in 8 GB without gradient checkpointing):
@@ -122,17 +133,18 @@ Open targets in recommended order, then the rest.
 | LLM-6 | MoE prompts: expert copies, MUL_MAT_ID, dense parts | expert copies now overlap compute (patch 108: pp2048 295 -> 367 tok/s); pp2048 SDMA profiling hung GPU; fused dequant unmeasured | Open, first |
 | LLM-8 | MoE generation with experts in system RAM | see LLM-8; 39.1 ms per token on Qwen3.6 35B-A3B; sync removal gains ~0.06 ms; CPU/GPU split pipelining is main lever | Open, measured |
 | PT-2 | PyTorch kernels that mix the host's 64-lane warp size with the device's 32 | correctness: wrong results or a GPU reset | Done: one more kernel fixed (embedding backward); the rest match the CPU |
-| SD-6 | Register-tiled fused attention (and llama.cpp's fp32 FA tile kernel) | SD inference ~12% per step; deep-context prompts | Open |
-| SD-7 | Fused Winograd F(2x2, 3x3) | SD 30-60 ms per step (5-10%), training too | Open |
+| SD-7 | Fused Winograd F(2x2, 3x3) | fp16 SD at most ~9 ms per step (2%); fp32 and training unmeasured | Open, low |
+| BLAS-7 | Shim GEMM efficiency at SD 1.5 / SDXL shapes | GEMMs are 236 ms (60%) of an fp16 SD 1.5 step at ~3.9 TFLOPS on average; two fp16 dispatch fixes took the step 415 -> 399 ms | Open, measured |
 | LLM-5 | The unexplained gap in decoded tokens | mul_mat_vec_q is at bandwidth bound (~198 GB/s); ~3.4 ms/token recoverable via attn_v and small-kernel fusion | Open, measured |
-| BLAS-4 | Shim: pipelined tiles with fp16 storage, fp32 accumulate | bandwidth-bound shapes (unmeasured); candidate to re-evaluate with fast tiles | Open, candidate |
 | SD-2 | Winograd F(4x4, 3x3) | unmeasured; only after SD-7 | Open |
 | SD-1 | Winograd weight gradients | full fine-tuning and LoCon only | Open |
-| SD-8 | Fused attention backward | training attention time and VRAM | Open, large |
 | LLM-3 | mmvq vs mmq for 9-16 tokens | speculative/parallel decoding | Open |
 | LLM-1b | SDWA dot product losses (2-token decode) | 1-11% on 2-token decode | Open, minor |
+| SD-8 | Fused attention backward for training | SD1.5 LoRA 512 px 3.37 -> 3.13 s/step and 7.6 -> 5.2 GB; 2.30 s/step without gradient checkpointing | Done (first version) |
+| SD-6 | Multi-wave fused attention | SD 1.5 fp16 step attention 161 -> 92 ms (step 460 -> 393 ms); SDXL self-attention 2.9x | Done |
 | LLM-4 | llama.cpp prompts through dequantize + fp32 SGEMM (patch 106) | Qwen3 8B prompt 149 -> 215 tok/s in Ollama | Done |
 | LLM-7 | DeltaNet conv-input concat (patch 107) | Qwen3.6 35B-A3B pp2048 244 -> 270 tok/s | Done |
+| BLAS-4 | Shim: fp16 operands on the fast tiles, all layouts | fp16 SD 1.5 step 602 -> 483 ms; 31 GEMM cases median 1.5x | Done |
 | BLAS-6 | Shim: GEMMs with 1-8 columns (decode-shaped), fp16 and fp32 | Chatterbox TTS token model 88 -> 25.7 ms per token | Done |
 | BLAS-5 | Shim: TN, NT and TT layouts | SD step 557 -> 526 ms, training 3.63 -> 3.37 s/step | Done |
 | BLAS-1, BLAS-2 | Shim: pipelined 64x64 and 32x32 tiles | large NN GEMMs 2.8-3.3 -> 3.9-4.8 TFLOPS | Done |
@@ -170,6 +182,14 @@ per-part breakdown is recorded.
   item is open.
 - Fused dequantization in the SGEMM load or lowering the patch-106 threshold
   below 128 is an unmeasured kernel-side lever for expert prefill.
+- Expert matmuls through dequantization + fp32 SGEMM (patch 106's route,
+  forced for every expert slice through llama.cpp's per-expert MUL_MAT_ID
+  path, dev-only switch): slower, pp2048 with experts in system RAM 292 ->
+  223 tok/s at 2048-token batches and 167 -> 122 at 512 (SDMA off in both).
+  That path synchronizes with the host to sort tokens by expert and then runs
+  a dequantization and a GEMM per expert, 256 of each per layer. A grouped
+  kernel that reads the quantized experts directly is the remaining form of
+  this lever (unbuilt).
 - MUL_MAT_ID tile choice for gfx803: measured, not a lever. Forcing every
   tile width from 8 to 64 for the expert matmuls (dev-only override) left
   pp2048 within noise: 171-176 tok/s at 1024-token batches for every width,
@@ -329,46 +349,17 @@ trapping assert names its kernel and costs one reset. PyTorch's own OpInfo
 tests (about 600 ops, against the suite's 118) run the same way, one op per
 process, would find the cases the audit misses.
 
-### SD-6: register-tiled fused attention
-
-**Why.** The node's fused attention removes the 2.3 GB score matrix and
-halves self-attention time, but runs at ~1.65 TFLOPS: 64x64 self-attention
-(batch 2, 8 heads, 4096 tokens, head size 40) is 43 GFLOP in 26 ms, and its
-five calls are ~130 ms of a 566 ms step. Attention is two GEMMs around a
-softmax, which is the card's best kind of work.
-
-**Where.** `tools/gfx803_fused_attention.hip` (kernels for head sizes 40/64
-and a 2-wave variant for 80/160) and `tools/gfx803_attention.py` (dispatch).
-
-**Approach.** Apply the shim's lessons: a larger output tile per thread
-(registers hold more of Q and the running output), K and V tiles staged
-through LDS with the next tile's loads issued before the current tile's math,
-and float4 global loads. Head size 40 is not a multiple of 16; padding to 48
-or 64 in LDS may beat handling the tail. Keep the online-softmax arithmetic
-in fp32.
-
-**Expected gain.** ~3.5 TFLOPS would take 64x64 self-attention from 26 to
-~12 ms per call: about -70 ms per step (~12%).
-
-**Shared with llama.cpp.** Patch 101's fp32 flash-attention tile kernel
-(`fattn-tile-kernel.cuh`, the `fattn_tile_fp32` namespace) is the same kind
-of kernel. Prompts 8k tokens deep still read at 127 tok/s against 163 at an
-empty context (Qwen3 8B, q8_0 KV), so the same design may help there.
-
-**Verify.** CPU float64 reference over head sizes 40/64/80/160, odd N and M,
-3-D and non-contiguous inputs, large score magnitudes (online softmax
-overflow), fp16 through the hook; then a full ComfyUI txt2img against a CPU
-run.
-
 ### SD-7: fused Winograd F(2x2, 3x3)
 
-**Why.** Convolutions are 182 ms (32%) of an SD step, and only ~97 ms of that
-is the Winograd solver's GEMM. `ConvHipWinogradF2x3`
+**Why.** Convolutions are 149 ms (36%) of an fp16 SD step. At fp16 the
+input and output transforms take 9 ms per step and the filter transform
+17 ms; the rest is the GEMM, which a fused kernel would still have to run.
+At fp32, before the shim's fp16 tiles, ~85 ms of 182 was outside the GEMM. `ConvHipWinogradF2x3`
 (`rocm6.4.4/patches/miopen/winograd-f2x3-hip-gfx803.patch`) transforms the
 input into 4x4 tiles (4x the data of the input) in one kernel, writes them to
 DRAM, runs a strided-batched GEMM over them, writes the result, and
 transforms it back in a third kernel. Those round trips through DRAM are most
-of the remaining ~85 ms.
+of the time outside the GEMM.
 
 **Approach.** One kernel per output tile block that transforms input tiles in
 LDS, runs the 16 small GEMMs from LDS and registers, and transforms the
@@ -378,8 +369,9 @@ disabled on gfx803 because they corrupt memory and hang the GPU (FINDINGS
 section 2), so build it as ordinary HIP with ordinary launches. Forward and
 backward-data both matter (training).
 
-**Expected gain.** 30-60 ms per SD step (5-10%) if most of the transform
-traffic goes away; training gains on both directions. Measure the split
+**Expected gain.** At fp16 at most the 9 ms of input and output transforms
+per step (2%), plus the GEMM's own reads and writes of the transformed
+tiles; at fp32 and in training more, unmeasured. Measure the split
 first: time the SD 1.5 conv shapes with the solver forced
 (`MIOPEN_DEBUG_FIND_ONLY_SOLVER=ConvHipWinogradF2x3`, empty
 `MIOPEN_USER_DB_PATH`) against the time of its GEMM alone, which the shim's
@@ -392,6 +384,50 @@ find-db once, or old records keep choosing other solvers.
 
 **Verify.** All 17 SD 1.5 conv shapes forward and backward-data against
 CPU float64, the 3-image VAE latent check, the UNet check, a training run.
+
+### BLAS-7: shim GEMM efficiency at SD shapes
+
+**Why.** The shim's GEMMs are 236 ms (60%) of an fp16 SD 1.5 step: about
+917 GFLOP at ~3.9 TFLOPS on average, a little over half the card's FMA peak.
+Each further 0.5 TFLOPS on average is about 25 ms per step, and training's
+GEMMs gain as well.
+
+**Where.** `rocm6.4.4/patches/sgemm-shim-batched/gfx803_sgemm.h`. The step's
+GEMMs, from the shim's call log (`GFX803_SGEMM_SHIM_VERBOSE` over the
+profiled steps only, so MIOpen's Find calls are excluded): TN linears
+(m = 320/640/1280, n = 154 to 8192, k = 320 to 5120), the Winograd solver's
+strided-batched NN GEMMs (batch 16, m = 32 to 2048, n = k = 320 to 1280), and
+1x1 convolutions as batch-2 NN GEMMs (m = 64 to 4096).
+
+**Done.** Two dispatch rules had been tuned on fp32 operands only. Single-
+float B staging for TN with K >= 2048 lost to float4 B at fp16 (SD 1.5's
+feed-forward output projections, 1280x512x5120: 2.1 -> 3.5 TFLOPS;
+640x2048x2560: 2.8 -> 4.3), and the 64x64 tile lost to the 32x32 tile at
+fp16 for M = 32 (the Winograd GEMMs at the smallest latent:
+16 x 32x1280x1280 0.86 -> 0.63 ms, k = 2560 2.33 -> 1.46 ms). Both now apply
+to fp16 only; every tile and staging accumulates in the same order, so
+outputs are bit-identical. fp16 SD 1.5 step 415 -> 399 ms.
+
+**Left, by time lost per step against 4.8 TFLOPS** (each shape timed alone):
+the 30 TN 1280x512x1280 linears per step at 3.8 TFLOPS (~3 ms), TN with
+n = 128/154 (cross-attention K/V projections and the 16x16 level) at
+1.0-2.0 TFLOPS (~3 ms), the batch-2 NN 1x1 convolutions with m = 64-256 at
+2.0-3.6 TFLOPS (~3 ms), and the Winograd GEMMs with m = 512 at 3.8 TFLOPS
+(~2 ms). None alone is more than 1% of the step; a broader gain needs a
+faster main tile rather than more dispatch rules.
+
+**Measured, not adopted.** Ablating a 64x64 4x4-per-thread NN tile (2048^3,
+fp32) attributes its time to the global fetch more than to LDS: removing the
+fetch 3.96 -> 5.06 TFLOPS, removing the LDS reads 3.96 -> 4.52, removing the
+barrier 3.96 -> 4.25, a pure multiply-add loop 6.35. Larger register tiles
+(8x4, 8x8 per thread) did not help at SD sizes (fewer workgroups, one wave
+per SIMD); 32-deep K slices halved the speed (LDS limits a CU to one
+workgroup). Fetching two slices ahead with LDS double-buffered gains 5-20% on
+single fp16 GEMMs (2048x640x640 3.1 -> 3.6 TFLOPS) but loses 5-15% on the
+batched Winograd and 1x1-convolution GEMMs that make up the step's NN time
+(116 -> 126 ms per step) and on fp32, so the shim keeps its kernels. Beyond
+~4 TFLOPS on this tile the remaining lever is instruction-level scheduling,
+not tile shape.
 
 ### LLM-5: the unexplained part of a decoded token
 
@@ -456,22 +492,6 @@ enabled versus 27.75 tok/s with `LLAMA_ATTN_ROT_DISABLE=1`.
   attention decode closer to 200 GB/s offers up to 2.4 ms more. All gains are
   unmeasured.
 
-### BLAS-4: pipelined tiles with fp16 storage and fp32 accumulate
-
-**Why.** Routing generic fp16 GEMMs to the shim was previously rejected because
-rocBLAS ran those layouts at 3.1-3.2 TFLOPS while the shim's older unpipelined
-kernels achieved 2.5-2.6 TFLOPS. With pipelined 64x64 and 32x32 tiles (BLAS-1,
-BLAS-2) now achieving 3.9-4.8 TFLOPS in fp32, the premise for evaluating fp16
-storage with fp32 accumulation re-opens.
-
-**Mechanism and expected gain.** Polaris (gfx803) has no packed fp16 math
-instructions (`v_pk_*`); fp16 arithmetic executes at the same rate as fp32.
-Holding inputs in fp16 storage and accumulating in fp32 registers halves global
-memory traffic and LDS footprint without altering arithmetic throughput. The
-gain is therefore restricted to memory bandwidth-bound GEMM shapes, with no
-benefit expected on compute-bound square matrices. Candidate to re-evaluate per
-shape (unmeasured).
-
 ### SD-2: Winograd F(4x4, 3x3)
 
 F(4x4, 3x3) needs 2.25 multiplies per output against F(2x2, 3x3)'s 4, so the
@@ -487,15 +507,6 @@ the convolution weights and never needs backward-weights; full fine-tuning
 or LoCon would, and falls back to MIOpen's GEMM path (im2col, then GEMM). The
 weight-gradient form is an input transform, an output-gradient transform, a
 batched GEMM accumulated over tiles, then the filter transform.
-
-### SD-8: fused attention backward
-
-Training's attention stores the score matrix and runs plain bmms in both
-directions. A fused backward (recomputing scores per tile from the saved
-log-sum-exp, as FlashAttention does) would cut attention's training time and
-VRAM. Whether the VRAM saved lets 512 px training run without gradient
-checkpointing, which costs one extra forward per step, is unknown. Large job;
-measure attention's share of a training step first.
 
 ### LLM-3: decode kernels for 9-16 tokens
 
@@ -525,22 +536,77 @@ Measured, and not worth pursuing unless something changes:
   at ~80% of reachable bandwidth after patches 103 and 104.
 - **DPP cross-lane reductions** (gfx8 has them). Reductions are a small share
   of every workload measured here.
+- **Transforming the Winograd filters once instead of per call.** The 48
+  Winograd convolutions of an fp16 SD 1.5 step read 1.1 GB of 3x3 weights and
+  write 1.9 GB of 4x4 tiles: ~13.4 ms at the streaming rate against 17.1 ms
+  measured, so the kernel is near its bound. Keeping the transformed filters
+  would cost 1.9 GB of VRAM beside 1.7 GB of fp16 UNet weights on an 8 GB
+  card.
 - **HIP graphs for decode.** Already on by default and in use on gfx803;
   turning them off changes nothing measurable (LLM-5).
 - **Routing generic fp16 GEMMs in every layout to the unpipelined shim.**
-  Slower than rocBLAS (evaluated under BLAS-4; pipelined tiles with fp16 storage
-  are re-opened as an open candidate).
+  Slower than rocBLAS (633.5 -> 675.4 ms per fp16 SD 1.5 step); the pipelined
+  fast tiles with fp16 operands (BLAS-4) are what made the fp16 route pay.
 - **Redefining `C10_WARP_SIZE` for gfx8** (PT-1 below): a global macro change
   breaks kernels written for the old value.
-- **Fused attention in gradient-checkpointed SD training.** sd-scripts uses
-  non-reentrant checkpointing (`checkpoint(..., use_reentrant=False)`), where
-  the first forward pass runs with gradients enabled. The attention hook skips
-  tensors requiring gradients, so forward-only fused attention cannot be applied
-  during training without a fused backward implementation (SD-8).
 - **LoRA `addmm` with beta=1 fusion.** Accounts for ~360 launches of ~10 us each
   (~4 ms out of a 3.4 s training step, ~0.1%), which does not justify a patch.
 
 ## Done
+
+### SD-8: fused attention backward
+
+`tools/gfx803_fused_attention.hip` (`attn_bwd_dkdv`, `attn_bwd_dq`, and an
+LSE output from the forward), used by `gfx803-train` through `--sdpa`. A
+fp32 SD1.5 UNet forward and backward at 384 px spends ~97 of 387 ms in
+attention at the 48x48 level and 1.4 GB on its matrices; at 512 px it runs
+out of 8 GB without gradient checkpointing, and fits in 4.6 GB when the
+attention keeps no N x M state. Per call at 4096 tokens, head size 40:
+PyTorch forward and backward 59 ms and 2.6 GB extra, fused 7 + 43 ms with
+memory linear in N. Training (512 px, 4 accumulated, 40 steps, seed 42):
+3.37 -> 3.13 s/step, 7.6 -> 5.2 GB; 2.30 s/step at 7.0 GB with
+`--no-checkpointing`; identical loss.
+
+Left: the backward runs at ~1.7 TFLOPS-equivalent with 32x32 tiles and
+scalar LDS reads; head size 80 at 1024 tokens is slower than PyTorch (9.3
+against 5.9 ms), so calls below 2M query-key pairs stay on PyTorch. In a
+512 px micro-step without checkpointing the five 64x64 backward calls are
+about 215 of ~575 ms, so this kernel is the training step's largest single
+lever. Register-tiling it (one wave per 32x32 tile, 4x4 S and dP per thread
+from float4 LDS reads) measured slower, 43 -> 70 ms: 180-250 VGPRs and the
+per-block LDS leave one or two waves per CU. A faster version has to keep
+several waves per CU on one K/V tile within 64 KiB of LDS.
+
+### SD-6: multi-wave fused attention
+
+Done in the node (`tools/gfx803_fused_attention.hip`): a block
+of four waves handles 128 query rows and shares each 32-key K/V tile, P
+values move between lanes with `ds_bpermute` instead of an LDS tile, and the
+next K/V tile is prefetched into registers. Per call: SD 1.5 64x64
+self-attention (CFG batch 2, head size 40) 26.3 -> 14.3 ms, 32x32 (head
+size 80) 1.95 -> 0.84 ms, SDXL 4096-token self-attention (head size 64)
+35.0 -> 12.2 ms; SD 1.5 step attention 161 ms (ComfyUI's own) -> 92 ms.
+The kernel reads Q, K and V in ComfyUI's [b, tokens, heads*D] fp16 layout
+and writes the output there, which saves the transposes, fp32 casts and
+output copy around every call (160 launches per step, 99 -> 92 ms); the K/V
+prefetch keeps the fp16 values raw until they go to LDS, or the conversion
+waits on every tile's loads (head size 40: 75.8 against 84.3 ms per step).
+
+What made the difference was the multiply-add encoding, not the tiling: the
+same multi-wave kernel written with `fmaf()` measured 15.3 ms at head size
+40 and 29.8 ms at 64, because gfx803 issues the fused `v_fma_f32` at a
+quarter rate (see the card table).
+
+**Left.** Head size 40 reaches 2.9-3.0 TFLOPS and 64 about 3.5. Head size
+40 runs one block per CU: two blocks fit in LDS but need the kernel within
+128 VGPRs, and at that bound the compiler spills the `v_mac_f32`
+accumulators. Head size 160 stays on ComfyUI's split attention (0.34 ms per
+call against the node's 0.79).
+
+**Shared with llama.cpp.** Patch 101's fp32 flash-attention tile kernel
+(`fattn-tile-kernel.cuh`) already compiles its inner products to
+`v_mad_f32`; the gfx803 build's `v_fma_f32` instructions are division
+sequences. The quarter-rate FMA is not a lever there.
 
 ### LLM-4: prompts through dequantize + fp32 SGEMM
 
@@ -712,15 +778,16 @@ LDS prefetch.
   `torch.nn.Linear` reaches it as TN (BLAS-5).
 - SD 1.5 LoRA training: 4.0 s per step against about 4.1 before.
 
-### BLAS-4: fp16 GEMMs in every layout (evaluated, not adopted)
+### BLAS-4: fp16 operands on the fast tiles
 
-rocBLAS's fp16 kernels are slow on gfx803 only for op(A) = N, op(B) = T, which
-the shim already takes. Routing the other three layouts to the shim's fp16
-path made an SD 1.5 fp16 UNet step slower (633.5 -> 675.4 ms; rocBLAS ran
-those layouts at 3.1-3.2 TFLOPS against the shim's 2.5-2.6 at the time), so
-the shim leaves them to rocBLAS. The fast tiles are fp32-only; pipelined tiles
-with fp16 storage and fp32 accumulation are re-opened as an open candidate for
-bandwidth-bound shapes.
+rocBLAS's fp16 GEMMs in the TN, NN and TT layouts widen each fp16 operand to
+fp32 inside the inner loop and ran 1.3-1.9x slower than the shim's fp32 tiles
+at equal shapes (the NT layout was worse still and already on the shim). The
+fast tiles now read fp16 operands with wide loads, widen once, accumulate in
+fp32 and round once at the store, in all four layouts and the batched calls:
+31 GEMM cases 1.0-2.4x faster (median 1.5x) at the same error against
+float64, and the fp16 SD 1.5 step 602 -> 483 ms (convolutions 228 -> 147 ms,
+linears 176 -> 137 ms). Details in FINDINGS section 8.
 
 ### SD-3, SD-4, SD-5: ComfyUI node
 
@@ -825,7 +892,8 @@ matmul (4096x14336) goes from 233 to 224 us for one column and from 287 to
   Use `--use-split-cross-attention` for anything with gradients (ComfyUI's
   default sub-quadratic attention writes `exp(..., out=...)` in place and
   cannot be differentiated), and `--force-fp32` to match the service. A 512 px
-  forward and backward without gradient checkpointing does not fit in 8 GB.
+  forward and backward with PyTorch's attention does not fit in 8 GB without
+  gradient checkpointing; with the fused training attention (SD-8) it does.
 - **GEMM speed.** Time `A @ B` with CUDA events after a few warm-up calls;
   build transposed operands as `.t()` views to reach each rocBLAS layout.
   Two effects of 5-15% hide in back-to-back A/B timing. The variant timed

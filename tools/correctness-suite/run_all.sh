@@ -82,7 +82,7 @@ report() {
 [ -n "$ONLY" ] && echo "ONLY set -- running just: $ONLY"
 echo "Results going to: $RESULTS_DIR"
 echo "=== op-level sweeps ===" | tee -a "$TXT"
-for op in activ_sweep pool_sweep bn_sweep softmax_sweep layernorm_sweep groupnorm_sweep tensorop_sweep reduce_sweep reduce_extreme_sweep glu_sweep cat_sweep rope_sweep kthvalue_sweep; do
+for op in activ_sweep activ_bwd_sweep pool_sweep bn_sweep bn_bwd_sweep softmax_sweep layernorm_sweep groupnorm_sweep tensorop_sweep reduce_sweep reduce_extreme_sweep glu_sweep cat_sweep rope_sweep kthvalue_sweep; do
     should_run "$op" || continue
     if [ -x "$BIN/$op" ]; then
         report "$op" "$BIN/$op"

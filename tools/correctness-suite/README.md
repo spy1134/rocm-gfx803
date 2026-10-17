@@ -31,6 +31,15 @@ reaches but a future one may.
 - `pool_sweep.cpp`: Max, Average, and AverageInclusive, with output sizes that
   straddle the 8, 16, 32, 64, and 128 work-group tile thresholds.
 - `bn_sweep.cpp`: BatchNorm forward inference, Spatial and PerActivation.
+- `bn_bwd_sweep.cpp`: BatchNorm training backward (Spatial, NCHW, fp32), with
+  saved and with recomputed statistics, against a float64 reference. Shapes
+  cover H*W that is not a multiple of 4, H*W around the 1024 and 4096
+  variant thresholds, and H*W of 4096 or more with a nonzero
+  `(N*H*W) % 4096` remainder. It also checks the largest error against the
+  peak value, because a few wrong channels keep the cosine above 0.999.
+- `activ_bwd_sweep.cpp`: `miopenActivationBackward` for the same modes as the
+  forward sweep, packed tensors only (MIOpen refuses padded strides) and
+  without POWER (its backward kernel ignores the incoming gradient).
 - `softmax_sweep.cpp`: CHANNEL and INSTANCE modes, with vector_size straddling
   the 256 `num_batch` threshold.
 - `layernorm_sweep.cpp`: norm_dim straddling the 256 `LOCAL_SIZE` reduction
@@ -105,6 +114,35 @@ any image of the line with the card passed through.
   Face's top-k, top-p and min-p filters (needs `transformers`). Expect 798 of 798 and 150 of 150.
   **Do not run it on an image without the top-k patch:** the first case traps a wave and the
   driver resets the GPU.
+- `linalg_check.py`: `torch.linalg` LU, solve, inverse, determinant, Cholesky, symmetric
+  eigendecomposition, QR, SVD and least squares at sizes from 2 to 257, batched and not, fp32 and
+  fp64, judged by residuals against float64 on the CPU. It factors one 4x4 matrix first and exits
+  before any other call when the GPU library returned no factorization, which is what a rocSOLVER
+  without a gfx803 code object does (unchecked launches leave the input as the "factors", and later
+  calls fault on the stale pivots).
+  Cholesky and least squares need MAGMA, which the PyTorch build here lacks, so those 60 cases are
+  skipped; the other 204 pass on the shipped libraries (`LINALG_MAX_N` limits the largest size).
+- `softmax_smem_check.py`: softmax and log_softmax forward and backward against float64 at the
+  row lengths where the block reduction's shared-memory buffer can overrun its allocation and over
+  the persistent-softmax range (rows up to 2048). `--device cpu` checks the script itself.
+- `sparse_coalesce_check.py`: sparse COO `coalesce()` against a float64 CPU result at dense widths
+  around the 160- and 256-feature tile boundaries of `coalesceValuesKernel`.
+- `torchvision_ops_check.py`: roi_align, roi_pool, ps_roi_align and deform_conv2d forward and backward,
+  and nms, on the GPU against the CPU.
+- `ort_topk_smem_bound_check.py`: ONNX Runtime's TopK on the ROCm EP at K on both sides of the
+  64 KiB shared-memory bound of its small-K kernel (K > 7808 fp32, 7872 fp16), sorted and unsorted,
+  against numpy. Run it in the base image.
+- `migraphx_check.py`: MIGraphX `reduce_sum` over int32/uint32 (the integer DPP reduction must
+  assemble for gfx8) and fp16 `dot` with a long reduction axis (must accumulate in fp32), against
+  numpy. `TARGET=ref` runs the reference target without a GPU.
+- `attention_check.py`: the ComfyUI node's fused attention (`tools/libgfx803_attn.so`, or
+  `--lib`) against float64 at SD 1.5 and SDXL shapes, odd sizes and tails, within 1e-4. The
+  large-logit cases are ill-conditioned (a CPU fp32 computation is already 2e-4 to 5e-4 off), so
+  they fail only above 4x that CPU fp32 error. Expect 23 of 23.
+- `shim_alpha0_check.py`: GEMMs with alpha == 0 (and k == 0) must give beta * C without reading A
+  or B, so a NaN or Inf in A or B stays out of C. Expect 15 of 15; a shim that computes 0 * (A * B)
+  fails 13.
+
 ## Running it
 
 Build inside any container that has `hipcc` and MIOpen installed. Every image

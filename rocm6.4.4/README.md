@@ -83,7 +83,7 @@ solvers; its header has the measurements and a reproduction.
 
 [`patches/miopen/winograd-f2x3-hip-gfx803.patch`](patches/miopen/winograd-f2x3-hip-gfx803.patch)
 adds a Winograd solver back for gfx8: `ConvHipWinogradF2x3`, F(2x2,3x3) for 3x3,
-stride-1, pad-1 fp32 convolutions, forward and backward data. It runs three
+stride-1, pad-1 fp32 and fp16 convolutions, forward and backward data. It runs three
 small HIP transform kernels around one strided-batched GEMM, which the SGEMM
 shim below executes, and Find chooses between it and the GEMM solvers per shape.
 On an RX 590 it runs most SD1.5 UNet convolutions about 2x faster, with lower
