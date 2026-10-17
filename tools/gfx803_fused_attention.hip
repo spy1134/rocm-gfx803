@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <math.h>
+#include <type_traits>
 
 #define WARP_SIZE 64
 
@@ -25,6 +26,24 @@ __device__ __forceinline__ float lane_xor(float v, int lane) {
     } else {
         return __int_as_float(__builtin_amdgcn_ds_bpermute((lane ^ MASK) << 2, __float_as_int(v)));
     }
+}
+
+// The value of lane ^ 2. A DPP quad permutation: no LDS round trip.
+__device__ __forceinline__ float lane_xor2(float v) {
+    return __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(v), 0x4e, 0xf, 0xf, false));
+}
+
+// acc += (p of the lane 2*S further along this lane's 16-lane row) * v, with
+// the row rotation applied to the operand by the multiply-add itself. The
+// compiler emits a separate v_mov_b32_dpp for __builtin_amdgcn_mov_dpp
+// instead of folding it into v_mac_f32, hence the asm.
+template <int S>
+__device__ __forceinline__ void mac_row_rot2(float& acc, float p, float v) {
+    if constexpr (S == 0)
+        acc += p * v;
+    else
+        asm("v_mac_f32_dpp %0, %1, %2 row_ror:%3 row_mask:0xf bank_mask:0xf"
+            : "+v"(acc) : "v"(p), "v"(v), "n"(16 - 2 * S));
 }
 
 __device__ __forceinline__ float lane_read(float v, int src_lane_byte_addr) {
@@ -92,25 +111,34 @@ __global__ void gfx803_fallback_attention_f32(
 //
 // One block = 4 waves = 128 query rows.  The block shares each 32-key K/V tile
 // among its waves, so K and V stream from memory once per 128 rows instead of
-// once per 32 rows.  Within a wave, lane (tx, ty) owns rows tx+8i and keys
-// ty+8j of the 32x32 score tile (4x4 per lane) and accumulates P*V for its
-// four rows over the d-slice [ty*D/8, (ty+1)*D/8).  The P values of the other
-// key groups come through ds_bpermute, which saves a P store, a barrier and a
-// re-read per tile, so the block needs only the Q, K and V tiles in LDS.
+// once per 32 rows, and the block needs only the Q, K and V tiles in LDS.
 //
-// LDS layout.  K and V rows are unpadded: the eight lanes of a key group read
-// the same K address, and the eight lanes of a row group the same V address,
-// which the LDS serves as a broadcast.  The Q row stride is D+4 floats, which
-// keeps 16-byte alignment for ds_read_b128 and makes (stride / 16 B) odd, so
-// the 8 consecutive rows one ds_read_b128 cycle serves fall into 8 distinct
-// 16-byte bank groups.  Q*K^T reads 8 float4 per 64 FMAs.
+// Lane tiling.  Lane l of a wave owns rows tx+8i (i < 4) of the wave's 32
+// query rows, tx = 2*(l/16) + l%2, and keys ty+8j (j < 4) of the 32-key tile,
+// ty = (l/2)%8: a 4x4 block of the score tile.  In P*V the lane accumulates
+// its four rows over the d-slice [ty*D/8, (ty+1)*D/8), which needs the P
+// values of all 32 keys of those rows.  They lie in the eight lanes of the
+// same 16-lane row with the same l%2, so at step s the lane takes key group
+// (ty+s)%8, whose P values the lane 2s further along holds, and its
+// v_mac_f32_dpp reads them through a DPP row rotation with no instruction of
+// its own.  With one wave per SIMD, every instruction besides the
+// multiply-adds costs the wave an issue slot: fetching P with ds_bpermute
+// (128 per tile, in a layout with row groups across the low lane bits)
+// measured 10% of the kernel's time, and with v_mov_b32_dpp 12%.
+//
+// LDS layout.  Q, K and V rows have a stride of D+4 floats, which keeps
+// 16-byte alignment for ds_read_b128 and makes (stride / 16 B) odd, so the
+// eight distinct rows one read serves fall into distinct 16-byte bank groups.
+// The eight key groups of a 16-lane row read eight K rows at once; unpadded,
+// those share one bank group, and the kernel ran 9% slower.  Q*K^T reads 8
+// float4 per 64 multiply-adds.
 //
 // Every D runs one block (4 waves) per CU and prefetches the next K/V tile
-// into registers while the current one is consumed.  D=40 would fit two
-// blocks per CU in LDS (32768 B), but only within 128 VGPRs, and at that
-// bound the compiler spills the accumulators of the v_mac_f32 loops (the
-// destination is tied to the addend); the spilling build is 5x slower than
-// the one-block, prefetching one.
+// into registers while the current one is consumed.  A second block per CU
+// needs the kernel within 128 VGPRs, and at that bound the compiler spills
+// the accumulators of the v_mac_f32 loops (the destination is tied to the
+// addend); the spilling build of D=40 was 5x slower than the one-block,
+// prefetching one.
 // ---------------------------------------------------------------------------
 // Element strides of one [B, H, rows, D] operand; D is contiguous.
 struct AttnStrides { long long b, h, n; };
@@ -156,7 +184,7 @@ gfx803_fused_attention_mw_kernel(
     constexpr int C = BC / NG;                // keys per lane
     constexpr int DS = D / NG;                // d-slice per lane in P*V
     constexpr int D4 = D / 4;
-    constexpr int QS = D + 4;                 // Q row stride in floats
+    constexpr int QS = D + 4;                 // Q, K and V row stride in floats
     constexpr int KV_VEC = BC * D4;           // float4 per K (or V) tile
     constexpr int KV_PER_THREAD = (KV_VEC + NTHREADS - 1) / NTHREADS;
     constexpr float MASKED = -1e30f;
@@ -165,17 +193,17 @@ gfx803_fused_attention_mw_kernel(
     static_assert(D % NG == 0, "D must split into 8 equal d-slices");
     static_assert(NG * NG == WARP_SIZE, "lane tiling must cover the 32x32 wave tile");
     static_assert(((QS / 4) & 1) == 1, "Q stride/16B must be odd for conflict-free ds_read_b128");
-    static_assert(BR * QS * 4 + 2 * BC * D * 4 <= 65536, "LDS footprint exceeds the 64 KiB of a CU");
+    static_assert((BR + 2 * BC) * QS * 4 <= 65536, "LDS footprint exceeds the 64 KiB of a CU");
 
     __shared__ __attribute__((aligned(16))) float s_Q[BR * QS];
-    __shared__ __attribute__((aligned(16))) float s_K[BC * D];
-    __shared__ __attribute__((aligned(16))) float s_V[BC * D];
+    __shared__ __attribute__((aligned(16))) float s_K[BC * QS];
+    __shared__ __attribute__((aligned(16))) float s_V[BC * QS];
 
     const int tid = threadIdx.x;
     const int wave = tid >> 6;
     const int lane = tid & (WARP_SIZE - 1);
-    const int tx = lane & (NG - 1);
-    const int ty = lane >> 3;
+    const int tx = 2 * (lane >> 4) + (lane & 1);
+    const int ty = (lane >> 1) & (NG - 1);
 
     const int b = blockIdx.z / H;
     const int h = blockIdx.z % H;
@@ -227,8 +255,8 @@ gfx803_fused_attention_mw_kernel(
             if (v < KV_VEC) {
                 const int r = v / D4;
                 const int d4 = v - r * D4;
-                *reinterpret_cast<float4*>(&s_K[r * D + d4 * 4]) = AttnVec4<E>::wide(k_reg[u]);
-                *reinterpret_cast<float4*>(&s_V[r * D + d4 * 4]) = AttnVec4<E>::wide(v_reg[u]);
+                *reinterpret_cast<float4*>(&s_K[r * QS + d4 * 4]) = AttnVec4<E>::wide(k_reg[u]);
+                *reinterpret_cast<float4*>(&s_V[r * QS + d4 * 4]) = AttnVec4<E>::wide(v_reg[u]);
             }
         }
     };
@@ -271,7 +299,7 @@ gfx803_fused_attention_mw_kernel(
                 q[i] = *reinterpret_cast<const float4*>(&s_Qw[(tx + NG * i) * QS + d4 * 4]);
             #pragma unroll
             for (int j = 0; j < C; ++j)
-                k[j] = *reinterpret_cast<const float4*>(&s_K[(ty + NG * j) * D + d4 * 4]);
+                k[j] = *reinterpret_cast<const float4*>(&s_K[(ty + NG * j) * QS + d4 * 4]);
         };
         // Plain a * b + c, never fmaf(): gfx803 issues the fused v_fma_f32 at
         // a quarter of the rate of v_mac_f32 / v_mad_f32, which the compiler
@@ -319,9 +347,9 @@ gfx803_fused_attention_mw_kernel(
                 if (k0 + ty + NG * j >= M) S[i][j] = MASKED;
                 m_tile = fmaxf(m_tile, S[i][j]);
             }
-            m_tile = fmaxf(m_tile, lane_xor<NG>(m_tile, lane));
-            m_tile = fmaxf(m_tile, lane_xor<2 * NG>(m_tile, lane));
-            m_tile = fmaxf(m_tile, lane_xor<4 * NG>(m_tile, lane));
+            m_tile = fmaxf(m_tile, lane_xor2(m_tile));
+            m_tile = fmaxf(m_tile, lane_xor<4>(m_tile, lane));
+            m_tile = fmaxf(m_tile, lane_xor<8>(m_tile, lane));
 
             // Every tile holds at least one key < M, so m_new is finite and
             // exp2 of (MASKED - m_new) underflows to exactly 0 for masked keys
@@ -334,9 +362,9 @@ gfx803_fused_attention_mw_kernel(
                 S[i][j] = exp2f(S[i][j] - m_new);
                 p_sum += S[i][j];
             }
-            p_sum += lane_xor<NG>(p_sum, lane);
-            p_sum += lane_xor<2 * NG>(p_sum, lane);
-            p_sum += lane_xor<4 * NG>(p_sum, lane);
+            p_sum += lane_xor2(p_sum);
+            p_sum += lane_xor<4>(p_sum, lane);
+            p_sum += lane_xor<8>(p_sum, lane);
 
             l_run[i] = l_run[i] * alpha + p_sum;
             m_run[i] = m_new;
@@ -344,36 +372,46 @@ gfx803_fused_attention_mw_kernel(
             for (int k = 0; k < DS; ++k) acc[i][k] *= alpha;
         }
 
-        // P*V over all 32 keys.  Key g+8j lives in lane (tx, g) as S[i][j];
-        // keys are walked as n = 4g + j, so g and j are compile-time after
-        // unrolling and the bpermute source register is a fixed VGPR.  The
-        // P values and V slice of key n+1 are fetched while key n is consumed.
-        float pa[R], va[DS], pb[R], vb[DS];
-        auto load_pv = [&](int n, float (&p)[R], float (&v)[DS]) {
-            const int g = n >> 2;
-            const int j = n & 3;
-            #pragma unroll
-            for (int i = 0; i < R; ++i) p[i] = lane_read(S[i][j], (tx << 2) + (NG * 4) * g);
-            const float* v_row = &s_V[(g + NG * j) * D + ty * DS];
+        // P*V over all 32 keys, step n = 4s + j taking key ((ty+s)%8) + 8j
+        // (see the lane tiling above).  The V slice of step n+1 is fetched
+        // while step n is consumed.
+        float va[DS], vb[DS];
+        auto load_v = [&](int n, float (&v)[DS]) {
+            const float* v_row = &s_V[(((ty + (n >> 2)) & (NG - 1)) + NG * (n & 3)) * QS + ty * DS];
             #pragma unroll
             for (int k = 0; k < DS; ++k) v[k] = v_row[k];
         };
-        auto fma_pv = [&](const float (&p)[R], const float (&v)[DS]) {
-            #pragma unroll
-            for (int k = 0; k < DS; ++k)
+        auto pv_step = [&](auto s_tag) {
+            constexpr int ST = decltype(s_tag)::value;
+            auto fma_pv = [&](int j, const float (&v)[DS]) {
                 #pragma unroll
-                for (int i = 0; i < R; ++i) acc[i][k] += p[i] * v[k];
+                for (int k = 0; k < DS; ++k)
+                    #pragma unroll
+                    for (int i = 0; i < R; ++i) mac_row_rot2<ST>(acc[i][k], S[i][j], v[k]);
+            };
+            #pragma unroll
+            for (int j = 0; j < 4; j += 2) {
+                const int n = 4 * ST + j;
+                load_v(n + 1, vb);
+                SCHED_BARRIER();
+                fma_pv(j, va);
+                if (n + 2 < BC) load_v(n + 2, va);
+                SCHED_BARRIER();
+                fma_pv(j + 1, vb);
+            }
         };
-        load_pv(0, pa, va);
-        #pragma unroll
-        for (int n = 0; n < BC; n += 2) {
-            load_pv(n + 1, pb, vb);
-            SCHED_BARRIER();
-            fma_pv(pa, va);
-            if (n + 2 < BC) load_pv(n + 2, pa, va);
-            SCHED_BARRIER();
-            fma_pv(pb, vb);
-        }
+        load_v(0, va);
+        pv_step(std::integral_constant<int, 0>{});
+        // gfx8 needs two wait states between a VALU write of a VGPR and a DPP
+        // read of it, and the compiler does not see the DPP inside the asm.
+        asm volatile("s_nop 1");
+        pv_step(std::integral_constant<int, 1>{});
+        pv_step(std::integral_constant<int, 2>{});
+        pv_step(std::integral_constant<int, 3>{});
+        pv_step(std::integral_constant<int, 4>{});
+        pv_step(std::integral_constant<int, 5>{});
+        pv_step(std::integral_constant<int, 6>{});
+        pv_step(std::integral_constant<int, 7>{});
         __syncthreads();
         if (!PREFETCH && kt + 1 < num_tiles) load_tile(kt + 1);
     }
