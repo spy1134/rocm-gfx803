@@ -4,28 +4,27 @@
 //
 // Intercepted:
 //   rocblas_sgemm
-//   rocblas_gemm_ex                     (all-f32, or all-f16 with op(A)=N op(B)=T
-//                                        or with op(A)=T and n <= 8;
-//                                        standard algo, C == D)
+//   rocblas_gemm_ex                     (all-f32 or all-f16, standard algo, C == D)
 //   rocblas_sgemm_strided_batched       (torch.bmm / baddbmm -> attention)
 //   rocblas_gemm_strided_batched_ex     (all-f32 or all-f16, standard algo, C == D)
 // The strided-batched pair matters as much as the plain pair: attention runs
 // through it, and its backward pass is wrong on rocBLAS's own kernels.
 //
 // The two _ex entry points also take fp16 GEMMs (f16 A, B, C and D, fp32
-// compute), on the same kernels with fp16 storage. rocBLAS computes those
-// correctly on gfx803, but its fp16 kernels for op(A) = N with op(B) = T run
-// 15-25x slower than for the other three layouts: 20.3 ms against 1.1 ms for
-// 1280x4096x320, 510 ms against 23 ms for a 16-batch attention GEMM. That is
-// the layout of every 1x1 convolution's backward pass, of MIOpen's other
-// GEMM-based backward convolutions and of attention's backward; in fp16 SD1.5
-// LoRA training it doubled the step time. For single GEMMs only that layout
-// is taken over, since rocBLAS runs the other three 10-15% faster than these
-// kernels; strided-batched fp16 GEMMs are all taken over, since these kernels
-// are faster than rocBLAS's there in almost every layout and shape measured.
-// fp16 GEMMs with op(A) = T and at most 8 columns of C (nn.Linear in a
-// token-by-token decode loop) are taken over too: rocBLAS runs them 20-25x
-// slower than reading the weight takes, see gfx803_sgemm_small_n_kernel.
+// compute), on the same kernels with fp16 storage, in every layout. rocBLAS
+// computes those correctly on gfx803 but slowly: its fp16 kernels for
+// op(A) = N with op(B) = T run 15-25x slower than for the other three layouts
+// (20.3 ms against 1.1 ms for 1280x4096x320, 510 ms against 23 ms for a
+// 16-batch attention GEMM; the layout of every 1x1 convolution's backward
+// pass, of MIOpen's other GEMM-based backward convolutions and of attention's
+// backward, which doubled an fp16 SD1.5 LoRA training step), and the other
+// three layouts run 1.3-1.9x slower than the fp32 kernels here on SD1.5/SDXL's
+// linears (2560x8192x320: 3.0 against 4.1 TFLOPS; 1280x512x5120: 1.7 against
+// 3.2), because they widen fp16 to fp32 inside the inner loop and load
+// operands 2 bytes at a time (see gfx803_sgemm.h). fp16 GEMMs with op(A) = T
+// and at most 8 columns of C (nn.Linear in a token-by-token decode loop) run
+// on gfx803_sgemm_small_n_kernel: rocBLAS runs them 20-25x slower than
+// reading the weight takes.
 //
 // Everything else (other dtypes, pointer-array batched calls, explicit
 // solution_index requests, non-standard algo, device pointer mode, negative
@@ -257,8 +256,6 @@ extern "C" rocblas_status rocblas_gemm_ex(rocblas_handle handle,
     const char* why = nullptr;
     if (env_shim_disabled()) why = "passthrough (disabled)";
     else if (!all_f32 && !f16) why = "passthrough (not all-f32 or all-f16)";
-    else if (f16 && !gfx803_small_n_applies(n, is_trans(transA)) && (is_trans(transA) || !is_trans(transB)))
-        why = "passthrough (fp16, layout rocBLAS runs fast)";
     else if (algo != rocblas_gemm_algo_standard || solution_index != 0) why = "passthrough (explicit algo/solution)";
     // in-place C==D matches this kernel's beta-accumulate semantics
     else if (c != d || ldc != ldd) why = "passthrough (C != D)";

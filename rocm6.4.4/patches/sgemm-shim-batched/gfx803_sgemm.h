@@ -34,10 +34,20 @@
 //   gfx803_sgemm_tile_p<P>: a (16P)x(16P) tile of C, a PxP block of outputs
 //                           per thread; P = 2 and P = 4 are used.
 // gfx803_sgemm_tile_p_fast and gfx803_sgemm_tile_p2_fast are the same 64x64
-// and 32x32 tiles for fp32 with B not transposed, which is most of what
-// PyTorch issues; see the comment at gfx803_sgemm_tile_p_fast.
+// and 32x32 tiles with B not transposed, which is most of what PyTorch
+// issues; see the comment at gfx803_sgemm_tile_p_fast.
 // gfx803_sgemm_tile_g is the same tile again for the transposed layouts that
 // rocBLAS sees from nn.Linear and its weight gradients; see the comment there.
+// All of them take fp32 or fp16 operands (E below): fp16 values are widened to
+// fp32 right after the global load, so LDS, the multiply-adds and the sums are
+// the fp32 kernel's, and C is rounded to fp16 once. Polaris has no packed
+// fp16 arithmetic, so fp16 cannot be faster per multiply-add than fp32; what
+// the fp16 path gains is the kernel itself. rocBLAS's fp16 kernels for gfx803
+// keep fp16 in LDS and widen inside the inner loop (10 v_cvt_f32_f16 per 16
+// v_mac_f32 in its 128x32 tile) and load operands as 2-byte flat_load_ushort,
+// which is why they run SD1.5/SDXL's linears 1.3-1.9x slower than the fp32
+// kernels here (2560x8192x320: 3.0 against 4.1 TFLOPS). Widening 16 values per
+// 512 multiply-adds at the LDS store costs about 3%.
 // gfx803_sgemm_small_n_kernel takes GEMMs with at most 8 columns of C and
 // op(A) = T, a token-by-token decode step's nn.Linear, as a GEMV; it sums in
 // a different order than the tiles (see the comment there).
@@ -73,7 +83,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
-#include <type_traits>
 
 #define GFX803_SGEMM_TILE 16
 #define GFX803_SGEMM_MAX_GRID_YZ 65535
@@ -170,6 +179,31 @@ template <> struct gfx803_vec<4> {
     typedef float4 type;
     static __device__ __forceinline__ void unpack(type v, float* o) {
         o[0] = v.x; o[1] = v.y; o[2] = v.z; o[3] = v.w;
+    }
+};
+
+// Four or two consecutive operand values as one global load, widened to fp32.
+// For fp16 that is one 8- or 4-byte load (flat_load_dwordx2/dword) and one
+// v_cvt_f32_f16 per value, two of them SDWA on the high halves. gfx8 runs with
+// SH_MEM_CONFIG in unaligned mode under amdkfd, and the compiler emits the
+// same single load for a 2-byte-aligned address, so an odd K, leading
+// dimension or offset needs no scalar path; edge tiles use the guarded scalar
+// loads in the callers.
+template <typename E> struct gfx803_ld;
+template <> struct gfx803_ld<float> {
+    static __device__ __forceinline__ void v4(const float* p, float4& o) { o = *reinterpret_cast<const float4*>(p); }
+    static __device__ __forceinline__ void v2(const float* p, float2& o) { o = *reinterpret_cast<const float2*>(p); }
+};
+template <> struct gfx803_ld<_Float16> {
+    typedef _Float16 h4 __attribute__((ext_vector_type(4)));
+    typedef _Float16 h2 __attribute__((ext_vector_type(2)));
+    static __device__ __forceinline__ void v4(const _Float16* p, float4& o) {
+        h4 v = *reinterpret_cast<const h4*>(p);
+        o = make_float4(v.x, v.y, v.z, v.w);
+    }
+    static __device__ __forceinline__ void v2(const _Float16* p, float2& o) {
+        h2 v = *reinterpret_cast<const h2*>(p);
+        o = make_float2(v.x, v.y);
     }
 };
 
@@ -351,9 +385,8 @@ gfx803_sgemm_p_strided_batched_kernel(int M, int N, int K,
 // dimension when B is not transposed; with B transposed that dimension is N
 // and the same mapping would stride every lane by ldb, so transposed-B calls
 // keep gfx803_sgemm_tile_p. TransA is a template parameter so the fetch has
-// no runtime branch on layout. The float4 path needs no alignment: gfx8 runs
-// in unaligned mode under amdkfd, and edge tiles fall back to guarded scalar
-// loads.
+// no runtime branch on layout. The wide loads need no alignment (see
+// gfx803_ld), and edge tiles fall back to guarded scalar loads.
 template <int P, bool TransA, typename E>
 __device__ __forceinline__ void gfx803_sgemm_tile_p_fast(int M, int N, int K,
                                                           float alpha,
@@ -392,7 +425,7 @@ __device__ __forceinline__ void gfx803_sgemm_tile_p_fast(int M, int N, int K,
         int gk_a = k0 + k_a;
         if constexpr (!TransA) {
             if (gr_a + 3 < M && gk_a < K) {
-                pa_vec = *reinterpret_cast<const float4*>(&A[(size_t)gk_a * lda + gr_a]);
+                gfx803_ld<E>::v4(&A[(size_t)gk_a * lda + gr_a], pa_vec);
             } else {
                 pa_vec = make_float4(
                     (gr_a + 0 < M && gk_a < K) ? static_cast<float>(A[(size_t)gk_a * lda + gr_a + 0]) : 0.0f,
@@ -403,7 +436,7 @@ __device__ __forceinline__ void gfx803_sgemm_tile_p_fast(int M, int N, int K,
             }
         } else {
             if (gr_a < M && gk_a + 3 < K) {
-                pa_vec = *reinterpret_cast<const float4*>(&A[(size_t)gr_a * lda + gk_a]);
+                gfx803_ld<E>::v4(&A[(size_t)gr_a * lda + gk_a], pa_vec);
             } else {
                 pa_vec = make_float4(
                     (gr_a < M && gk_a + 0 < K) ? static_cast<float>(A[(size_t)gr_a * lda + gk_a + 0]) : 0.0f,
@@ -517,7 +550,7 @@ __device__ __forceinline__ void gfx803_sgemm_tile_p2_fast(int M, int N, int K,
         int gk_a = k0 + k_a;
         if constexpr (!TransA) {
             if (gr_a + 1 < M && gk_a < K) {
-                pa = *reinterpret_cast<const float2*>(&A[(size_t)gk_a * lda + gr_a]);
+                gfx803_ld<E>::v2(&A[(size_t)gk_a * lda + gr_a], pa);
             } else {
                 pa = make_float2(
                     (gr_a + 0 < M && gk_a < K) ? static_cast<float>(A[(size_t)gk_a * lda + gr_a + 0]) : 0.0f,
@@ -533,7 +566,7 @@ __device__ __forceinline__ void gfx803_sgemm_tile_p2_fast(int M, int N, int K,
 
         int gk_b = k0 + k_b;
         if (gc_b < N && gk_b + 1 < K) {
-            pb = *reinterpret_cast<const float2*>(&B[(size_t)gc_b * ldb + gk_b]);
+            gfx803_ld<E>::v2(&B[(size_t)gc_b * ldb + gk_b], pb);
         } else {
             pb = make_float2(
                 (gc_b < N && gk_b + 0 < K) ? static_cast<float>(B[(size_t)gc_b * ldb + gk_b + 0]) : 0.0f,
@@ -659,10 +692,11 @@ gfx803_sgemm_p2_strided_batched_fast_kernel(int M, int N, int K,
 // M or N index and a thread moves four rows with one float4 load and one LDS
 // write. A K-contiguous operand is read either as float4 runs along K, with
 // consecutive lanes on consecutive addresses of one row (Scalar = false), or
-// as single floats with 16 lanes along K (Scalar = true); which is faster
+// as single values with 16 lanes along K (Scalar = true); which is faster
 // depends on the shape, see gfx803_sgemm_tile_g. Edge slices fall back to
-// guarded scalar loads.
-template <int TT, int KT, bool KC, bool Scalar>
+// guarded scalar loads. E is the storage type (float or _Float16); the LDS
+// slice is fp32 either way.
+template <int TT, int KT, bool KC, bool Scalar, typename E>
 struct gfx803_stage {
     static constexpr int NV = TT * KT / 4 / 256;
     static constexpr int NS = TT * KT / 256;
@@ -671,34 +705,35 @@ struct gfx803_stage {
     float4 v[NV];
     float s[NS];
 
-    __device__ __forceinline__ void fetch(const float* __restrict__ X, int ld, int rows, int K,
+    __device__ __forceinline__ void fetch(const E* __restrict__ X, int ld, int rows, int K,
                                           int idx0, int k0, int tid) {
+        auto at = [](const E* p, bool ok) { return ok ? static_cast<float>(*p) : 0.0f; };
         if constexpr (KC && Scalar) {
             #pragma unroll
             for (int i = 0; i < NS; i++) {
                 int lin = tid + 256 * i;
                 int gr = idx0 + lin / KT, gk = k0 + lin % KT;
-                s[i] = (gr < rows && gk < K) ? X[(size_t)gr * ld + gk] : 0.0f;
+                s[i] = at(X + (size_t)gr * ld + gk, gr < rows && gk < K);
             }
         } else if constexpr (KC) {
             #pragma unroll
             for (int i = 0; i < NV; i++) {
                 int lin = tid + 256 * i;
                 int gr = idx0 + lin / KQ, gk = k0 + (lin % KQ) * 4;
-                const float* p = X + (size_t)gr * ld + gk;
-                if (gr < rows && gk + 3 < K) v[i] = *reinterpret_cast<const float4*>(p);
-                else v[i] = make_float4(gr < rows && gk + 0 < K ? p[0] : 0.0f, gr < rows && gk + 1 < K ? p[1] : 0.0f,
-                                        gr < rows && gk + 2 < K ? p[2] : 0.0f, gr < rows && gk + 3 < K ? p[3] : 0.0f);
+                const E* p = X + (size_t)gr * ld + gk;
+                if (gr < rows && gk + 3 < K) gfx803_ld<E>::v4(p, v[i]);
+                else v[i] = make_float4(at(p + 0, gr < rows && gk + 0 < K), at(p + 1, gr < rows && gk + 1 < K),
+                                        at(p + 2, gr < rows && gk + 2 < K), at(p + 3, gr < rows && gk + 3 < K));
             }
         } else {
             #pragma unroll
             for (int i = 0; i < NV; i++) {
                 int lin = tid + 256 * i;
                 int gr = idx0 + (lin % (TT / 4)) * 4, gk = k0 + lin / (TT / 4);
-                const float* p = X + (size_t)gk * ld + gr;
-                if (gr + 3 < rows && gk < K) v[i] = *reinterpret_cast<const float4*>(p);
-                else v[i] = make_float4(gr + 0 < rows && gk < K ? p[0] : 0.0f, gr + 1 < rows && gk < K ? p[1] : 0.0f,
-                                        gr + 2 < rows && gk < K ? p[2] : 0.0f, gr + 3 < rows && gk < K ? p[3] : 0.0f);
+                const E* p = X + (size_t)gk * ld + gr;
+                if (gr + 3 < rows && gk < K) gfx803_ld<E>::v4(p, v[i]);
+                else v[i] = make_float4(at(p + 0, gr + 0 < rows && gk < K), at(p + 1, gr + 1 < rows && gk < K),
+                                        at(p + 2, gr + 2 < rows && gk < K), at(p + 3, gr + 3 < rows && gk < K));
             }
         }
     }
@@ -730,7 +765,7 @@ struct gfx803_stage {
     }
 };
 
-// gfx803_sgemm_tile_p_fast for the transposed layouts, fp32. nn.Linear reaches
+// gfx803_sgemm_tile_p_fast for the transposed layouts. nn.Linear reaches
 // rocBLAS as op(A) = T, op(B) = N (40% of an SD1.5 step's GEMM FLOPs) and its
 // weight gradient as op(A) = N, op(B) = T; gfx803_sgemm_tile_p_fast stages a
 // transposed B with every lane strided by ldb, and its transposed-A fetch
@@ -751,11 +786,11 @@ struct gfx803_stage {
 // Every output still accumulates its products one at a time in increasing k,
 // so the result is bit-identical to the other tiles. See gfx803_sgemm_g_launch
 // for the shapes that keep the older kernels.
-template <int P, int KT, bool TransA, bool TransB, bool ScalarB>
+template <int P, int KT, bool TransA, bool TransB, bool ScalarB, typename E>
 __device__ __forceinline__ void gfx803_sgemm_tile_g(int GW, int M, int N, int K, float alpha,
-                                                    const float* __restrict__ A, int lda,
-                                                    const float* __restrict__ B, int ldb,
-                                                    float beta, float* __restrict__ C, int ldc) {
+                                                    const E* __restrict__ A, int lda,
+                                                    const E* __restrict__ B, int ldb,
+                                                    float beta, E* __restrict__ C, int ldc) {
     constexpr int T = 16 * P;
     typedef typename gfx803_vec<P>::type vec;
     __shared__ float As[KT][T + 4];
@@ -767,8 +802,8 @@ __device__ __forceinline__ void gfx803_sgemm_tile_g(int GW, int M, int N, int K,
     const int gw = gy - first < GW ? gy - first : GW, loc = blockIdx.x - grp * per;
     const int row0 = (loc / gw) * T, col0 = (first + loc % gw) * T;
 
-    gfx803_stage<T, KT, TransA, false> sa;
-    gfx803_stage<T, KT, !TransB, ScalarB> sb;
+    gfx803_stage<T, KT, TransA, false, E> sa;
+    gfx803_stage<T, KT, !TransB, ScalarB, E> sb;
 
     float acc[P][P];
     #pragma unroll
@@ -814,21 +849,21 @@ __device__ __forceinline__ void gfx803_sgemm_tile_g(int GW, int M, int N, int K,
             int row = row0 + tx * P + i;
             if (row < M && col < N) {
                 size_t idx = (size_t)col * ldc + row;
-                C[idx] = alpha * acc[i][j] + (beta != 0.0f ? beta * C[idx] : 0.0f);
+                C[idx] = static_cast<E>(alpha * acc[i][j] + (beta != 0.0f ? beta * static_cast<float>(C[idx]) : 0.0f));
             }
         }
     }
 }
 
-template <int P, int KT, bool TransA, bool TransB, bool ScalarB>
+template <int P, int KT, bool TransA, bool TransB, bool ScalarB, typename E>
 __global__ void __launch_bounds__(256)
 gfx803_sgemm_g_kernel(int GW, int M, int N, int K, float alpha,
-                      const float* __restrict__ A, int lda, int64_t strideA,
-                      const float* __restrict__ B, int ldb, int64_t strideB,
-                      float beta, float* __restrict__ C, int ldc, int64_t strideC) {
+                      const E* __restrict__ A, int lda, int64_t strideA,
+                      const E* __restrict__ B, int ldb, int64_t strideB,
+                      float beta, E* __restrict__ C, int ldc, int64_t strideC) {
     const int64_t b = (int64_t)blockIdx.z;
-    gfx803_sgemm_tile_g<P, KT, TransA, TransB, ScalarB>(GW, M, N, K, alpha, A + b * strideA, lda,
-                                                        B + b * strideB, ldb, beta, C + b * strideC, ldc);
+    gfx803_sgemm_tile_g<P, KT, TransA, TransB, ScalarB, E>(GW, M, N, K, alpha, A + b * strideA, lda,
+                                                           B + b * strideB, ldb, beta, C + b * strideC, ldc);
 }
 
 // Launches gfx803_sgemm_tile_g where it measured faster; returns false to
@@ -851,20 +886,24 @@ gfx803_sgemm_g_kernel(int GW, int M, int N, int K, float alpha,
 // Rows padded off that alignment, as llama.cpp's prompt GEMMs on gfx803 are
 // (K + 16 floats), measured best with float4 B in row-tile order
 // (8192x2048x2048: 2.1 -> 3.9; 4096x512x14336: 3.7 -> 3.9).
+// The thresholds are in bytes, so for fp16 operands they fall at twice the
+// element counts (an ld of 4096 halves camps; rows align at 128 halves); they
+// were measured with fp32 operands.
+template <typename E>
 inline bool gfx803_sgemm_g_launch(int tile, dim3 grid, hipStream_t stream, int M, int N, int K, float alpha,
-                                  const float* A, int lda, int64_t strideA, bool transA,
-                                  const float* B, int ldb, int64_t strideB, bool transB,
-                                  float beta, float* C, int ldc, int64_t strideC) {
-    auto camps = [](int ld) { return ((size_t)ld * sizeof(float)) % 8192 == 0; };
-    const bool a_big = (size_t)M * K * sizeof(float) > (2u << 20);
+                                  const E* A, int lda, int64_t strideA, bool transA,
+                                  const E* B, int ldb, int64_t strideB, bool transB,
+                                  float beta, E* C, int ldc, int64_t strideC) {
+    auto camps = [](int ld) { return ((size_t)ld * sizeof(E)) % 8192 == 0; };
+    const bool a_big = (size_t)M * K * sizeof(E) > (2u << 20);
     if (transB ? (camps(lda) && camps(ldb)) : (!transA || K <= 64 || !a_big || camps(lda) || camps(ldb)))
         return false;
     if (tile == 16 || (tile == 32 && !transB)) return false;
     const dim3 g1(grid.x * grid.y, 1, grid.z), block(GFX803_SGEMM_TILE, GFX803_SGEMM_TILE);
-    const bool b_rows_aligned = transB || ((size_t)ldb * sizeof(float)) % 256 == 0;
+    const bool b_rows_aligned = transB || ((size_t)ldb * sizeof(E)) % 256 == 0;
     const int gw = transA && a_big && b_rows_aligned ? 8 : 1;
 #define GFX803_G(P, TA, TB, SB) \
-    hipLaunchKernelGGL((gfx803_sgemm_g_kernel<P, 32, TA, TB, SB>), g1, block, 0, stream, gw, M, N, K, alpha, \
+    hipLaunchKernelGGL((gfx803_sgemm_g_kernel<P, 32, TA, TB, SB, E>), g1, block, 0, stream, gw, M, N, K, alpha, \
                        A, lda, strideA, B, ldb, strideB, beta, C, ldc, strideC)
     if (tile == 32) {
         if (transA) GFX803_G(2, true, true, false); else GFX803_G(2, false, true, false);
@@ -1137,43 +1176,42 @@ inline hipError_t gfx803_gemm_strided_batched(int M, int N, int K,
             const T* As = A + (int64_t)start * strideA;
             const T* Bs = Bc + (int64_t)start * strideB;
             T* Cs = Cc + (int64_t)start * strideC;
-            if (std::is_same_v<T, float> &&
-                gfx803_sgemm_g_launch(tile, grid, stream, M, cols, K, alpha, (const float*)As, lda, strideA, transA,
-                                      (const float*)Bs, ldb, strideB, transB, beta, (float*)Cs, ldc, strideC)) {
-            } else if (!transB && tile == 64 && std::is_same_v<T, float>) {
+            if (gfx803_sgemm_g_launch<T>(tile, grid, stream, M, cols, K, alpha, As, lda, strideA, transA,
+                                         Bs, ldb, strideB, transB, beta, Cs, ldc, strideC)) {
+            } else if (!transB && tile == 64) {
                 if (batch_count == 1) {
                     if (!transA) {
-                        hipLaunchKernelGGL((gfx803_sgemm_p_fast_kernel<4, false, float>), grid, block, 0, stream,
-                                           M, cols, K, alpha, (const float*)As, lda, (const float*)Bs, ldb, beta, (float*)Cs, ldc);
+                        hipLaunchKernelGGL((gfx803_sgemm_p_fast_kernel<4, false, T>), grid, block, 0, stream,
+                                           M, cols, K, alpha, As, lda, Bs, ldb, beta, Cs, ldc);
                     } else {
-                        hipLaunchKernelGGL((gfx803_sgemm_p_fast_kernel<4, true, float>), grid, block, 0, stream,
-                                           M, cols, K, alpha, (const float*)As, lda, (const float*)Bs, ldb, beta, (float*)Cs, ldc);
+                        hipLaunchKernelGGL((gfx803_sgemm_p_fast_kernel<4, true, T>), grid, block, 0, stream,
+                                           M, cols, K, alpha, As, lda, Bs, ldb, beta, Cs, ldc);
                     }
                 } else {
                     if (!transA) {
-                        hipLaunchKernelGGL((gfx803_sgemm_p_strided_batched_fast_kernel<4, false, float>), grid, block, 0, stream,
-                                           M, cols, K, alpha, (const float*)As, lda, strideA, (const float*)Bs, ldb, strideB, beta, (float*)Cs, ldc, strideC);
+                        hipLaunchKernelGGL((gfx803_sgemm_p_strided_batched_fast_kernel<4, false, T>), grid, block, 0, stream,
+                                           M, cols, K, alpha, As, lda, strideA, Bs, ldb, strideB, beta, Cs, ldc, strideC);
                     } else {
-                        hipLaunchKernelGGL((gfx803_sgemm_p_strided_batched_fast_kernel<4, true, float>), grid, block, 0, stream,
-                                           M, cols, K, alpha, (const float*)As, lda, strideA, (const float*)Bs, ldb, strideB, beta, (float*)Cs, ldc, strideC);
+                        hipLaunchKernelGGL((gfx803_sgemm_p_strided_batched_fast_kernel<4, true, T>), grid, block, 0, stream,
+                                           M, cols, K, alpha, As, lda, strideA, Bs, ldb, strideB, beta, Cs, ldc, strideC);
                     }
                 }
-            } else if (!transB && tile == 32 && std::is_same_v<T, float>) {
+            } else if (!transB && tile == 32) {
                 if (batch_count == 1) {
                     if (!transA) {
-                        hipLaunchKernelGGL((gfx803_sgemm_p2_fast_kernel<false, float>), grid, block, 0, stream,
-                                           M, cols, K, alpha, (const float*)As, lda, (const float*)Bs, ldb, beta, (float*)Cs, ldc);
+                        hipLaunchKernelGGL((gfx803_sgemm_p2_fast_kernel<false, T>), grid, block, 0, stream,
+                                           M, cols, K, alpha, As, lda, Bs, ldb, beta, Cs, ldc);
                     } else {
-                        hipLaunchKernelGGL((gfx803_sgemm_p2_fast_kernel<true, float>), grid, block, 0, stream,
-                                           M, cols, K, alpha, (const float*)As, lda, (const float*)Bs, ldb, beta, (float*)Cs, ldc);
+                        hipLaunchKernelGGL((gfx803_sgemm_p2_fast_kernel<true, T>), grid, block, 0, stream,
+                                           M, cols, K, alpha, As, lda, Bs, ldb, beta, Cs, ldc);
                     }
                 } else {
                     if (!transA) {
-                        hipLaunchKernelGGL((gfx803_sgemm_p2_strided_batched_fast_kernel<false, float>), grid, block, 0, stream,
-                                           M, cols, K, alpha, (const float*)As, lda, strideA, (const float*)Bs, ldb, strideB, beta, (float*)Cs, ldc, strideC);
+                        hipLaunchKernelGGL((gfx803_sgemm_p2_strided_batched_fast_kernel<false, T>), grid, block, 0, stream,
+                                           M, cols, K, alpha, As, lda, strideA, Bs, ldb, strideB, beta, Cs, ldc, strideC);
                     } else {
-                        hipLaunchKernelGGL((gfx803_sgemm_p2_strided_batched_fast_kernel<true, float>), grid, block, 0, stream,
-                                           M, cols, K, alpha, (const float*)As, lda, strideA, (const float*)Bs, ldb, strideB, beta, (float*)Cs, ldc, strideC);
+                        hipLaunchKernelGGL((gfx803_sgemm_p2_strided_batched_fast_kernel<true, T>), grid, block, 0, stream,
+                                           M, cols, K, alpha, As, lda, strideA, Bs, ldb, strideB, beta, Cs, ldc, strideC);
                     }
                 }
             } else {

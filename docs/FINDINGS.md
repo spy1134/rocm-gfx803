@@ -83,6 +83,7 @@ run with wrong numbers, not a crash. "It runs" was never taken as evidence.
 | BatchNorm training wrong when H*W is not a multiple of 4 (generic MIOpen bug) | Fixed | 2 | `patches/miopen/bn-spatial-variant1-unaligned-hw.patch` |
 | fp16 3x3 convolutions slow (GEMM only) | Fixed (same solver, fp16) | 8 | same |
 | rocBLAS fp16 N/T GEMMs 15-25x slow | Fixed (shim fp16 route) | 8 | `patches/sgemm-shim-batched/` |
+| rocBLAS fp16 GEMMs in the other layouts 1.3-1.9x slower than the fp32 shim at equal arithmetic | Fixed (fp16 operands on the shim's fast tiles); fp16 SD1.5 UNet step 602 -> 483 ms | 8 | same |
 | bf16 reported as supported (no bf16 hardware) | Checked: correct; convs 1.7x slower than fp16 | 8 | none needed |
 | PyTorch int8 matmul fails on every call | Fixed (port of upstream's fix) | 5 | `patches/pytorch/` |
 | PyTorch layer_norm wrong (warp-size mismatch) | Fixed | 5 | `patches/pytorch/` |
