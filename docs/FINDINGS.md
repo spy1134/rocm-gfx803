@@ -631,10 +631,10 @@ GroupNorm and GEGLU within 1e-5, over odd shapes, 2-D/3-D and non-contiguous
 inputs). A full ComfyUI SD 1.5 fp32 txt2img, 512 px and 20 steps, sent 400
 attention, 320 GEGLU and 1220 GroupNorm calls through the node, and its image
 differs from a CPU run's by at most 1/255 (mean 0.001/255). The same
-workflow at fp16 takes 10.0 s per warm image with the node and 11.5 s
+workflow at fp16 takes 8.5 s per warm image with the node and 10.5 s
 without it. With the node, a 512 px fp16
-denoising step (ComfyUI's default precision on this card) takes 393 ms
-instead of 460, and its attention 92 ms instead of 161. The kernel reads the
+denoising step (ComfyUI's default precision on this card) takes 360 ms
+instead of 395, and its attention 91 ms instead of 129. The kernel reads the
 fp16 projections in ComfyUI's [b, tokens, heads*D] layout and writes its
 output there, with no transposed or fp32 copies around the call. Per call, with
 classifier-free guidance (batch 2, 8 heads): self-attention at 64x64 14.3 ms
@@ -716,6 +716,17 @@ SDXL UNets in fp16 match fp32 to about 1e-3.
   projections, 1280x512x5120: 2.1 -> 3.5 TFLOPS) and the 64x64 tile for
   M = 32 (the Winograd GEMMs at the smallest latent: 0.86 -> 0.63 ms). The
   outputs are bit-identical; the fp16 step goes from 415 to 399 ms. `tools/unet_breakdown.py` prints the split by operation.
+- An fp16 operand widened right after its global load makes the compiler wait
+  for that load inside the fetch, one load at a time, so each K slice of the
+  fp16 tiles paid four or five memory round trips that nothing overlapped.
+  The shim keeps the fetched values fp16 until the next slice's LDS store, and
+  a one-wavefront 64x64 tile (an 8x8 block per thread, no barriers) takes the
+  fp16 strided-batched NN calls with batch >= 8 and M >= 512. Outputs are
+  bit-identical on 478 cases. fp16 GEMM time over the SD call logs drops 12%
+  (SDXL 2426 -> 2120 ms); the fp16 UNet step goes from 392 to 360 ms at
+  SD 1.5 and from 3.34 to 2.98 s at SDXL. The same tile on single GEMMs runs
+  up to 3.3x slower (nothing in its workgroup hides its loads), and at fp32 it
+  is erratic, so it takes only those batched fp16 calls.
 
 **Training.** SD1.5 LoRA, 512 px, 20 steps: fp32 4.10 s/step at a 7.6 GB card
 peak; fp16 4.40 s/step at 5.9 GB, same loss. fp16 is no faster (gfx803 runs

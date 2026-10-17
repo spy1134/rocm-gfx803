@@ -39,7 +39,7 @@ architecture:
   the GEMM path for most SD 1.5 convolutions, in fp32 and fp16.
 - **Attention.** An optional ComfyUI node fuses attention, GroupNorm and GEGLU,
   avoids a 2.3 GB score matrix, and takes a 512 px fp16 denoising step from
-  460 to 393 ms (attention 161 -> 92 ms; SDXL self-attention 2.9x faster).
+  395 to 360 ms (attention 129 -> 91 ms; SDXL self-attention 2.9x faster).
 - **Language models.** Prompt processing uses fp32 GEMMs on the shim instead of
   emulated int8 dot products, and generation kernels were rewritten to avoid
   register spills. MoE prompts prefetch experts over the card's DMA engines

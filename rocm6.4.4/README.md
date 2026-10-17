@@ -248,7 +248,7 @@ docker build --build-context tools=../tools -t rocm-gfx803-comfyui:latest -f Doc
 
 Optional: `../tools/ComfyUI-gfx803-attention/install.sh` adds a custom node
 with gfx803 kernels for attention, GroupNorm and GEGLU, which makes an SD 1.5
-fp16 step about 15% faster (460 -> 393 ms at 512 px) and avoids the 2.3 GB score matrix PyTorch's attention
+fp16 step about 9% faster (395 -> 360 ms at 512 px) and avoids the 2.3 GB score matrix PyTorch's attention
 allocates. It compiles the kernels with the
 base image's `hipcc` when the host has none and copies the node into
 `ComfyUI/custom_nodes/`; restart ComfyUI afterwards. The node acts only on
