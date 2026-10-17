@@ -888,7 +888,10 @@ gfx803_sgemm_g_kernel(int GW, int M, int N, int K, float alpha,
 // (8192x2048x2048: 2.1 -> 3.9; 4096x512x14336: 3.7 -> 3.9).
 // The thresholds are in bytes, so for fp16 operands they fall at twice the
 // element counts (an ld of 4096 halves camps; rows align at 128 halves); they
-// were measured with fp32 operands.
+// were measured with fp32 operands. Single-float B is fp32-only: at fp16 each
+// lane loads 2 bytes, and float4 B with grouped tiles measured faster at every
+// fp16 shape where the choice applies (1280x512x5120: 2.1 -> 3.5 TFLOPS;
+// 640x2048x2560: 2.8 -> 4.3, SD1.5's feed-forward output projections).
 template <typename E>
 inline bool gfx803_sgemm_g_launch(int tile, dim3 grid, hipStream_t stream, int M, int N, int K, float alpha,
                                   const E* A, int lda, int64_t strideA, bool transA,
@@ -909,7 +912,7 @@ inline bool gfx803_sgemm_g_launch(int tile, dim3 grid, hipStream_t stream, int M
         if (transA) GFX803_G(2, true, true, false); else GFX803_G(2, false, true, false);
     } else if (transB) {
         if (transA) GFX803_G(4, true, true, false); else GFX803_G(4, false, true, false);
-    } else if (K >= 2048 && b_rows_aligned) {
+    } else if (K >= 2048 && b_rows_aligned && sizeof(E) == sizeof(float)) {
         GFX803_G(4, true, false, true);
     } else {
         GFX803_G(4, true, false, false);
@@ -1107,9 +1110,13 @@ inline void gfx803_small_n_dispatch(int N, unsigned batch, hipStream_t stream, i
 //   - An M or N of 16 or less leaves most of a 64-wide tile idle (m=8
 //     n=4096 k=320: 80 us on 64x64, 59 us on 32x32); 40 still fills enough
 //     of it to win (attention context, m=40: 8.7 vs 9.2 ms).
+//   - With fp16 operands an M of 32 already loses on the 64x64 tile: the
+//     Winograd solver's GEMMs at SD1.5's smallest latent (16 x 32x1280x1280:
+//     0.86 vs 0.63 ms; k=2560: 2.33 vs 1.46 ms). With fp32 operands, and at
+//     M = 48 in either type, the 64x64 tile stays faster.
 // GFX803_SGEMM_MIN_TILES64 and GFX803_SGEMM_MIN_TILES32 override the tile-
 // count thresholds for benchmarking (0 = always, -1 = never use that tile).
-inline int gfx803_sgemm_pick_tile(int M, int N, int K, int batch) {
+inline int gfx803_sgemm_pick_tile(int M, int N, int K, int batch, bool half = false) {
     static const long cus = [] {
         int dev = 0, n = 0;
         if (hipGetDevice(&dev) != hipSuccess ||
@@ -1124,9 +1131,39 @@ inline int gfx803_sgemm_pick_tile(int M, int N, int K, int batch) {
     auto tiles = [&](int t) {
         return (long)((M + t - 1) / t) * ((N + t - 1) / t) * batch;
     };
-    if (min64 >= 0 && ((K > 32 && M > 16 && N > 16) || min64_forced) && tiles(64) >= min64) return 64;
+    const int min_m64 = half ? 32 : 16;
+    if (min64 >= 0 && ((K > 32 && M > min_m64 && N > 16) || min64_forced) && tiles(64) >= min64) return 64;
     if (min32 >= 0 && tiles(32) >= min32) return 32;
     return GFX803_SGEMM_TILE;
+}
+
+// C = beta * C, without reading A or B: what BLAS defines for alpha == 0 or
+// K == 0. Running the GEMM kernels instead would compute 0 * (A * B), which
+// turns an Inf or NaN anywhere in A or B into NaN in C. beta == 0 writes zeros
+// without reading C, as the GEMM kernels do.
+template <typename T>
+__global__ void gfx803_scale_c_kernel(int M, int N, int batch, float beta,
+                                      T* __restrict__ C, int ldc, int64_t strideC) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= M) return;
+    for (int b = blockIdx.z; b < batch; b += gridDim.z) {
+        for (int j = blockIdx.y; j < N; j += gridDim.y) {
+            T* c = C + (int64_t)b * strideC + (int64_t)j * ldc + i;
+            *c = static_cast<T>(beta != 0.0f ? beta * static_cast<float>(*c) : 0.0f);
+        }
+    }
+}
+
+template <typename T>
+inline hipError_t gfx803_scale_c(int M, int N, float beta, T* C, int ldc, int64_t strideC,
+                                 int batch_count, hipStream_t stream) {
+    if (beta == 1.0f) return hipSuccess;
+    (void)hipGetLastError();
+    const unsigned gy = (unsigned)(N < GFX803_SGEMM_MAX_GRID_YZ ? N : GFX803_SGEMM_MAX_GRID_YZ);
+    const unsigned gz = (unsigned)(batch_count < GFX803_SGEMM_MAX_GRID_YZ ? batch_count : GFX803_SGEMM_MAX_GRID_YZ);
+    hipLaunchKernelGGL(gfx803_scale_c_kernel<T>, dim3((unsigned)((M + 255) / 256), gy, gz), dim3(256), 0, stream,
+                       M, N, batch_count, beta, C, ldc, strideC);
+    return hipGetLastError();
 }
 
 // Batch is split into launches of at most GFX803_SGEMM_MAX_GRID_YZ matrices
@@ -1144,6 +1181,7 @@ inline hipError_t gfx803_gemm_strided_batched(int M, int N, int K,
                                               T* C, int ldc, int64_t strideC,
                                               int batch_count,
                                               hipStream_t stream = 0) {
+    if (alpha == 0.0f || K == 0) return gfx803_scale_c<T>(M, N, beta, C, ldc, strideC, batch_count, stream);
     if (gfx803_small_n_applies(N, transA)) {
         (void)hipGetLastError();
         for (int start = 0; start < batch_count; start += GFX803_SGEMM_MAX_GRID_YZ) {
@@ -1158,7 +1196,7 @@ inline hipError_t gfx803_gemm_strided_batched(int M, int N, int K,
         }
         return hipSuccess;
     }
-    const int tile = gfx803_sgemm_pick_tile(M, N, K, batch_count);
+    const int tile = gfx803_sgemm_pick_tile(M, N, K, batch_count, sizeof(T) == 2);
     const unsigned grid_x = (unsigned)((M + tile - 1) / tile);
     const int max_cols = GFX803_SGEMM_MAX_GRID_YZ * tile;
 
@@ -1254,9 +1292,8 @@ inline hipError_t gfx803_sgemm_strided_batched(int M, int N, int K,
 // runs on these kernels. Handing a wide GEMM to rocBLAS instead would compute
 // it on the Tensile kernels this shim exists to avoid; a 4x3 @ 3x4.9M filter
 // transform is one such shape. Any error left pending by earlier unrelated
-// work is cleared first, so a stale error can't be mistaken for a failure of
-// this launch (the shim would otherwise fall back to rocBLAS AFTER this
-// kernel already ran, applying the GEMM twice when beta != 0).
+// work is cleared first, so a stale error can't be reported as a failure of
+// this launch.
 inline hipError_t gfx803_sgemm(int M, int N, int K,
                                float alpha,
                                const float* A, int lda, bool transA,

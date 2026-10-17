@@ -31,7 +31,8 @@
 // sizes or leading dimensions too small for the operand) falls through
 // untouched to the real rocBLAS symbol via dlsym(RTLD_NEXT, ...), so rocBLAS
 // returns its own result or error status for those. m == 0, n == 0 or
-// batch_count == 0 return success without launching. Conjugate-transpose is
+// batch_count == 0 return success without launching; alpha == 0 or k == 0
+// scale C by beta without reading A or B. Conjugate-transpose is
 // treated as transpose, which is identical for real data.
 //
 // The interception is blanket, not limited to shapes proven bad. Selecting
@@ -176,6 +177,15 @@ static void log_call(const char* fn, const char* decision,
     }
 }
 
+// A failed launch is reported, not retried on rocBLAS: the shim launches C in
+// column and batch chunks, so earlier chunks may already hold the result, and
+// rerunning the whole GEMM would apply them twice when beta != 0, on Tensile
+// kernels that compute wrong results on gfx803 to begin with.
+static rocblas_status launch_failed(const char* fn, hipError_t err) {
+    fprintf(stderr, "gfx803_sgemm_shim: %s kernel launch failed (%s)\n", fn, hipGetErrorString(err));
+    return rocblas_status_internal_error;
+}
+
 // conjugate-transpose is plain transpose for real data
 static bool is_trans(rocblas_operation op) {
     return op != rocblas_operation_none;
@@ -227,11 +237,7 @@ extern "C" rocblas_status rocblas_sgemm(rocblas_handle handle,
                                    A, (int)lda, is_trans(transA),
                                    B, (int)ldb, is_trans(transB),
                                    *beta, C, (int)ldc, stream);
-    if (herr != hipSuccess) {
-        fprintf(stderr, "gfx803_sgemm_shim: sgemm kernel launch failed (%s), falling back to rocBLAS\n",
-                hipGetErrorString(herr));
-        return real_rocblas_sgemm(handle, transA, transB, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
-    }
+    if (herr != hipSuccess) return launch_failed("sgemm", herr);
     log_call("sgemm", "shim kernel", transA, transB, m, n, k, 1);
     return rocblas_status_success;
 }
@@ -287,14 +293,7 @@ extern "C" rocblas_status rocblas_gemm_ex(rocblas_handle handle,
                        (const float*)a, (int)lda, is_trans(transA),
                        (const float*)b, (int)ldb, is_trans(transB),
                        *(const float*)beta, (float*)d, (int)ldd, stream);
-    if (herr != hipSuccess) {
-        fprintf(stderr, "gfx803_sgemm_shim: gemm_ex kernel launch failed (%s), falling back to rocBLAS\n",
-                hipGetErrorString(herr));
-        return real_rocblas_gemm_ex(handle, transA, transB, m, n, k, alpha,
-                                    a, a_type, lda, b, b_type, ldb, beta,
-                                    c, c_type, ldc, d, d_type, ldd,
-                                    compute_type, algo, solution_index, flags);
-    }
+    if (herr != hipSuccess) return launch_failed("gemm_ex", herr);
     log_call("gemm_ex", f16 ? "shim kernel (fp16)" : "shim kernel", transA, transB, m, n, k, 1);
     return rocblas_status_success;
 }
@@ -337,13 +336,7 @@ extern "C" rocblas_status rocblas_sgemm_strided_batched(rocblas_handle handle,
                                                    B, (int)ldb, (int64_t)stride_b, is_trans(transB),
                                                    *beta, C, (int)ldc, (int64_t)stride_c,
                                                    (int)batch_count, stream);
-    if (herr != hipSuccess) {
-        fprintf(stderr, "gfx803_sgemm_shim: sgemm_strided_batched kernel launch failed (%s), "
-                        "falling back to rocBLAS\n", hipGetErrorString(herr));
-        return real_rocblas_sgemm_strided_batched(handle, transA, transB, m, n, k, alpha,
-                                                  A, lda, stride_a, B, ldb, stride_b,
-                                                  beta, C, ldc, stride_c, batch_count);
-    }
+    if (herr != hipSuccess) return launch_failed("sgemm_strided_batched", herr);
     log_call("sgemm_strided_batched", "shim kernel", transA, transB, m, n, k, batch_count);
     return rocblas_status_success;
 }
@@ -416,17 +409,7 @@ extern "C" rocblas_status rocblas_gemm_strided_batched_ex(rocblas_handle handle,
                                        *(const float*)beta,
                                        (float*)d, (int)ldd, (int64_t)stride_d,
                                        (int)batch_count, stream);
-    if (herr != hipSuccess) {
-        fprintf(stderr, "gfx803_sgemm_shim: gemm_strided_batched_ex kernel launch failed (%s), "
-                        "falling back to rocBLAS\n", hipGetErrorString(herr));
-        return real_rocblas_gemm_strided_batched_ex(handle, transA, transB, m, n, k, alpha,
-                                                    a, a_type, lda, stride_a,
-                                                    b, b_type, ldb, stride_b, beta,
-                                                    c, c_type, ldc, stride_c,
-                                                    d, d_type, ldd, stride_d,
-                                                    batch_count, compute_type, algo,
-                                                    solution_index, flags);
-    }
+    if (herr != hipSuccess) return launch_failed("gemm_strided_batched_ex", herr);
     log_call("gemm_strided_batched_ex", f16 ? "shim kernel (fp16)" : "shim kernel", transA, transB, m, n,
              k, batch_count);
     return rocblas_status_success;
