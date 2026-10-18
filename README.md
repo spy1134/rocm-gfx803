@@ -21,11 +21,11 @@ without this project's patches.
 | --- | --- | --- | --- |
 | SD 1.5 image, 20 steps at 512 px (ComfyUI, fp32) | 35 s | 10.5 s | 3.3x |
 | SD 1.5 LoRA training step (4 images, 512 px; fp16 mixed precision now, fp32 before) | 12.1 s | 2.5 s | 4.9x |
-| SD 1.5 UNet step in fp16 (ComfyUI default, 512 px, batch of 2), before and after the fp16 GEMM change | 602 ms | 483 ms | 1.25x |
-| Ollama prompt processing (Qwen3 8B, Q4_K_M) | 14 tokens/s | 223 tokens/s | 16x |
+| SD 1.5 UNet step in fp16 (ComfyUI default, 512 px, batch of 2, with the node), before the fp16 GEMM tiles and now | 602 ms | 342 ms | 1.76x |
+| Prompt processing, 512 tokens (Qwen3 8B, Q4_K_M, llama-bench on Ollama's llama.cpp) | 14 tokens/s | 223 tokens/s | 16x |
 | A coding agent's first request (12,000-token prompt) | 18 min | 71 s | 15x |
 | Prompt processing, MoE model with experts in system RAM, without and with expert prefetch (Qwen3.6 35B-A3B through Ollama, 3,100-token prompt) | 165 tokens/s | 196 tokens/s | 1.2x |
-| Ollama text generation (Qwen3 8B, short context) | 27 tokens/s | 30.5 tokens/s | 1.1x |
+| Text generation (Qwen3 8B, short context, llama-bench on Ollama's llama.cpp) | 27 tokens/s | 30.5 tokens/s | 1.1x |
 
 The largest gains come from replacing the code paths that were slowest on this
 architecture:
@@ -37,9 +37,10 @@ architecture:
 - **Convolution.** A new Winograd F(2x2, 3x3) kernel replaces MIOpen's binary
   Winograd kernels, which corrupt memory on gfx803. It runs about 2x faster than
   the GEMM path for most SD 1.5 convolutions, in fp32 and fp16.
-- **Attention.** An optional ComfyUI node fuses attention, GroupNorm and GEGLU,
-  avoids a 2.3 GB score matrix, and takes a 512 px fp16 denoising step from
-  392 to 342 ms (attention 129 -> 79 ms; SDXL self-attention 3.4x faster).
+- **Attention.** An optional ComfyUI node fuses attention (and, at fp32,
+  GroupNorm and GEGLU), avoids a 2.3 GB score matrix, and takes a 512 px fp16
+  denoising step from 392 to 342 ms (attention 129 -> 79 ms; SDXL
+  self-attention 3.4x faster).
 - **Language models.** Prompt processing uses fp32 GEMMs on the shim instead of
   emulated int8 dot products, and generation kernels were rewritten to avoid
   register spills. MoE prompts prefetch experts over the card's DMA engines

@@ -146,7 +146,8 @@ Paths in the table are relative to `rocm6.4.4/`.
   526 ms with the ComfyUI node (section 6): 35 s -> 12.9 s / 10.5 s.
 - **SD 1.5 LoRA training step**, 512 px, 4 accumulated images: 12.1 s in the
   first setup with correct results (extended shim, binary Winograd disabled),
-  about 3.4 s now (section 1). The original stack ran about 8 s per step with
+  about 2.5 s now in fp16 mixed precision, `gfx803-train`'s default, and
+  2.9 s in fp32 (section 8). The original stack ran about 8 s per step with
   wrong attention gradients, GPU hangs and corrupted latents.
 - **Ollama / llama.cpp**, Qwen3 8B Q4_K_M, q8_0 KV cache, flash attention,
   `llama-bench` on llama.cpp b11232 as Ollama 0.35.1 fetches it, unmodified
@@ -614,8 +615,8 @@ They are workarounds with their source fixes still to do.
 PyTorch has no fused attention on gfx803, so every SD 1.5 attention call
 stores its full score matrix (8 x 4096 x 4096 floats at the 64x64 level).
 [`tools/ComfyUI-gfx803-attention/`](../tools/ComfyUI-gfx803-attention/) is a
-ComfyUI custom node that replaces three operations of ComfyUI's SD 1.5 path
-with HIP kernels from [`tools/`](../tools/):
+ComfyUI custom node that replaces three operations of ComfyUI's SD 1.5 and SDXL
+UNets with HIP kernels from [`tools/`](../tools/):
 
 - attention for head sizes 40, 64 and 80, in one pass with an online softmax
   (`gfx803_fused_attention.hip`: a block of four waves shares each 32-key K/V
@@ -625,7 +626,8 @@ with HIP kernels from [`tools/`](../tools/):
 - GroupNorm with float64 accumulation (`gfx803_group_norm_silu.hip`), fp32
   and up to 128 channels per group;
 - GEGLU, the split, exact-erf GELU and product in one pass
-  (`gfx803_geglu.hip`).
+  (`gfx803_geglu.hip`), fp32 like the GroupNorm: at ComfyUI's default fp16
+  only the attention runs.
 
 All three match a CPU float64 reference (attention within 3.5e-6 relative,
 GroupNorm and GEGLU within 1e-5, over odd shapes, 2-D/3-D and non-contiguous
@@ -1077,15 +1079,17 @@ a reproduction.
   code in the prompt kernels, for table-lookup operands and for 2-token decode.
 - Whether the decode kernels (mmvq) beat the prompt kernels (mmq) for 9-16
   tokens on gfx803; llama.cpp switches at 8.
-- fp16 over full-length training runs and in ComfyUI (only short runs so far).
+- fp16 over full-length training runs, which `gfx803-train` makes by default,
+  and in ComfyUI (only short runs so far).
 - An intermittent GPU memory fault in SD 1.5 LoRA training on AMD's stock HSA
   runtime. Two of sixteen runs of 120-300 steps (same image and data) died, at
   steps 32 and 74, with `Memory access fault ... Page not present` and amdgpu
   `VM fault ... read from 'TC'` lines, without a GPU reset; the loss was healthy up
-  to that point and nothing was NaN. To reproduce, run a 300-step
-  `gfx803-train` job on the SD 1.5 dataset (about 3.5 s/step, 7.2-7.6 GB peak
-  VRAM) and check `journalctl -k` for `VM fault` afterwards; expect to need
-  several runs.
+  to that point and nothing was NaN. To reproduce, run 300-step
+  `gfx803-train` jobs on the SD 1.5 dataset in the setup the faults occurred
+  in: `--precision fp32` with PyTorch's attention (`GFX803_ATTN_TRAIN=0`),
+  about 3.5 s/step at a 7.2-7.6 GB peak. Check `journalctl -k` for `VM fault`
+  afterwards; expect to need several runs.
   Ruled out or not supported: the card's power mode (one fault in manual mode, one
   in auto mode, with the PCIe link at 2.5 GT/s during training, which is the
   driver's choice under low bus traffic); VRAM pressure (three 300-step runs under
@@ -1103,8 +1107,10 @@ a reproduction.
   upper half, or at a mapping that is briefly absent, and not at a plain
   out-of-bounds index. The kernel is not identified. Sections 2 and 4 describe
   the known sources of faults of this kind on this card; the stale vector L1 of
-  section 4 would produce a stale upper half, and this fault has not been
-  re-run with that fix.
+  section 4 would produce a stale upper half. Six 300-step runs with that
+  fix completed without a fault, which at the old rate of 2 in 16 does not
+  yet show whether it is gone; about 22 clean runs in all would put the rate
+  below 1 in 8 with 95% confidence.
 - Why images are slow to read: a 1080p image (about 2000 tokens) takes 56 s
   with Qwen3.5 9B, against about 15 s for 2000 text tokens.
 

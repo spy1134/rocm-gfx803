@@ -248,8 +248,10 @@ docker build --build-context tools=../tools -t rocm-gfx803-comfyui:latest -f Doc
 
 Optional: `../tools/ComfyUI-gfx803-attention/install.sh` adds a custom node
 with gfx803 kernels for attention, GroupNorm and GEGLU, which makes an SD 1.5
-fp16 step about 13% faster (392 -> 342 ms at 512 px) and avoids the 2.3 GB score matrix PyTorch's attention
-allocates. It compiles the kernels with the
+fp16 step about 13% faster (392 -> 342 ms at 512 px) and avoids the 2.3 GB
+score matrix PyTorch's attention allocates. Its GroupNorm and GEGLU kernels
+take fp32 inputs only, so at ComfyUI's default fp16 only the attention runs.
+It compiles the kernels with the
 base image's `hipcc` when the host has none and copies the node into
 `ComfyUI/custom_nodes/`; restart ComfyUI afterwards. The node acts only on
 inference (calls that need gradients go to PyTorch), so training is
@@ -668,8 +670,6 @@ Qwen3 8B and Qwen2.5-Coder 7B.
   calls them but misuses Qwen Code's tool-search bridge: it passes
   `read_file`'s arguments straight to `tool_call` without naming the tool.
   Qwen3.6 35B-A3B (see Fitting models) reads, edits and runs files correctly.
-- `test-backend-ops` passes everything except `SOLVE_TRI` above 64x64
-  (7 cases); no model used here reaches that path.
 - Images are slow to read: a 1080p image becomes about 2000 tokens and takes
   56 s with Qwen3.5 9B, where 2000 text tokens take about 15 s. Where the time
   goes in the vision path is not yet measured.
