@@ -454,9 +454,8 @@ one fp16 rounding step, at the same distance from a float64 reference.
 
 **Left.** A second wave per SIMD would hide the remaining LDS reads,
 waits and barriers, but needs 128 VGPRs and half the LDS (the fp32 Q tile
-alone is 34 KiB). The training backward kernels (SD-8) still move P and dS
-with 336 `ds_bpermute` per tile pair, the same exchange this change took
-out of the forward kernel.
+alone is 34 KiB). The training backward (SD-8) takes P and dS for dV/dK
+the same way.
 
 ### BLAS-7: shim GEMM efficiency at SD shapes
 
@@ -714,22 +713,41 @@ attention keeps no N x M state.
 
 Design: a block of 2x2 waves owns 64 keys (32 for head size 80), keeps K and V
 in LDS and dK/dV in registers, and streams 64-row query tiles; S and dP are
-computed once per tile pair from float4 LDS reads (lane tiling as in the
-forward), P and dS move between lanes with `ds_bpermute`, LDS rows are
+computed once per tile pair from float4 LDS reads, P and dS reach the dV/dK
+accumulators of other lanes through DPP row rotations inside the
+multiply-adds (the lane tiling below) and the dQ ones through
+`ds_bpermute`, LDS rows are
 XOR-swizzled instead of padded (padding would push head size 64 past 64 KiB),
 operands go through raw buffer loads (one 32-bit offset per access, rows past
 N read 0), and dQ is written per key block to scratch slabs that a second
-kernel adds in a fixed order. Per call at 4096 tokens, head size 40: 18.3 ms
-(4.1 TFLOPS-equivalent), against 43.2 ms for the previous two-kernel version
+kernel adds in a fixed order. Per call at 4096 tokens, head size 40: 17.6 ms
+at sustained clocks (4.3 TFLOPS-equivalent), against 43.2 ms for the previous two-kernel version
 that computed S and dP twice, and 59 ms plus 2.6 GB for PyTorch; 2304 tokens
 5.9 ms; head size 80 at 1024 tokens 2.9 ms (PyTorch 5.9). A two-kernel
 version without scratch built the same way measured 23.0 ms. Training (512
 px, 4 accumulated, 40 steps, seed 42): 3.37 -> 2.87 s/step, 7.6 -> 5.6 GB;
 2.03 s/step at 6.9 GB with `--no-checkpointing`; identical loss.
 
-Left: the slab scratch is 336 MB at 4096 tokens (537 MB at head size 64);
-the P/dS lane exchange (336 bpermutes per tile pair) is the largest
-remaining overhead.
+The lane tiling: lane l has row group (l/2)%8 and key group l%2 + 2*(l/16),
+so the P and dS values one lane's dK/dV keys need from the 8 row groups lie
+in its own 16-lane DPP row, at rotations of 2, 4, ... 14 lanes, which
+`v_mac_f32_dpp` applies to its operand. That took 224 of the 336
+`ds_bpermute` per tile pair out of the kernel. Sustained, per call:
+head size 40 at 4096 tokens 18.8 -> 17.6 ms, head size 64 at 4096 34.4 ->
+33.8 ms, head size 80 at 1024 3.02 -> 2.90 ms; gradients as close to a
+float64 reference as before. Unrolling the eight rotation steps (the DPP
+control is an immediate) let the compiler hoist each step's lane-dependent
+addresses out of the query loop, which pushed head sizes 64 and 80 into
+spilling inside it (80: 15% slower); an empty asm on the step's row index
+keeps them in place, and the kernel stays at 231-245 VGPRs without spills.
+The `dgroup` tables were searched again for the rotation order, and dQ got
+one for head size 64.
+
+Left: the slab scratch is 336 MB at 4096 tokens (537 MB at head size 64).
+dQ's 112 remaining `ds_bpermute` per tile pair cost 2-6% (timing build
+with them removed); a 16-lane DPP row holds 8 row groups but only 2 key
+groups, so dQ's exchange across key groups cannot move to DPP alongside
+dV/dK's.
 
 ### SD-6: multi-wave fused attention
 

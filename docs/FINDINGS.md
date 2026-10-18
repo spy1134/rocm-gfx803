@@ -773,7 +773,7 @@ grows with the token count. One kernel computes S and dP once per tile pair
 and accumulates dK and dV in registers; gfx803 has no global float atomic add,
 so each key block writes its dQ partial sums to a scratch slab (336 MB for the
 64x64 level at batch 1, from PyTorch's allocator) and a second kernel adds the
-slabs in a fixed order. At 4096 tokens, head size 40, it takes 18.3 ms against
+slabs in a fixed order. At 4096 tokens, head size 40, it takes 17.6 ms against
 59 ms for PyTorch's forward and backward with 2.6 GB of matrices. Its
 gradients match a float64 reference within 1e-5 (fp32) and 5e-4 (fp16
 inputs). `gfx803-train` runs sd-scripts with `--sdpa`, which routes every
