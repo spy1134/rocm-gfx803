@@ -537,11 +537,10 @@ at 2.0-4.6 TFLOPS (~1.3 ms), and the 30 TN 1280x512x1280 linears per step at
 4.3 TFLOPS (~1.2 ms). None alone is more than 1% of the step; a broader gain
 needs a faster main tile rather than more dispatch rules. The two-wavefront
 tile loses where a call has fewer than three rounds of its tiles (TN
-1280x512x1280 0.41 -> 0.51 ms, 640x2048x640 0.38 -> 0.44) and on the
-K = 5120 linears even with enough tiles (1280x2048x5120 6.3 -> 9.2 ms;
-cause unmeasured: those rows are 10 KiB apart). A 64x64 two-wavefront
-variant for the small-tile-count calls, and the K = 5120 loss, are what is
-left of the TN linears.
+1280x512x1280 0.41 -> 0.51 ms, 640x2048x640 0.38 -> 0.44, and
+1280x2048x5120 6.5 -> 9.2 ms, where the channel camping above adds to it),
+and the rule leaves those calls on the 64x64 tile. A 64x64 two-wavefront variant for them is
+what is left of the TN linears.
 
 **Measured, not adopted.** Ablating a 64x64 4x4-per-thread NN tile (2048^3,
 fp32) attributes its time to the global fetch more than to LDS: removing the
@@ -757,8 +756,8 @@ values move between lanes instead of through an LDS tile (since SD-9 inside
 the multiply-adds, by DPP), and the next K/V tile is prefetched into
 registers. Per call, before SD-9: SD 1.5 64x64
 self-attention (CFG batch 2, head size 40) 26.3 -> 14.3 ms, 32x32 (head
-size 80) 1.95 -> 0.84 ms, SDXL 4096-token self-attention (head size 64)
-35.0 -> 12.2 ms; SD 1.5 step attention 129 ms (ComfyUI's own) -> 91 ms.
+size 80) 1.95 -> 0.84 ms, SDXL 4096-token self-attention (head size 64,
+batch 1) 34.8 -> 12.2 ms; SD 1.5 step attention 129 ms (ComfyUI's own) -> 91 ms.
 The kernel reads Q, K and V in ComfyUI's [b, tokens, heads*D] fp16 layout
 and writes the output there, which saves the transposes, fp32 casts and
 output copy around every call (160 launches per step, 99 -> 92 ms); the K/V

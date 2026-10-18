@@ -732,7 +732,8 @@ SDXL UNets in fp16 match fp32 to about 1e-3.
   rounds of its tiles over the CUs: both TN operands are contiguous in K, the
   one-wavefront tile's 8-deep pieces read a quarter of each 64-byte line, and
   the two wavefronts share 16-deep slices instead (SDXL TN 10240x2048x1280
-  10.4 -> 8.6 ms, 5120x8192x640 13.9 -> 10.1 ms). Bit-identical; fp16 UNet
+  12.4 -> 10.2 ms at the sustained clock; 5120x8192x640 13.9 -> 10.1 ms in
+  a short timing at the boost clock). Bit-identical; fp16 UNet
   step SDXL 2.98 -> 2.84 s, SD 1.5 359 -> 355 ms.
 - The node's fused attention runs one wave per SIMD, so every instruction
   besides its multiply-adds costs it time, and fetching the softmax
@@ -976,11 +977,11 @@ bullets are the original findings (patches 100-105); the rest build on them.
   `HSA_ENABLE_SDMA=0`, 24.6 -> 25.6 with SDMA; through Ollama 25.3 -> 26.2.
   Logits are unchanged: llama-perplexity at 1- and 16-token batches gives
   the same PPL to the last digit with the overlap on and off, mean KLD 0,
-  same top token 100%, with SDMA on and off, and Ollama's greedy output is
-  identical. Unlike 109, it keeps the scheduler's synchronous copies and
-  changes only what they wait for (an event instead of the whole stream); no
-  SDMA fault occurred in any run. `GGML_SCHED_EARLY_HOST_INPUTS=0` disables
-  it.
+  same top token 100% (with SDMA on, the 1-token batches give the same),
+  and Ollama's greedy output is identical. Unlike 109, it keeps the
+  scheduler's synchronous copies and changes only what they wait for (an
+  event instead of the whole stream); no SDMA fault occurred in any run.
+  `GGML_SCHED_EARLY_HOST_INPUTS=0` disables it.
 
 Upstream llama.cpp has no equivalent of the third fix; issue
 [#27796](https://github.com/ggml-org/llama.cpp/issues/27796) reports the same

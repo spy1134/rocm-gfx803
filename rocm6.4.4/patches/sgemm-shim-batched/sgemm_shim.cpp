@@ -67,6 +67,12 @@
 //   GFX803_SGEMM_WAVE_GW=N          -- tile group width for gfx803_w_kernel
 //   GFX803_SGEMM_WAVE_KC2=1         -- fp16 one-wavefront tiles fetch two K
 //                                      rows per load
+//   GFX803_SGEMM_W2=0|1             -- two-wavefront TN tile (gfx803_w2_kernel)
+//                                      for 0: no call, 1: every call whose
+//                                      shape it supports; unset:
+//                                      gfx803_w2_applies's rule. Outputs are
+//                                      bit-identical either way; for
+//                                      benchmarking
 #define ROCBLAS_BETA_FEATURES_API
 #include <rocblas/rocblas.h>
 #include <hip/hip_runtime.h>

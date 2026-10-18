@@ -47,9 +47,10 @@ Q4_K_M, -ncmoe 99, tg128, 5 repetitions, two rounds each, tok/s):
 
 llama-perplexity (4 chunks of 512, all experts in host memory, -ub 1 and
 -ub 16) with the overlap on against the GPU logits with it off: PPL
-10.141204 and 10.148967 in both, mean KLD 0.000000, same top token 100%,
-also with HSA_ENABLE_SDMA=1. Qwen3-Coder-Next takes the same path but was
-not measured: it pins 51.5 GiB of RAM. No GPU faults in any run.
+10.141204 and 10.148967 in both, mean KLD 0.000000, same top token 100%;
+with HSA_ENABLE_SDMA=1, -ub 1 gives the same. Qwen3-Coder-Next takes the
+same path but was not measured: it pins 51.5 GiB of RAM. No GPU faults in
+any run.
 diff -ru a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
 --- a/ggml/src/ggml-backend.cpp	2026-10-17 02:07:57.691913115 -0700
 +++ b/ggml/src/ggml-backend.cpp	2026-10-17 02:08:44.619193931 -0700

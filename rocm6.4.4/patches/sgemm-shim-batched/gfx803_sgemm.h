@@ -1518,12 +1518,7 @@ __device__ __forceinline__ void gfx803_w_tile(int M, int N, int K, float alpha,
 
     auto compute = [&](const float (*as)[64], const float (*bs)[TN]) {
         float a[2][8], b[2][PN];
-        auto read = [&](int s, int kk) {
-#if GFX803_W_ABL_NO_LDS_READ
-            const int k = 0 * kk;
-#else
-            const int k = kk;
-#endif
+        auto read = [&](int s, int k) {
             const float4 x0 = *reinterpret_cast<const float4*>(&as[k][tx * 4]);
             const float4 x1 = *reinterpret_cast<const float4*>(&as[k][32 + tx * 4]);
             a[s][0] = x0.x; a[s][1] = x0.y; a[s][2] = x0.z; a[s][3] = x0.w;
@@ -1546,9 +1541,7 @@ __device__ __forceinline__ void gfx803_w_tile(int M, int N, int K, float alpha,
             // Left free, the scheduler issues all eight steps' LDS reads first
             // and groups the multiply-adds by accumulator, which keeps 128
             // operand values live next to the 64 sums and spills.
-#if !GFX803_W_ABL_NO_LDS_READ
             __builtin_amdgcn_sched_barrier(0);
-#endif
         }
     };
 
@@ -1639,14 +1632,10 @@ __device__ __forceinline__ void gfx803_w_tile(int M, int N, int K, float alpha,
             gfx803_w_order();
             compute(As[buf], Bs[buf]);
             gfx803_w_order();
-#if !GFX803_W_ABL_NO_STORE
             oa.store(As[buf], ra);
             ob.store(Bs[buf], rb);
-#endif
-#if !GFX803_W_ABL_NO_FETCH
             ra = load_a(t + 3);
             rb = load_b(t + 3);
-#endif
         }
         if (t + 2 < nh) {
             gfx803_w_order();
@@ -1849,8 +1838,8 @@ inline long gfx803_sgemm_cus() {
 
 // The calls gfx803_w2_kernel takes: fp16 TN with whole 64x128 tiles, K a
 // multiple of 16, and at least three rounds of tiles over the CUs' four
-// workgroup slots each. On an RX 590 it ran SDXL's large linears 17-27%
-// faster (TN 5120x8192x640: 13.9 -> 10.1 ms, 10240x2048x1280: 10.4 -> 8.6)
+// workgroup slots each. On an RX 590 it ran SDXL's large linears 18% faster
+// at the sustained clock (TN 10240x2048x1280: 12.4 -> 10.2 ms)
 // and calls with fewer tiles up to 64% slower: a 64x128 tile is twice the
 // work of the 64x64 tiles it replaces, so a call with few of them leaves
 // CUs idle in its last round. GFX803_SGEMM_W2 overrides the rule for timing:
