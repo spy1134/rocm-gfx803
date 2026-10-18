@@ -1055,12 +1055,17 @@ template <bool B> struct Own { static constexpr bool value = B; };
 template <int D> __device__ __forceinline__ int swz(int r) {
     return D == 40 ? ((r >> 2) & 1) : D == 64 ? (r & 7) : ((r >> 1) & 3);
 }
-// d-group of the dK/dV accumulators of lane tx. With the identity the dV/dK slice reads of the
-// 8 lanes of a pass collide 2-way (D=40), 8-way (D=64) or 4-way (D=80) under the swizzle above;
-// these permutations, found by exhaustive search over the 8! orders, make all 8 rotation
-// steps conflict-free.
+// d-group of the dK/dV accumulators of lane tx, and of the dQ accumulators of lane ty. With
+// the identity, under the swizzle above, the dV/dK slice reads of the lanes of a pass collide
+// 2-way at every step for D=40 and D=80, and the dQ K-slice reads 2-way for D=64; these
+// permutations, found by exhaustive search over the 8! orders against a model of the LDS
+// banks, make all 8 steps of each conflict-free.
 template <int D> __device__ __forceinline__ int dgroup(int t) {
-    constexpr uint32_t tab = D == 40 ? 0x67453210u : D == 64 ? 0x57136420u : 0x45762310u;
+    constexpr uint32_t tab = D == 40 ? 0x75436210u : D == 64 ? 0x75361420u : 0x65324710u;
+    return (tab >> (4 * t)) & 7;
+}
+template <int D> __device__ __forceinline__ int dqgroup(int t) {
+    constexpr uint32_t tab = D == 64 ? 0x75643120u : 0x76543210u;
     return (tab >> (4 * t)) & 7;
 }
 template <int D> __device__ __forceinline__ int pel(int e, int fr) { return (((e >> 2) ^ fr) << 2) | (e & 3); }
@@ -1138,6 +1143,14 @@ __device__ __forceinline__ void tile_dot(const float* a, const float* b, int fa,
 // Block = 4 waves = WQ query groups x WK key groups. Wave (wq, wk) handles 32 query rows x KT
 // keys of each (BQ x BK) tile pair: 4 rows x KT/8 keys per lane in S/dP, KT/8 keys x D/8
 // elements per lane in dK/dV, 4 rows x D/8 elements per lane in dQ.
+//
+// Lane l has row group tx = (l/2)%8 and key group ty = l%2 + 2*(l/16). dV/dK needs, for
+// this lane's keys, the P and dS values of all 8 row groups; they lie in the 8 lanes of the
+// same 16-lane row with the same l%2, so step m takes row group (tx+m)%8, whose values the
+// lane 2m further along holds, and v_mac_f32_dpp reads them through a DPP row rotation with
+// no instruction of its own (see mac_row_rot2). Exchanged with ds_bpermute, as dQ's key
+// groups across rows still are, these were 224 of the kernel's 336 lane reads per tile
+// pair.
 template <int D, int KT, int WQ, int WK>
 __global__ void __launch_bounds__(256, 1)
 attn_bwd_main(const float* __restrict__ Q, const float* __restrict__ K, const float* __restrict__ V,
@@ -1159,7 +1172,8 @@ attn_bwd_main(const float* __restrict__ Q, const float* __restrict__ K, const fl
     float* const sQ = sV + BK * D;
     float* const sG = sQ + BQ * D;
 
-    const int tid = threadIdx.x, w = tid >> 6, lane = tid & 63, tx = lane & 7, ty = lane >> 3;
+    const int tid = threadIdx.x, w = tid >> 6, lane = tid & 63;
+    const int tx = (lane >> 1) & 7, ty = (lane & 1) | ((lane >> 4) << 1);
     const int wq = w % WQ, wk = w / WQ;
     const int kb = blockIdx.x;
     const size_t bh = blockIdx.y;
@@ -1220,7 +1234,7 @@ attn_bwd_main(const float* __restrict__ Q, const float* __restrict__ K, const fl
     #pragma unroll
     for (int j = 0; j < JN; ++j) kvalid |= (k0 + krow + 8 * j < M ? 1u : 0u) << j;
     const int fq = swz<D>(tx), fk = swz<D>(ty);
-    const int gkv = dgroup<D>(tx);
+    const int gkv = dgroup<D>(tx), gq = dqgroup<D>(ty);
 
     float aK[JN][DG], aV[JN][DG];
     #pragma unroll
@@ -1260,47 +1274,45 @@ attn_bwd_main(const float* __restrict__ Q, const float* __restrict__ K, const fl
                     S[i][j] = p;
                 }
 
-            // dV += P^T dO, dK += dS^T Q over the wave's 32 rows. Step s takes the rows of
-            // lane tx ^ s, whose P and dS for this lane's keys sit in the same registers there.
-            auto dvdk = [&](auto own, int s) __attribute__((always_inline)) {
-                const int ts = tx ^ s;
-                const int src = ((ty << 3) | ts) << 2;
+            // dV += P^T dO, dK += dS^T Q over the wave's 32 rows. Step m takes the rows of row
+            // group (tx+m)%8, whose P and dS for this lane's keys sit in the same registers of
+            // the lane 2m further along (see the lane tiling above).
+            auto dvdk = [&](auto m_tag) __attribute__((always_inline)) {
+                constexpr int MS = decltype(m_tag)::value;
+                // Opaque to the compiler, so each step's lane-dependent addresses are computed
+                // here and not hoisted out of the query loop, where the eight steps' sets stayed
+                // live and pushed D=64 and D=80 into spilling inside the loop.
+                int ts = (tx + MS) & 7;
+                asm volatile("" : "+v"(ts));
                 const int fr = swz<D>(ts);
                 const float* xr = sQ + (wq * 32 + ts) * D;
                 const float* gr = sG + (wq * 32 + ts) * D;
-                auto fetch = [&](int i, float (&xs)[DG], float (&gs)[DG], float (&p)[JP], float (&ds)[JP])
-                    __attribute__((always_inline)) {
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    float xs[DG], gs[DG];
                     load_slice<D>(xr + 8 * i * D, gkv, fr, xs);
                     load_slice<D>(gr + 8 * i * D, gkv, fr, gs);
-                    #pragma unroll
-                    for (int j = 0; j < JP; ++j) {
-                        if constexpr (decltype(own)::value) { p[j] = S[i][j]; ds[j] = G[i][j]; }
-                        else { p[j] = lane_read(S[i][j], src); ds[j] = lane_read(G[i][j], src); }
-                    }
-                };
-                auto mac = [&](const float (&xs)[DG], const float (&gs)[DG], const float (&p)[JP], const float (&ds)[JP])
-                    __attribute__((always_inline)) {
                     #pragma unroll
                     for (int j = 0; j < JP; ++j)
                         #pragma unroll
                         for (int e = 0; e < DG; ++e) {
-                            aV[JP * h + j][e] += p[j] * gs[e];
-                            aK[JP * h + j][e] += ds[j] * xs[e];
+                            mac_row_rot2<MS>(aV[JP * h + j][e], S[i][j], gs[e]);
+                            mac_row_rot2<MS>(aK[JP * h + j][e], G[i][j], xs[e]);
                         }
-                };
-                {
-                    #pragma unroll
-                    for (int i = 0; i < 4; ++i) {
-                        float xs[DG], gs[DG], p[JP], ds[JP];
-                        fetch(i, xs, gs, p, ds);
-                        mac(xs, gs, p, ds);
-                    }
                 }
+                SCHED_BARRIER();
             };
-            // Without a dQ pass the next tile's loads hide behind the last dV/dK pass instead.
-            dvdk(Own<true>{}, 0);
-            #pragma unroll 1
-            for (int s = 1; s < 8; ++s) dvdk(Own<false>{}, s);
+            dvdk(std::integral_constant<int, 0>{});
+            // gfx8 needs two wait states between a VALU write of a VGPR and a DPP read of it,
+            // and the compiler does not see the DPP inside the asm.
+            asm volatile("s_nop 1");
+            dvdk(std::integral_constant<int, 1>{});
+            dvdk(std::integral_constant<int, 2>{});
+            dvdk(std::integral_constant<int, 3>{});
+            dvdk(std::integral_constant<int, 4>{});
+            dvdk(std::integral_constant<int, 5>{});
+            dvdk(std::integral_constant<int, 6>{});
+            dvdk(std::integral_constant<int, 7>{});
 
             // The Q/dO registers are free from here on; the loads hide behind the last dQ pass.
             if (h == NP - 1 && qt + 1 < nqt) load_tile(q0 + BQ);
@@ -1308,11 +1320,11 @@ attn_bwd_main(const float* __restrict__ Q, const float* __restrict__ K, const fl
             // dQ += dS K over this pass's keys. Step s takes the keys of lane ty ^ s.
             auto dq = [&](auto own, int s) __attribute__((always_inline)) {
                 const int ys = ty ^ s;
-                const int src = ((ys << 3) | tx) << 2;
+                const int src = ((ys & 1) | (tx << 1) | ((ys >> 1) << 4)) << 2;
                 const int fr = swz<D>(ys);
                 const float* kr = sK + (krow - ty + ys + 8 * JP * h) * D;
                 auto fetch = [&](int j, float (&ks)[DG], float (&d)[4]) __attribute__((always_inline)) {
-                    load_slice<D>(kr + 8 * j * D, ty, fr, ks);
+                    load_slice<D>(kr + 8 * j * D, gq, fr, ks);
                     #pragma unroll
                     for (int i = 0; i < 4; ++i) {
                         if constexpr (decltype(own)::value) d[i] = G[i][j];
@@ -1345,14 +1357,14 @@ attn_bwd_main(const float* __restrict__ Q, const float* __restrict__ K, const fl
         const Buf bs = make_buf(dQs + (size_t)q0 * D, (unsigned)(N - q0) * D * 4);
         if constexpr (WK == 1) {
             #pragma unroll
-            for (int i = 0; i < 4; ++i) bstore_slice<D>(bs, 4 * (qrow + 8 * i) * D, ty, aQ[i]);
+            for (int i = 0; i < 4; ++i) bstore_slice<D>(bs, 4 * (qrow + 8 * i) * D, gq, aQ[i]);
         } else {
             // The WK waves of a query group hold partial sums over different keys; add them in
             // the Q/dO tiles, which no wave reads after its dV/dK step.
             __syncthreads();
             float* const red = sQ;
             #pragma unroll
-            for (int i = 0; i < 4; ++i) store_slice<D>(red + (wk * BQ + qrow + 8 * i) * D, ty, fq, aQ[i]);
+            for (int i = 0; i < 4; ++i) store_slice<D>(red + (wk * BQ + qrow + 8 * i) * D, gq, fq, aQ[i]);
             __syncthreads();
             #pragma unroll
             for (int u = 0; u < QPT; ++u) {
