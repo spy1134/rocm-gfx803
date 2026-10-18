@@ -111,7 +111,8 @@ run with wrong numbers, not a crash. "It runs" was never taken as evidence.
 | llama.cpp prompts on emulated int8 (mmq) | Faster (fp32 GEMMs on the shim) | 9 | `patches/ollama/llama-cpp/106-*` |
 | llama.cpp DeltaNet concat reads 32 KiB-strided | Fixed (all GPUs) | 9 | `patches/ollama/llama-cpp/107-*` |
 | MoE prompts: the GPU idles while each layer's experts cross PCIe | Fixed (all GPUs; needs SDMA copies on gfx803) | 9 | `patches/ollama/llama-cpp-sched/108-*`, `HSA_ENABLE_SDMA=1` in Dockerfile-Ollama |
-| MoE generation: one GPU round trip per tensor handed to the CPU experts | Patch kept but not applied: with SDMA on it ends in a GPU reset | 9 | `patches/ollama/unapplied/` |
+| MoE generation: one GPU round trip per tensor handed to the CPU experts | Patch kept but not applied: no speedup in the image; with SDMA on it reset the GPU on kernel 6.18.55 | 9 | `patches/ollama/unapplied/` |
+| GPU resets: `ring sdma0 timeout` with SDMA copies on (Polaris SDMA hang on POLL_REGMEM/FENCE) | Not reproduced on kernel 6.18.57; the full workaround is in mainline, not yet in a 6.18 release | 3 | host kernel |
 | MoE generation: the GPU idles during the CPU experts, the shared expert waits for them | Faster (all GPUs) | 9 | `patches/ollama/llama-cpp-sched/112-*` |
 | Ollama rejects argument-less tools | Fixed (all GPUs) | 9 | `patches/ollama/ollama/` |
 | llama.cpp reserves a vision projector's memory on the wrong device | Fixed (all GPUs) | 9 | `patches/ollama/llama-cpp-server/` |
@@ -323,6 +324,52 @@ prevented it in both the stress test and a full training segment, but only
 made the failure rarer; disabling the binary Winograd kernels is what removed
 it, at full clocks and power.
 
+### GPU resets from the SDMA engine (`ring sdma0 timeout`)
+
+With `HSA_ENABLE_SDMA=1` the kernel can log `amdgpu: ring sdma0 timeout,
+signaled seq=N, emitted seq=N+2` and reset the whole card through BACO: VRAM
+is lost, the compositor loses its buffers, and the desktop session usually goes
+with it. SDMA 3 has no soft recovery in amdgpu, so every such timeout is a full
+reset. On kernel 6.18.55 it ended MoE prompt processing with expert prefetch
+(about one heavy run in ten to fifteen) and MoE generation with patch 109 (two
+of two).
+
+The ring that times out is the driver's own: amdgpu runs TTM buffer clears,
+fills and moves on SDMA engine 0. Polaris's SDMA engine has an undocumented
+hang on POLL_REGMEM and FENCE packets that strikes at random, more often the
+busier the engine is, and a single NOP before each such packet avoids it
+(mainline c343a27ed908, "drm/amdgpu/sdma3: Work around POLL_REGMEM / FENCE
+hang", tagged for stable). ROCm's user SDMA queues make the engine busier but do
+not emit the trigger under ROCm 6.4.4's defaults: CLR waits for a copy's
+dependencies on the host, so ROCr queues no POLL_REGMEM, and a copy completes
+with an atomic, not a fence.
+
+Kernel 6.18.55 also put two POLL_REGMEM packets on that ring for every ROCm
+VRAM allocation and free. KFD buffers are cleared when allocated and wiped
+when released, and each clear carried a VMID 0 TLB flush, which SDMA 3 emits
+as a pipeline sync and a VM flush, both POLL_REGMEM. 6.18.57 drops that flush
+for VRAM (stable 30dacb56f072, upstream 87ceb8cba73d), and on 6.18.57 neither
+trigger reproduces: the MoE generation canary with patch 109 ran clean from 12
+of 12 starts (105 generations, the same output every time), and 11 long-prompt
+runs with expert prefetch (24 prompts of 13,227 tokens) did too (on 6.18.55
+the heavy prompts were llama-bench runs at a 2048-token batch, so that
+comparison is looser). The 6.18.55 generation runs used an image that also
+carried scheduler code left inactive since, so the kernel version is the
+likeliest difference, not a proven one; booting 6.18.55 again with the same
+images would settle it.
+
+Run 6.18.57 or later. The NOP workaround closes the rest of the hang (the
+driver's own fences, HDP flushes and GART-window flushes still use the
+affected packets); until a 6.18 release carries it, it applies cleanly to
+6.18.57 as a backport. NOT YET RE-VERIFIED ON REAL HARDWARE with the NOP
+workaround in place.
+
+The reproduction that hit it on 6.18.55 is the MoE generation canary with
+patch 109 and `HSA_ENABLE_SDMA=1`. A synthetic load aimed at the same packets,
+pinned 64 MiB round trips beside a compute stream and a 256 MiB
+allocate/fill/free every 50 ms (`sdma_stress 120 64 ckav`), runs clean on
+6.18.57; it has not been run on 6.18.55.
+
 ## 4. The HSA runtime: patched or stock
 
 The base image carries upstream's patched `libhsa-runtime64` (a "va-reuse-
@@ -429,10 +476,11 @@ isolates the bug, together with the rocBLAS and reduce programs in the table.
 That MIOpen's reduce failures and rocBLAS's wrong results on small fp32 GEMMs
 (`KERNEL_BUGS.md`) are this bug follows from the table; whether the patches written
 for them (the va-reuse-defer runtime change, the small-shape rocBLAS patch) are
-still needed has not been tested. The faults of the patched HSA runtime and the
-intermittent training fault in section 10 have not been explained: six training
-runs with the fix were clean, which at the old fault rate of 2 in 16 is not
-evidence either way.
+still needed has not been tested. The faults of the patched HSA runtime have
+not been explained. The intermittent training fault in section 10 has not
+recurred with the fix: 22 clean runs' worth of training against the old rate
+of 2 in 16 puts its rate below 1 in 8 with 95% confidence, so this bug was very
+likely its cause.
 
 ### rocSOLVER and rocSPARSE had no gfx803 code
 
@@ -760,8 +808,16 @@ gfx803 runs fp16 arithmetic at the fp32 rate, so the 14-16% comes from the
 halved memory traffic of the fp16 GEMM tiles and the widening deferred to the
 LDS store; the 2.2 GB saved is enough to train without gradient
 checkpointing beside a desktop. The 20-step losses of the four runs
-(0.16-0.22) are within run-to-run variation; no longer run compared fp16
-against fp32 training quality. `gfx803-train` trains in fp16 mixed precision
+(0.16-0.22) are within run-to-run variation. Over a full-length run (1200
+steps at 512 px, the same dataset and seed) the two precisions track each
+other step for step: the paired losses correlate at 1.0000, fp16's is lower by
+0.0007 on average (0.0001 over the first 100 steps, 0.0013 over the last),
+against a step-to-step spread of 0.10, and neither run has a non-finite loss.
+The LoRA weights end as far apart (median per-tensor cosine 0.968, relative
+difference 0.26) as one run's step-800 and step-1200 checkpoints are from each
+other, and images rendered with the two at 1200 steps show the same subject
+and style, for most prompt and seed pairs the same composition. fp16 costs no
+measurable training quality. `gfx803-train` trains in fp16 mixed precision
 (the frozen model in fp16, fp32 LoRA weights, loss scaling) unless given
 `--precision fp32`.
 
@@ -957,7 +1013,8 @@ bullets are the original findings (patches 100-105); the rest build on them.
   and `HSA_ENABLE_SDMA=1`, generation with the experts in host memory ends in
   `ring sdma0 timeout` and a GPU reset (two reproductions, with expert prefetch
   on and off), and it gives no speedup in the image (28 to 31 tokens/s with and
-  without it). The cause of the SDMA timeout is not understood. The rest of a
+  without it). The reset is the SDMA engine hang in section 3, which does not
+  reproduce with this patch on kernel 6.18.57. The rest of a
   generated token's time is in docs/OPTIMIZATION_TARGETS.md (LLM-8).
 - **The GPU idled through every CPU expert split, and the shared expert
   waited for it.** In the same generation, each layer runs attention and
@@ -1042,8 +1099,17 @@ What decided those numbers:
   copies the RAM-resident experts to the card once per batch, so 1024-token
   batches read prompts 31% faster than 512 at a 1% decode cost; at 2048 the
   compute buffer pushes experts off the card and decode drops to 12 tok/s.
-- **Anonymous memory beats the page cache for the experts.** Loading without
-  mmap made prompt reading 10% faster with generation unchanged.
+- **Load MoE models without mmap.** With `use_mmap false` the experts sit in
+  pinned host memory and each batch's expert copies go straight to the copy
+  engine. From a memory-mapped model file every copy first asks the kernel to
+  pin the file's pages for the GPU; KFD registers user memory as writable, the
+  read-only mapping refuses, the kernel logs `amdgpu: init_user_pages: Failed
+  to get user pages: -1`, and the copy falls back to a staged path, one failed
+  pin per 1 MiB chunk. With patch 108's prefetch that is about 6000 failed pins
+  a second during a long prompt. Qwen3.6 35B-A3B on 13,227-token prompts:
+  192 tok/s mapped, 229 tok/s with `use_mmap false`, generation 1.5-2% faster,
+  the same output, no kernel messages. The cost is RAM that cannot be swapped
+  or reclaimed: 16 GB of pinned experts for this model.
 - **Threads: one per core.** 16 threads on the 8-core CPU dropped decode to
   2.7 tok/s.
 
@@ -1079,8 +1145,7 @@ a reproduction.
   code in the prompt kernels, for table-lookup operands and for 2-token decode.
 - Whether the decode kernels (mmvq) beat the prompt kernels (mmq) for 9-16
   tokens on gfx803; llama.cpp switches at 8.
-- fp16 over full-length training runs, which `gfx803-train` makes by default,
-  and in ComfyUI (only short runs so far).
+- fp16 LoRA training in ComfyUI (only short runs so far).
 - An intermittent GPU memory fault in SD 1.5 LoRA training on AMD's stock HSA
   runtime. Two of sixteen runs of 120-300 steps (same image and data) died, at
   steps 32 and 74, with `Memory access fault ... Page not present` and amdgpu
@@ -1107,10 +1172,12 @@ a reproduction.
   upper half, or at a mapping that is briefly absent, and not at a plain
   out-of-bounds index. The kernel is not identified. Sections 2 and 4 describe
   the known sources of faults of this kind on this card; the stale vector L1 of
-  section 4 would produce a stale upper half. Six 300-step runs with that
-  fix completed without a fault, which at the old rate of 2 in 16 does not
-  yet show whether it is gone; about 22 clean runs in all would put the rate
-  below 1 in 8 with 95% confidence.
+  section 4 would produce a stale upper half. With that fix, fourteen 300-step
+  runs and two 1200-step runs (6,600 steps, fp32 and fp16 alike) completed
+  without a fault. Counting each 1200-step run as four, that is 22 clean runs
+  against the old rate of 2 in 16, which puts the rate below 1 in 8 with 95%
+  confidence: the fix very likely cured it, though a much rarer fault of the
+  same kind cannot be ruled out.
 - Why images are slow to read: a 1080p image (about 2000 tokens) takes 56 s
   with Qwen3.5 9B, against about 15 s for 2000 text tokens.
 

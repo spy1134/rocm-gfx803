@@ -130,8 +130,8 @@ A run with `gfx803-train`'s defaults (fp16 mixed precision, 512 px buckets,
 gradient checkpointing, batch 1, gradient accumulation 4) takes about 2.5 s
 per step at steady state, 1.7 s without gradient checkpointing; in fp32,
 2.9 and 2.1 s (TRAIN-1). Attention runs on the fused forward and backward
-kernels (SD-8). No breakdown of the step by phase is recorded (TRAIN-3), and
-fp16 has not been compared with fp32 over a full-length run (TRAIN-2).
+kernels (SD-8). No breakdown of the step by phase is recorded (TRAIN-3). Over
+a full-length run fp16 and fp32 give the same loss and images (TRAIN-2).
 GEMM FLOPs by layout for one UNet forward and backward with frozen weights,
 which is what LoRA training's base model does, at 384 px (fp32; the shares
 do not depend on the precision):
@@ -167,12 +167,10 @@ LLM-10.
 
 ## Status
 
-Open targets in recommended order, then the done ones. TRAIN-2 comes first
-because it checks the default that `gfx803-train` ships.
+Open targets in recommended order, then the done ones.
 
 | Target | Area | Expected gain | Status |
 | --- | --- | --- | --- |
-| TRAIN-2 | fp16 LoRA training over a full-length run | correctness of `gfx803-train`'s default, compared with fp32 only over 20-40 steps | Open, first |
 | LLM-6 | MoE prompts: expert copies, MUL_MAT_ID, dense parts | copies overlap compute since patch 108 (pp2048 295 -> 367 tok/s, against 376 with no copies at all); the rest is compute, with no breakdown | Open, profile first |
 | RT-1 | Cost of the vector-L1 invalidate before every dispatch | 1.65 us per dispatch: ~2.4 ms of an MoE token (~6%), 2.3-2.7% of dense decode, ~2.4 ms of an SD 1.5 step | Open, unmeasured |
 | LLM-5 | Dense decode above the bandwidth bound | per 36 ms token: K-quant kernels ~2.9 ms, flash-attention decode ~2.6 ms at 5k depth, F16 `attn_v` ~1 ms, launches ~1 ms by fusion; the same kernels make up MoE generation's GPU part | Open, measured before the stale-L1 fix and patch 111 |
@@ -190,6 +188,7 @@ because it checks the default that `gfx803-train` ships.
 | LLM-3 | mmvq vs mmq for 9-16 tokens | speculative/parallel decoding | Open |
 | LLM-1b | SDWA dot product losses (2-token decode) | 1-11% on 2-token decode | Open, minor |
 | TRAIN-1 | fp16 LoRA training against fp32 | 2.87 -> 2.47 s/step, 5.8 -> 3.6 GB; without checkpointing 2.07 -> 1.73 s/step, 7.1 -> 4.9 GB | Done (fp16 is `gfx803-train`'s default) |
+| TRAIN-2 | fp16 LoRA training over a full-length run | checks `gfx803-train`'s default: same loss and images as fp32 over 1200 steps | Done |
 | SD-8 | Fused attention backward for training | SD1.5 LoRA 512 px, fp32: 3.37 -> 2.87 s/step and 7.6 -> 5.6 GB; 2.03 s/step without gradient checkpointing | Done |
 | SD-6 | Multi-wave fused attention | SD 1.5 fp16 step attention 129 -> 91 ms (step 395 -> 360 ms); SDXL self-attention 2.9x | Done |
 | PT-2 | PyTorch kernels that mix the host's 64-lane warp size with the device's 32 | correctness: wrong results or a GPU reset | Done: four kernels fixed, the audit's other suspects match the CPU; PyTorch's OpInfo sweep left |
@@ -206,24 +205,6 @@ because it checks the default that `gfx803-train` ships.
 | LLM-2 | llama.cpp q5_K decode (patch 105) | q5_K decode ~4% | Done |
 
 ## Open targets
-
-### TRAIN-2: fp16 training over a full-length run
-
-**Why.** `gfx803-train` trains in fp16 mixed precision by default, and fp16
-has been compared with fp32 only over 20- and 40-step runs, whose losses lie
-within run-to-run variation. A default run is 1200 steps. Loss-scaling
-trouble, fp16 overflow in the frozen model's activations, or a LoRA that
-converges differently show only over a long run.
-
-**Measure.** One default run per precision on the same dataset and seed
-(1200 steps at 512 px: ~50 min in fp16, ~58 min in fp32): the loss curves,
-the sample images at the checkpoints, and any NaN stop and resume. The two
-runs also count toward the intermittent training fault's statistics
-("Figures to re-measure").
-
-**Verify.** fp16's loss within the fp32 run's step-to-step variation, and
-images of the same quality at matched steps. Whether fp16 stays the default
-follows from it.
 
 ### LLM-6: MoE prompt processing
 
@@ -804,11 +785,25 @@ session.
 | fp32 SD 1.5 image (35 -> 10.5 s; 644 and 526 ms per step) | front page, FINDINGS "Speed, start to finish" | SD-6 and SD-9 attention, stale-L1 fix | ComfyUI `--force-fp32`, warm images |
 | The memory bandwidth bound | card table, LLM-5 | LLM-5's estimates take the 222-229 GB/s of q8_0 and f16 matmuls as the bound; no read-only streaming kernel has measured it at sustained clocks | a read-only streaming kernel at sustained clocks |
 | `test-backend-ops`, full suite | Verifying a change | stale-L1 fix (FINDINGS section 4 has `SOLVE_TRI` passing with it), patches 108-112 | the full suite in the current Ollama image against the CPU backend |
-| The intermittent training fault | FINDINGS section 10 | stale-L1 fix: six clean 300-step runs so far | about 22 clean runs in all put its rate below 1 in 8 with 95% confidence; TRAIN-2's runs count |
 | The va-reuse-defer runtime change and the small-shape rocBLAS patch | FINDINGS section 4 | the stale-L1 fix may explain the bugs they were written for | their original reproducers without them, with the fix |
 | Kernel TFLOPS in BLAS-1 to BLAS-6 and BLAS-7's ablations | Done, BLAS-7 | short timings at the boost clock (10-20% high) | re-time only where a decision depends on the absolute value |
 
 ## Done
+
+### TRAIN-2: fp16 training over a full-length run
+
+One default `gfx803-train` run per precision, 1200 steps at 512 px on the
+same dataset and seed, in the same image (fp16 53 min, peak 4.4 GB; fp32
+62 min, 5.9 GB; neither faulted). The two precisions track each other step
+for step: the paired losses correlate at
+1.0000, fp16's is lower by 0.0007 on average (0.0001 over the first 100 steps,
+0.0013 over the last), against a step-to-step spread of 0.10, and neither run
+has a non-finite loss. The LoRA weights end as far apart (median per-tensor
+cosine 0.968, relative difference 0.26) as one run's step-800 and step-1200
+checkpoints are from each other, and images rendered with the two at 1200
+steps show the same subject and style, for most prompt and seed pairs the same
+composition. fp16 costs no measurable training quality.
+`gfx803-train` keeps fp16 as its default.
 
 ### TRAIN-1: fp16 LoRA training
 
@@ -818,8 +813,8 @@ checkpointing (card peak 5.8 -> 3.6 GB), 2.07 -> 1.73 s/step without (7.1 ->
 4.9 GB). The gain is memory traffic: the fp16 GEMM tiles (BLAS-4, BLAS-7)
 read half the bytes, and the arithmetic runs at the fp32 rate either way.
 Without gradient checkpointing, fp16 fits beside a desktop. `gfx803-train`
-trains in fp16 by default; `--precision fp32` remains, and no full-length run
-has compared the two for training quality (FINDINGS section 8).
+trains in fp16 by default; `--precision fp32` remains. TRAIN-2 compares the two
+over a full-length run.
 
 ### SD-8: fused attention backward
 

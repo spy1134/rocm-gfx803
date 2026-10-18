@@ -356,9 +356,9 @@ manager (`sudo systemctl stop display-manager`); start the desktop again with
 the LoRA weights stay fp32, and the loss is scaled against fp16 underflow. It is
 14-16% faster than fp32 and needs 2.2 GB less VRAM (section 8 of
 `docs/FINDINGS.md`). `--precision fp32` trains in fp32, the most thoroughly
-checked precision on gfx803; the two have not been compared over a full-length
-run. A resumed run keeps the precision it started with (runs recorded before
-the option existed resume in fp32). To check the card, the image and
+checked precision on gfx803; over a full-length run the two give the same loss
+and images. A resumed run keeps the precision it started with (runs recorded
+before the option existed resume in fp32). To check the card, the image and
 the shim together, `training/gfx803_unet_check.py` compares fp32 attention,
 linear, convolution and normalization (forward and backward) and the whole UNet
 against a float64 CPU reference:
@@ -658,10 +658,14 @@ Qwen3 8B and Qwen2.5-Coder 7B.
 
 ### Known issues
 
-- Every model load logs about 4000 `amdgpu: init_user_pages: Failed to get
-  user pages: -1` kernel messages. The model loads and runs correctly; the
-  cause is not yet investigated. `llama-bench` on the same image does not
-  trigger them.
+- A model loaded through mmap (Ollama's default unless the Modelfile sets
+  `PARAMETER use_mmap false`) logs `amdgpu: init_user_pages: Failed to get user
+  pages: -1` for every large copy from the model file: about 4000 lines per
+  load, and thousands per second while a MoE model reads a long prompt, enough
+  to push older boots out of the journal. The runtime asks the kernel to pin
+  the source pages for the GPU as writable memory, the read-only file mapping
+  refuses, and the copy falls back to a slower staged path, so the output is
+  still correct. `use_mmap false` avoids both (section 9 of `docs/FINDINGS.md`).
 - Ollama is tested on the stock HSA runtime, the image's default. On the
   patched runtime (`GFX803_RUNTIME=patched`) llama-server crashed with GPU page
   faults during a 17k-token prompt, and that runtime reports about 860 MiB less
