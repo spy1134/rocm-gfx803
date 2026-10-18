@@ -20,7 +20,8 @@ mkdir -p "${NODE_DEST}"
 IMAGE="${GFX803_IMAGE:-rocm-gfx803:rocm6.4.4}"
 build() {
     local out="$1" src="$2"
-    [ -f "${TOOLS_DIR}/${out}" ] || [ ! -f "${TOOLS_DIR}/${src}" ] && return 0
+    [ -f "${TOOLS_DIR}/${src}" ] || return 0
+    [ "${TOOLS_DIR}/${out}" -nt "${TOOLS_DIR}/${src}" ] && return 0
     echo "[install.sh] Compiling ${out}..."
     if command -v hipcc >/dev/null; then
         hipcc -O3 -shared -fPIC --offload-arch=gfx803 -o "${TOOLS_DIR}/${out}" "${TOOLS_DIR}/${src}"
