@@ -98,7 +98,7 @@ run with wrong numbers, not a crash. "It runs" was never taken as evidence.
 | MIGraphX int32 reductions fail to compile for gfx803 | Fixed | 5 | `patches/migraphx/dpp-int32-sum-gfx8.patch` |
 | MIGraphX fp16 matrix products accumulate in fp16 (error 0.7-1% instead of 0.02%) | Fixed | 5 | `patches/migraphx/rocblas-compute-fp32-gfx803.patch` |
 | ONNX Runtime TopK with sorted = 0 fails above K of about 7,800 | Fixed | 5 | `patches/onnxruntime/topk-safe-small-k-smem-bound.patch` |
-| No fused attention in PyTorch on gfx803 | ComfyUI node (inference, fp32 kernels) | 6 | `tools/ComfyUI-gfx803-attention/` |
+| No fused attention in PyTorch on gfx803 | ComfyUI node (inference; its GroupNorm and GEGLU are fp32 only) | 6 | `tools/ComfyUI-gfx803-attention/` |
 | Patched HSA runtime page faults | Open; images default to the stock runtime | 4 | `Dockerfile`, start scripts |
 | Kernels read stale data from the per-CU vector L1 after a freed address is reused (silent wrong results in rocBLAS, rocSOLVER, torch.linalg) | Fixed (libamdhip64 rebuilt); decode costs about 2.6% | 4 | `patches/clr/` |
 | rocSOLVER and rocSPARSE ship no gfx803 code, so their kernels silently never run | Fixed (rebuilt for gfx803) | 4 | `patches/rocsolver/`, `patches/rocsparse/` |
@@ -112,7 +112,7 @@ run with wrong numbers, not a crash. "It runs" was never taken as evidence.
 | llama.cpp DeltaNet concat reads 32 KiB-strided | Fixed (all GPUs) | 9 | `patches/ollama/llama-cpp/107-*` |
 | MoE prompts: the GPU idles while each layer's experts cross PCIe | Fixed (all GPUs; needs SDMA copies on gfx803) | 9 | `patches/ollama/llama-cpp-sched/108-*`, `HSA_ENABLE_SDMA=1` in Dockerfile-Ollama |
 | MoE generation: one GPU round trip per tensor handed to the CPU experts | Patch kept but not applied: no speedup in the image; with SDMA on it reset the GPU on kernel 6.18.55 | 9 | `patches/ollama/unapplied/` |
-| GPU resets: `ring sdma0 timeout` with SDMA copies on (Polaris SDMA hang on POLL_REGMEM/FENCE) | Not reproduced on kernel 6.18.57; the full workaround is in mainline, not yet in a 6.18 release | 3 | host kernel |
+| GPU resets: `ring sdma0 timeout` with SDMA copies on (Polaris SDMA hang on POLL_REGMEM/FENCE) | Open: rarer on kernel 6.18.57, still resets the card there; the NOP workaround is in mainline, not yet in a 6.18 release, and unverified here | 3 | host kernel |
 | MoE generation: the GPU idles during the CPU experts, the shared expert waits for them | Faster (all GPUs) | 9 | `patches/ollama/llama-cpp-sched/112-*` |
 | Ollama rejects argument-less tools | Fixed (all GPUs) | 9 | `patches/ollama/ollama/` |
 | llama.cpp reserves a vision projector's memory on the wrong device | Fixed (all GPUs) | 9 | `patches/ollama/llama-cpp-server/` |
@@ -348,21 +348,24 @@ Kernel 6.18.55 also put two POLL_REGMEM packets on that ring for every ROCm
 VRAM allocation and free. KFD buffers are cleared when allocated and wiped
 when released, and each clear carried a VMID 0 TLB flush, which SDMA 3 emits
 as a pipeline sync and a VM flush, both POLL_REGMEM. 6.18.57 drops that flush
-for VRAM (stable 30dacb56f072, upstream 87ceb8cba73d), and on 6.18.57 neither
-trigger reproduces: the MoE generation canary with patch 109 ran clean from 12
-of 12 starts (105 generations, the same output every time), and 11 long-prompt
-runs with expert prefetch (24 prompts of 13,227 tokens) did too (on 6.18.55
-the heavy prompts were llama-bench runs at a 2048-token batch, so that
-comparison is looser). The 6.18.55 generation runs used an image that also
-carried scheduler code left inactive since, so the kernel version is the
-likeliest difference, not a proven one; booting 6.18.55 again with the same
-images would settle it.
+for VRAM (stable 30dacb56f072, upstream 87ceb8cba73d). That removes the two
+reproductions above: on 6.18.57 the MoE generation canary with patch 109 ran
+clean from 12 of 12 starts (105 generations, the same output every time), and
+11 long-prompt runs with expert prefetch (24 prompts of 13,227 tokens) did too.
+It does not remove the hang. On 6.18.57 the Ollama image (patch 109 not
+applied, `HSA_ENABLE_SDMA=1`) reset the card during an ordinary chat request to
+a small dense model (Gemma 4 E2B): two `sdma0`
+timeouts and a `gfx` ring timeout within 40 seconds, each a full reset. The
+trigger is therefore neither MoE nor heavy copy traffic; the driver's own
+fences, HDP flushes and GART-window flushes still put the affected packets on
+the ring, and any of them can hit it.
 
-Run 6.18.57 or later. The NOP workaround closes the rest of the hang (the
-driver's own fences, HDP flushes and GART-window flushes still use the
-affected packets); until a 6.18 release carries it, it applies cleanly to
-6.18.57 as a backport. NOT YET RE-VERIFIED ON REAL HARDWARE with the NOP
-workaround in place.
+The fix is the NOP workaround. Until a 6.18 release carries it, it applies
+cleanly to 6.18.57 as a backport. NOT YET RE-VERIFIED ON REAL HARDWARE with the
+NOP workaround in place. Without it, the hang can reset the card on any
+kernel: `HSA_ENABLE_SDMA=1` makes it likelier by keeping the engine busier,
+and `HSA_ENABLE_SDMA=0` lowers the risk without removing it, because amdgpu
+keeps its own clears and moves on SDMA either way.
 
 The reproduction that hit it on 6.18.55 is the MoE generation canary with
 patch 109 and `HSA_ENABLE_SDMA=1`. A synthetic load aimed at the same packets,
@@ -474,13 +477,20 @@ PyTorch (`probe.py`, `soak.py`, the copy-engine and graph-replay probes) are
 clean on this stack with the packet off as well, so only the rocBLAS probe
 isolates the bug, together with the rocBLAS and reduce programs in the table.
 That MIOpen's reduce failures and rocBLAS's wrong results on small fp32 GEMMs
-(`KERNEL_BUGS.md`) are this bug follows from the table; whether the patches written
-for them (the va-reuse-defer runtime change, the small-shape rocBLAS patch) are
-still needed has not been tested. The faults of the patched HSA runtime have
-not been explained. The intermittent training fault in section 10 has not
-recurred with the fix: 22 clean runs' worth of training against the old rate
-of 2 in 16 puts its rate below 1 in 8 with 95% confidence, so this bug was very
-likely its cause.
+(`KERNEL_BUGS.md`) are this bug follows from the table, and the patches
+written for them before its cause was known have nothing left to fix. On the
+stock runtime with the packet, the MIOpen reduce programs pass every shape in
+five runs each (10 and 11 of 52 shapes fail with it off), so the
+va-reuse-defer runtime change is not needed. Every rocBLAS solution for fp32
+strided-batched GEMMs of 1 to 16 cubed (batch 4), forced one at a time by
+index on buffers refilled before each call, returns the exact product in 300
+of 300 calls; with the packet off nearly all of them are wrong in most calls,
+including the assembly kernels that the small-shape rocBLAS patch steers away
+from, so its detour is not needed either. Both are still in the images. The
+faults of the patched HSA runtime have not been explained. The intermittent
+training fault in section 10 has not recurred with the fix, but only six of
+the clean runs used the setup it occurred in, so whether this bug caused it is
+still open.
 
 ### rocSOLVER and rocSPARSE had no gfx803 code
 
@@ -1013,8 +1023,9 @@ bullets are the original findings (patches 100-105); the rest build on them.
   and `HSA_ENABLE_SDMA=1`, generation with the experts in host memory ends in
   `ring sdma0 timeout` and a GPU reset (two reproductions, with expert prefetch
   on and off), and it gives no speedup in the image (28 to 31 tokens/s with and
-  without it). The reset is the SDMA engine hang in section 3, which does not
-  reproduce with this patch on kernel 6.18.57. The rest of a
+  without it). The reset is the SDMA engine hang in section 3; this patch's
+  reproduction runs clean on kernel 6.18.57, though the hang itself still
+  occurs there. The rest of a
   generated token's time is in docs/OPTIMIZATION_TARGETS.md (LLM-8).
 - **The GPU idled through every CPU expert split, and the shared expert
   waited for it.** In the same generation, each layer runs attention and
@@ -1172,12 +1183,16 @@ a reproduction.
   upper half, or at a mapping that is briefly absent, and not at a plain
   out-of-bounds index. The kernel is not identified. Sections 2 and 4 describe
   the known sources of faults of this kind on this card; the stale vector L1 of
-  section 4 would produce a stale upper half. With that fix, fourteen 300-step
-  runs and two 1200-step runs (6,600 steps, fp32 and fp16 alike) completed
-  without a fault. Counting each 1200-step run as four, that is 22 clean runs
-  against the old rate of 2 in 16, which puts the rate below 1 in 8 with 95%
-  confidence: the fix very likely cured it, though a much rarer fault of the
-  same kind cannot be ruled out.
+  section 4 would produce a stale upper half. With that fix, six 300-step runs
+  in the setup the faults occurred in completed without a fault, which at the
+  old rate of 2 in 16 happens about 45% of the time and so says little. About
+  23 clean runs in that setup would put its rate below 1 in 8 with 95%
+  confidence; its 7.2-7.9 GB peak needs a low-VRAM desktop or none. The
+  default setup has changed since: `gfx803-train` now runs the fused attention
+  kernels, and in it fourteen 300-step and two 1200-step runs (fp32 and fp16)
+  completed without a fault. Those runs do not execute PyTorch's attention
+  kernels, so they show that the default setup has not reproduced the fault,
+  not that the fix cured it.
 - Why images are slow to read: a 1080p image (about 2000 tokens) takes 56 s
   with Qwen3.5 9B, against about 15 s for 2000 text tokens.
 

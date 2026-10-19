@@ -172,7 +172,7 @@ Open targets in recommended order, then the done ones.
 | Target | Area | Expected gain | Status |
 | --- | --- | --- | --- |
 | LLM-6 | MoE prompts: expert copies, MUL_MAT_ID, dense parts | copies overlap compute since patch 108 (pp2048 295 -> 367 tok/s, against 376 with no copies at all); the rest is compute, with no breakdown | Open, profile first |
-| RT-1 | Cost of the vector-L1 invalidate before every dispatch | 1.65 us per dispatch: ~2.4 ms of an MoE token (~6%), 2.3-2.7% of dense decode, ~2.4 ms of an SD 1.5 step | Open, unmeasured |
+| RT-1 | Cost of the vector-L1 invalidate before every dispatch | 1.65 us per dispatch: ~2.4 ms of an MoE token (~6%), 2.3-2.7% of dense decode, ~2.4 ms of an SD 1.5 step | Open: the cheaper-packet option is unmeasured |
 | LLM-5 | Dense decode above the bandwidth bound | per 36 ms token: K-quant kernels ~2.9 ms, flash-attention decode ~2.6 ms at 5k depth, F16 `attn_v` ~1 ms, launches ~1 ms by fusion; the same kernels make up MoE generation's GPU part | Open, measured before the stale-L1 fix and patch 111 |
 | LLM-8 | MoE generation with experts in system RAM | shared expert overlaps the CPU experts since patch 112 (Ollama 25.3 -> 26.2 tok/s); left: the GPU split's kernels and dispatches, the fp32 router ~0.5 ms, the hand-offs, the CPU experts (at most ~3.5 ms) | Open, measured before patches 111 and 112 |
 | SD-10 | fp16 GroupNorm/SiLU and GEGLU in the node | the node's kernels take fp32 only, so ComfyUI's fp16 default runs neither; a few ms of a 342 ms step | Open, unmeasured |
@@ -785,7 +785,7 @@ session.
 | fp32 SD 1.5 image (35 -> 10.5 s; 644 and 526 ms per step) | front page, FINDINGS "Speed, start to finish" | SD-6 and SD-9 attention, stale-L1 fix | ComfyUI `--force-fp32`, warm images |
 | The memory bandwidth bound | card table, LLM-5 | LLM-5's estimates take the 222-229 GB/s of q8_0 and f16 matmuls as the bound; no read-only streaming kernel has measured it at sustained clocks | a read-only streaming kernel at sustained clocks |
 | `test-backend-ops`, full suite | Verifying a change | stale-L1 fix (FINDINGS section 4 has `SOLVE_TRI` passing with it), patches 108-112 | the full suite in the current Ollama image against the CPU backend |
-| The va-reuse-defer runtime change and the small-shape rocBLAS patch | FINDINGS section 4 | the stale-L1 fix may explain the bugs they were written for | their original reproducers without them, with the fix |
+| The intermittent training fault | FINDINGS section 10 | stale-L1 fix: six clean 300-step runs in the setup it occurred in (fp32, PyTorch's attention); the default setup's 16 clean runs use the fused attention instead | about 23 clean runs in the original setup put its rate below 1 in 8 with 95% confidence; peak 7.2-7.9 GB |
 | Kernel TFLOPS in BLAS-1 to BLAS-6 and BLAS-7's ablations | Done, BLAS-7 | short timings at the boost clock (10-20% high) | re-time only where a decision depends on the absolute value |
 
 ## Done
