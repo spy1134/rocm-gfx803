@@ -158,6 +158,16 @@ ENV OLLAMA_KV_CACHE_TYPE=q8_0
 # and it raises a 512 MiB copy from 10.4 to 12.3 GB/s. Checked with 767 GiB of
 # byte-compared round trips next to running GEMMs.
 ENV HSA_ENABLE_SDMA=1
+# ROCm leaves user SDMA queues off on gfx8 as unstable. With them on, a copy
+# that must wait for a running kernel gets that wait as a POLL_REGMEM packet in
+# the SDMA queue, and the engine does not leave that poll. If the kernel is
+# queued behind one that waits for ROCr to map more scratch, and the mapping's
+# page-table update is scheduled on the same engine (a second ROCm process on
+# the card makes that likely), nothing can proceed until the driver resets the
+# GPU (ring sdma0 timeout). Waiting for dependencies on the CPU keeps every
+# wait out of the SDMA queue; prompt speed with expert prefetch is unchanged
+# and greedy output identical (docs/FINDINGS.md, section 3).
+ENV ROC_CPU_WAIT_FOR_SIGNAL=1
 EXPOSE 11434
 ENTRYPOINT ["/usr/bin/ollama"]
 CMD ["serve"]

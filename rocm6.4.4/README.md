@@ -510,10 +510,16 @@ measurements and a reproduction. In short:
   batches (llama-bench, development tree): 193 / 250 / 295 -> 243 / 321 / 367
   tok/s. Through Ollama's default 512-token batches in the image, a 3,100-token
   prompt reads 165 -> 196 tok/s and a 11,900-token prompt 174 -> 193 tok/s, and
-  generation is 4% faster. The patch changes the graph scheduler, which lives in
-  `libggml-base`; it is in `patches/ollama/llama-cpp-sched/` so that
-  `Dockerfile-Ollama` applies it before the CPU build that installs that
-  library, and the build fails if the installed library lacks it.
+  generation is 4% faster. SDMA copies on gfx8 need
+  `ROC_CPU_WAIT_FOR_SIGNAL=1` (also set in `Dockerfile-Ollama`): without it a
+  copy that waits for a running kernel puts that wait into the SDMA queue, and
+  while another ROCm process (a TTS server, ComfyUI, a training job) is open
+  beside Ollama, loading a model can stall the SDMA engine and reset the GPU
+  (docs/FINDINGS.md, section 3). The setting costs no prompt speed. The patch
+  changes the graph scheduler, which lives in `libggml-base`; it is in
+  `patches/ollama/llama-cpp-sched/` so that `Dockerfile-Ollama` applies it
+  before the CPU build that installs that library, and the build fails if the
+  installed library lacks it.
 - **111-mmvq-reuse-quantized-src1.patch**: every single-token matrix-vector
   product converted its input to q8_1 in a kernel of its own, also when the
   product before it had just converted the same input (attention's q, k and v;

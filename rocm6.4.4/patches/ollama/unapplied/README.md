@@ -8,6 +8,5 @@ the CPU build (see `llama-cpp-sched/`). With this patch in the scheduler and `HS
 default), decoding a MoE model with the experts in host memory ends in `amdgpu: ring sdma0 timeout` and a
 BACO reset of the GPU. The same decode passes on the scheduler without the patch, and with the patch
 when SDMA is off. It also gave no measurable decode speedup (Qwen3.6 35B-A3B, 28 to 31 tokens/s with and
-without it). The timeout is a Polaris SDMA engine hang in the kernel driver's own
-ring (docs/FINDINGS.md, section 3); on kernel 6.18.57 this patch with SDMA on ran
-clean from 12 of 12 starts, but the hang itself still occurs there.
+without it). The timeout is the SDMA engine hang described in docs/FINDINGS.md, section 3,
+which the image now avoids with `ROC_CPU_WAIT_FOR_SIGNAL=1`; this patch has not been run with that setting.
