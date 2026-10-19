@@ -110,9 +110,9 @@ run with wrong numbers, not a crash. "It runs" was never taken as evidence.
 | llama.cpp integer dot products built from byte unpacking | Faster (decode kernels) | 9 | `patches/ollama/llama-cpp/104-*`, `105-*` |
 | llama.cpp prompts on emulated int8 (mmq) | Faster (fp32 GEMMs on the shim) | 9 | `patches/ollama/llama-cpp/106-*` |
 | llama.cpp DeltaNet concat reads 32 KiB-strided | Fixed (all GPUs) | 9 | `patches/ollama/llama-cpp/107-*` |
-| MoE prompts: the GPU idles while each layer's experts cross PCIe | Fixed (all GPUs; needs SDMA copies on gfx803) | 9 | `patches/ollama/llama-cpp-sched/108-*`, `HSA_ENABLE_SDMA=1` in Dockerfile-Ollama |
+| MoE prompts: the GPU idles while each layer's experts cross PCIe | Fixed (all GPUs; needs SDMA copies on gfx803) | 9 | `patches/ollama/llama-cpp-sched/108-*`, `HSA_ENABLE_SDMA=1` and `ROC_CPU_WAIT_FOR_SIGNAL=1` in Dockerfile-Ollama |
 | MoE generation: one GPU round trip per tensor handed to the CPU experts | Patch kept but not applied: no speedup in the image; with SDMA on it reset the GPU on kernel 6.18.55 | 9 | `patches/ollama/unapplied/` |
-| GPU resets: `ring sdma0 timeout` with SDMA copies on (Polaris SDMA hang on POLL_REGMEM/FENCE) | Open: rarer on kernel 6.18.57, still resets the card there; the NOP workaround is in mainline, not yet in a 6.18 release, and unverified here | 3 | host kernel |
+| GPU resets: `ring sdma0 timeout` with SDMA copies on | Fixed in the image (trigger removed): a kernel waiting for scratch, the page-table update that maps it, and a user SDMA queue polling for a kernel behind it deadlock engine 0 once a second process tips page-table jobs onto that engine; CLR now waits for dependencies on the CPU (prompt speed unchanged). The engine's behaviour remains | 3 | `ROC_CPU_WAIT_FOR_SIGNAL=1` in Dockerfile-Ollama |
 | MoE generation: the GPU idles during the CPU experts, the shared expert waits for them | Faster (all GPUs) | 9 | `patches/ollama/llama-cpp-sched/112-*` |
 | Ollama rejects argument-less tools | Fixed (all GPUs) | 9 | `patches/ollama/ollama/` |
 | llama.cpp reserves a vision projector's memory on the wrong device | Fixed (all GPUs) | 9 | `patches/ollama/llama-cpp-server/` |
@@ -326,52 +326,133 @@ it, at full clocks and power.
 
 ### GPU resets from the SDMA engine (`ring sdma0 timeout`)
 
-With `HSA_ENABLE_SDMA=1` the kernel can log `amdgpu: ring sdma0 timeout,
-signaled seq=N, emitted seq=N+2` and reset the whole card through BACO: VRAM
-is lost, the compositor loses its buffers, and the desktop session usually goes
-with it. SDMA 3 has no soft recovery in amdgpu, so every such timeout is a full
-reset. On kernel 6.18.55 it ended MoE prompt processing with expert prefetch
-(about one heavy run in ten to fifteen) and MoE generation with patch 109 (two
-of two).
+With `HSA_ENABLE_SDMA=1`, which runs ROCm's copies on user SDMA queues,
+loading a model in Ollama can deadlock SDMA engine 0. Ten seconds later the
+kernel logs `amdgpu: ring sdma0 timeout, signaled seq=N, emitted seq=N+2` and
+resets the card through BACO. VRAM is lost, every ROCm process on the card
+loses its work, and the desktop session usually goes with it. The `Failed to
+suspend process` and `cp is busy, skip halt cp` lines that follow come from
+the reset itself: the driver's queue-suspend path cannot take the reset lock
+that the reset already holds, so they say nothing about the state before the
+stall.
 
-The ring that times out is the driver's own: amdgpu runs TTM buffer clears,
-fills and moves on SDMA engine 0. Polaris's SDMA engine has an undocumented
-hang on POLL_REGMEM and FENCE packets that strikes at random, more often the
-busier the engine is, and a single NOP before each such packet avoids it
-(mainline c343a27ed908, "drm/amdgpu/sdma3: Work around POLL_REGMEM / FENCE
-hang", tagged for stable). ROCm's user SDMA queues make the engine busier but do
-not emit the trigger under ROCm 6.4.4's defaults: CLR waits for a copy's
-dependencies on the host, so ROCr queues no POLL_REGMEM, and a copy completes
-with an atomic, not a fence.
+The deadlock has three parts, all read from the registers, rings and queues
+of the stalled GPU and from a kernel trace of the seconds before it:
 
-Kernel 6.18.55 also put two POLL_REGMEM packets on that ring for every ROCm
-VRAM allocation and free. KFD buffers are cleared when allocated and wiped
-when released, and each clear carried a VMID 0 TLB flush, which SDMA 3 emits
-as a pipeline sync and a VM flush, both POLL_REGMEM. 6.18.57 drops that flush
-for VRAM (stable 30dacb56f072, upstream 87ceb8cba73d). That removes the two
-reproductions above: on 6.18.57 the MoE generation canary with patch 109 ran
-clean from 12 of 12 starts (105 generations, the same output every time), and
-11 long-prompt runs with expert prefetch (24 prompts of 13,227 tokens) did too.
-It does not remove the hang. On 6.18.57 the Ollama image (patch 109 not
-applied, `HSA_ENABLE_SDMA=1`) reset the card during an ordinary chat request to
-a small dense model (Gemma 4 E2B): two `sdma0`
-timeouts and a `gfx` ring timeout within 40 seconds, each a full reset. The
-trigger is therefore neither MoE nor heavy copy traffic; the driver's own
-fences, HDP flushes and GART-window flushes still put the affected packets on
-the ring, and any of them can hit it.
+1. A kernel on one of the runner's compute queues needs more scratch memory
+   than the queue has. The CP stops the queue in front of that dispatch and
+   asks ROCr for more; ROCr's event thread allocates and maps the memory and
+   then restarts the queue (`DynamicQueueEventsHandler`,
+   `AcquireQueueMainScratch`). On an RX 590 the first such request is
+   36 CUs x 32 waves x 2 KiB = 2,359,296 bytes of VRAM.
+2. Mapping that memory is a page-table update, and amdgpu runs page-table
+   updates on an SDMA engine's own ring. Each process's page-table jobs go to
+   whichever of the two engines the drm scheduler scores lower, and the score
+   counts the job queues of every process that has used that engine.
+3. Engine 0 is busy with the runner's user SDMA queue, which sits on a
+   dependency wait: when HIP issues a copy that must wait for a kernel that is
+   still running, CLR hands the kernel's completion signal to ROCr, and ROCr
+   writes a POLL_REGMEM packet that polls until the signal reaches zero and
+   never gives up. The kernel it waits for is queued behind the dispatch from
+   step 1. The engine stays in the poll even after the queue's time slice has
+   expired (`SDMA0_RLC0_CONTEXT_STATUS` shows the expired bit) and never runs
+   its own ring, so the page-table update never runs, the scratch never
+   arrives, and the poll never ends.
 
-The fix is the NOP workaround. Until a 6.18 release carries it, it applies
-cleanly to 6.18.57 as a backport. NOT YET RE-VERIFIED ON REAL HARDWARE with the
-NOP workaround in place. Without it, the hang can reset the card on any
-kernel: `HSA_ENABLE_SDMA=1` makes it likelier by keeping the engine busier,
-and `HSA_ENABLE_SDMA=0` lowers the risk without removing it, because amdgpu
-keeps its own clears and moves on SDMA either way.
+A second process decides where step 2 lands. With Ollama alone on the card,
+engine 0 also carries the driver's buffer-move queues, so the runner's
+page-table jobs go to engine 1, the scratch is mapped, and nothing stalls
+(a traced run sent all 42 of the scratch thread's jobs to engine 1). Any other
+process with a GPU address space, even one that only called `hsa_init`,
+leaves its page-table queues on engine 1 and raises that engine's score. The
+runner's jobs then lean to engine 0, and the scratch mapping lands behind the
+poll. That is why the size and activity of the other process do not matter: a
+queue-less, memory-less process triggers it as reliably as a text-to-speech
+server holding 3.8 GB.
 
-The reproduction that hit it on 6.18.55 is the MoE generation canary with
-patch 109 and `HSA_ENABLE_SDMA=1`. A synthetic load aimed at the same packets,
-pinned 64 MiB round trips beside a compute stream and a 256 MiB
-allocate/fill/free every 50 ms (`sdma_stress 120 64 ckav`), runs clean on
-6.18.57; it has not been run on 6.18.55.
+The reset therefore reproduces when all of these hold:
+
+- Ollama loads a model entirely into VRAM, and the model has a kernel that
+  needs scratch (Gemma 4 E2B does);
+- `HSA_ENABLE_SDMA=1`;
+- another ROCm process exists on the card;
+- the KFD hardware scheduler runs the queues (`amdgpu.sched_policy=0`, the
+  default). Without it the queue-less neighbour did not trigger a stall in
+  120 loads; a neighbour holding 3.8 GB still caused two in about 200, one of
+  which ended in an SDMA write fault (`VM protection fault`, client SDM0, no
+  PASID) and the other in a reset when the stall returned after the driver
+  restored the queues.
+
+Without the fix below, all 21 such runs reset the card, 17 of them on the
+first load, with compute-wave save and restore on and off
+(`amdgpu.cwsr_enable`). Ollama alone ran 80 loads without a reset, and loads
+that leave part of the model on the CPU ran 260. CLR passes a dependency to
+the GPU only while it is still pending at submit, so the hang depends on
+timing: with `AMD_LOG_LEVEL=4` the host is slow enough that no wait reaches
+the SDMA queue, and a logged run does not reproduce it. ROCm itself leaves
+user SDMA queues off on gfx8 ("User SDMA queues are unstable on gfx8", ROCr
+`GpuAgent::InitDma`); `HSA_ENABLE_SDMA=1` overrides that default.
+
+Ruled out, each by a run that reset anyway: the memory clock (pinned at its
+top level, automatic, and forced to its lowest), the amount of VRAM in use and
+where buffers land, eviction (GTT use stays flat up to the hang), the failed
+pins of read-only mmap'd model pages (`use_mmap: false` resets too), a NOP
+before ROCr's own POLL_REGMEM and FENCE packets (a rebuilt ROCr resets the
+same way), a larger CLR signal pool (`ROC_SIGNAL_POOL_SIZE=512`), and this
+repository's CLR cache-invalidate packets (`CLR_GFX8_TC_INVALIDATE=0`).
+Polaris SDMA also has a separate, documented hang on POLL_REGMEM and FENCE
+packets in the driver's ring, made rarer by a NOP before each such packet
+(mainline c343a27ed908, tagged for stable); the resets above occur with that
+workaround in the running kernel. Kernel 6.18.57 also stops putting two
+POLL_REGMEM packets on sdma0 for every KFD VRAM clear (stable 30dacb56f072,
+upstream 87ceb8cba73d), which on 6.18.55 reset the card during the MoE runs
+in section 9 (about one heavy prompt run in ten to fifteen; generation with
+patch 109, two of two); on 6.18.57 both run clean. The devcoredump does not
+show the stall: its ring contents and pointers are read after the reset.
+
+The fix: Dockerfile-Ollama sets `ROC_CPU_WAIT_FOR_SIGNAL=1` next to
+`HSA_ENABLE_SDMA=1`. With it CLR waits for every pending dependency on the CPU
+and submits the copy without one, so no poll ever holds an SDMA engine, and
+the scratch mapping in step 2 runs whichever engine it lands on. The setting
+is CLR's own; it is CLR's default when HIP does not dispatch directly. With it
+the reproduction ran 720 loads without a reset:
+
+- beside the queue-less process;
+- beside a process churning 256 MiB of VRAM every 50 ms;
+- beside the text-to-speech server;
+- with MoE loads;
+- with the image as built, beside the text-to-speech server and the
+  queue-less process together, and with compute-wave save and restore on.
+
+Greedy output is identical with and without it on four models
+(Qwen3.6-35B-A3B, Qwen3 8B, Gemma 4 E2B, Gemma 3n E2B). Qwen3.6-35B-A3B with
+its experts in host memory (2.8k-token prompt, medians of two interleaved
+sets of five requests) keeps its prompt speed, 338 tokens/s, and generates
+24.3 tokens/s against 24.5, inside the run-to-run spread.
+
+The alternatives cost more or cover less:
+
+- `HSA_ENABLE_SDMA=0` drops that prompt speed to 263 tokens/s (-22%).
+- Waiting on the CPU only for copies' dependencies also avoids the reset, but
+  drops it to the same 262. Why CLR's switch keeps the overlap and the
+  narrower wait does not is not known.
+- Moving copies up to 4 MiB onto blit kernels (`GPU_FORCE_BLIT_COPY_SIZE=4096`)
+  avoids this reproduction only because every copy of these loads is smaller
+  than 4 MiB. Larger copies keep their GPU-side waits.
+- Running Ollama alone on the card avoids it only by the scheduler's choice of
+  engine, not by design.
+
+The engine's refusal to leave a polling queue is in the SDMA hardware or
+firmware and cannot be fixed here; the image keeps dependency waits out of
+the SDMA queues, which removes the third part of the cycle.
+
+To reproduce, without the setting: start an idle ROCm process (for example a
+program that calls `hsa_init` and sleeps). Then send chat requests to the
+Ollama image that alternate between Gemma 4 E2B and Gemma 3n E2B (both fit
+in VRAM) with `keep_alive: 0`, so that every request loads a model. The reset
+comes on a Gemma 4 E2B load, usually the first. With
+`ROC_CPU_WAIT_FOR_SIGNAL=1` added to the container the same requests run
+clean.
 
 ## 4. The HSA runtime: patched or stock
 
@@ -997,7 +1078,9 @@ bullets are the original findings (patches 100-105); the rest build on them.
   used. On gfx803 that overlap needs `HSA_ENABLE_SDMA=1`: ROCm's runtime
   otherwise copies host to device with blit kernels, which serialize with
   compute (a 512 MiB copy next to a GEMM loop: no overlap at all, against
-  37 ms of 41 hidden with SDMA). Dockerfile-Ollama sets it. llama-bench
+  37 ms of 41 hidden with SDMA). Dockerfile-Ollama sets it, together with
+  `ROC_CPU_WAIT_FOR_SIGNAL=1`, which keeps dependency waits out of the SDMA
+  queues (section 3). llama-bench
   pp2048 with all experts in RAM: 193 / 250 / 295 -> 243 / 321 / 367 tok/s at
   512 / 1024 / 2048-token batches. In Ollama with Chatterbox loaded beside
   it (3.2 GiB of the model on the card), prompts of 2k and 8k tokens went
@@ -1024,8 +1107,9 @@ bullets are the original findings (patches 100-105); the rest build on them.
   `ring sdma0 timeout` and a GPU reset (two reproductions, with expert prefetch
   on and off), and it gives no speedup in the image (28 to 31 tokens/s with and
   without it). The reset is the SDMA engine hang in section 3; this patch's
-  reproduction runs clean on kernel 6.18.57, though the hang itself still
-  occurs there. The rest of a
+  reproduction runs clean on kernel 6.18.57, and the image avoids that hang
+  with `ROC_CPU_WAIT_FOR_SIGNAL=1`, but the patch has not been run with that
+  setting. The rest of a
   generated token's time is in docs/OPTIMIZATION_TARGETS.md (LLM-8).
 - **The GPU idled through every CPU expert split, and the shared expert
   waited for it.** In the same generation, each layer runs attention and
