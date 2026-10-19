@@ -1148,9 +1148,8 @@ __device__ __forceinline__ void tile_dot(const float* a, const float* b, int fa,
 // this lane's keys, the P and dS values of all 8 row groups; they lie in the 8 lanes of the
 // same 16-lane row with the same l%2, so step m takes row group (tx+m)%8, whose values the
 // lane 2m further along holds, and v_mac_f32_dpp reads them through a DPP row rotation with
-// no instruction of its own (see mac_row_rot2). Exchanged with ds_bpermute, as dQ's key
-// groups across rows still are, these were 224 of the kernel's 336 lane reads per tile
-// pair.
+// no instruction of its own (see mac_row_rot2). Through ds_bpermute, which dQ's key groups
+// across rows need, these exchanges would be 224 of the 336 lane reads per tile pair.
 template <int D, int KT, int WQ, int WK>
 __global__ void __launch_bounds__(256, 1)
 attn_bwd_main(const float* __restrict__ Q, const float* __restrict__ K, const float* __restrict__ V,

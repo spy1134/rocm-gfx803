@@ -85,6 +85,7 @@ RUN_NAME=""
 RESUME_MODE=ask
 NAN_RETRIES=${GFX803_NAN_RETRIES:-3}
 SAVE_EVERY_CLI=""
+PRECISION_CLI=""
 DIAG_ARGS=()
 RESUME_RUN=""
 ASSUME_YES=0
@@ -648,7 +649,7 @@ while [ $# -gt 0 ]; do
         --scheduler) SCHEDULER=$2; shift 2 ;;
         --fresh-latents) FRESH_LATENTS=1; shift ;;
         --no-checkpointing) NO_CHECKPOINTING=1; shift ;;
-        --precision) PRECISION=$2; shift 2 ;;
+        --precision) PRECISION=$2; PRECISION_CLI=$2; shift 2 ;;
         --runtime) RUNTIME=$2; DIAG_ARGS+=("$1" "$2"); shift 2 ;;
         --shim) SHIM=$2; DIAG_ARGS+=("$1" "$2"); shift 2 ;;
         --no-batched) NO_BATCHED=1; DIAG_ARGS+=("$1"); shift ;;
@@ -753,6 +754,11 @@ if [ "$RESUMING" = 1 ]; then
         log "Checkpoint interval changed from $SAVE_EVERY to $SAVE_EVERY_CLI steps for this run"
         SAVE_EVERY=$SAVE_EVERY_CLI
         save_run_env
+    fi
+    case "$PRECISION" in fp16|fp32) ;; *) die "run $RUN_NAME's run.env has PRECISION=$PRECISION (expected fp16 or fp32)" ;; esac
+    # The saved optimizer and gradient-scaler state belong to the precision the run started in.
+    if [ -n "$PRECISION_CLI" ] && [ "$PRECISION_CLI" != "$PRECISION" ]; then
+        warn "--precision $PRECISION_CLI is ignored when resuming; $RUN_NAME continues in $PRECISION"
     fi
     [ ${#CLI_EXTRA[@]} -gt 0 ] && warn "extra train_network.py args are ignored when resuming"
     normalize_outputs "$RUN_NAME"

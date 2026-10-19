@@ -41,8 +41,8 @@
 // All of them take fp32 or fp16 operands (E below): fp16 values are widened to
 // fp32 when they are stored to LDS (gfx803_stage_d says why not earlier), so
 // LDS, the multiply-adds and the sums are the fp32 kernel's, and C is rounded
-// to fp16 once. Polaris has no packed
-// fp16 arithmetic, so fp16 cannot be faster per multiply-add than fp32; what
+// to fp16 once. Polaris has no packed fp16 arithmetic, so fp16 cannot be
+// faster per multiply-add than fp32; what
 // the fp16 path gains is the kernel itself. rocBLAS's fp16 kernels for gfx803
 // keep fp16 in LDS and widen inside the inner loop (10 v_cvt_f32_f16 per 16
 // v_mac_f32 in its 128x32 tile) and load operands as 2-byte flat_load_ushort,
@@ -1879,9 +1879,10 @@ inline int gfx803_w_pick_pn(int M, int N, int K, int batch, size_t elem) {
 // up to 28% faster (SDXL 8192x320x640 b16: 13.6 -> 9.8 ms), a few such shapes
 // up to 18% slower, and the SDXL and SD1.5 UNet call logs' GEMM time dropped
 // 2%. Smaller or less batched shapes lose. On single GEMMs it lost up
-// to 3.3x (TN 1280x2048x5120: 6.6 -> 21.5 ms); on TN 1280x2048x1280 removing
-// its global fetch took it from 3.3 to 5.6 TFLOPS and removing its LDS reads
-// changed nothing. In fp32 batched NN it ran 0.5-2.8x the old time with no
+// to 3.3x (TN 1280x2048x5120: 6.6 -> 21.5 ms): with one wavefront per tile
+// nothing hides the latency of its global loads, which alone hold TN
+// 1280x2048x1280 at 3.3 of the 5.6 TFLOPS it reaches without them; its LDS
+// reads cost nothing measurable. In fp32 batched NN it ran 0.5-2.8x the old time with no
 // pattern a rule could follow. GFX803_SGEMM_WAVE overrides the rule for timing: 0 = never, 1 =
 // every call given the 64x64 tile, 3 = also those given the 32x32 tile.
 inline bool gfx803_w_applies(int tile, int M, bool transA, bool transB, int batch, size_t elem) {
