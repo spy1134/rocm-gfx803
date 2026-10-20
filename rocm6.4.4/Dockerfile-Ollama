@@ -63,10 +63,14 @@ RUN cmake -S llama/server --preset cpu \
          && grep -q moe_expand_after_weights \
              build/llama-server-cpu/_deps/llama_cpp-src/src/models/qwen3next.cpp \
          || { echo "112-moe-shared-expert-overlap.patch was not applied" >&2; exit 1; }; } \
+    && { grep -q GGML_SCHED_PREFETCH_SLOTS \
+             build/llama-server-cpu/_deps/llama_cpp-src/ggml/src/ggml-backend.cpp \
+         || { echo "126-moe-prefetch-slots.patch was not applied" >&2; exit 1; }; } \
     && cmake --build build/llama-server-cpu --parallel "$(nproc)" \
     && cmake --install build/llama-server-cpu --component llama-server --strip \
     && { grep -q GGML_SCHED_EXPERT_PREFETCH dist/lib/ollama/libggml-base.so.0.* \
          && grep -q GGML_SCHED_EARLY_HOST_INPUTS dist/lib/ollama/libggml-base.so.0.* \
+         && grep -q GGML_SCHED_PREFETCH_SLOTS dist/lib/ollama/libggml-base.so.0.* \
          || { echo "the installed libggml-base.so lacks the scheduler patches" >&2; exit 1; }; }
 
 # Ollama applies every *.patch under llama/compat to the llama.cpp source it
@@ -141,6 +145,15 @@ RUN CC=/opt/rocm/llvm/bin/clang CXX=/opt/rocm/llvm/bin/clang++ \
     && { grep -qF mul_mat_vec_q_group \
              build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/mmvq.cu \
          || { echo "122-mmvq-shared-input-group.patch was not applied" >&2; exit 1; }; } \
+    && { grep -qF rms_norm_scale_pair_f32 \
+             build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/norm.cu \
+         || { echo "123-gdn-qk-norm-pair.patch was not applied" >&2; exit 1; }; } \
+    && { grep -qF fwht_set_rows_q8_0_cuda \
+             build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/fwht.cu \
+         || { echo "124-kv-hadamard-fold.patch was not applied" >&2; exit 1; }; } \
+    && { grep -qF ggml_cuda_op_sigmoid_mul_strided \
+             build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/unary.cu \
+         || { echo "125-attn-gate-strided.patch was not applied" >&2; exit 1; }; } \
     && { grep -q ggml_backend_sched_prefetch_split \
              build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-backend.cpp \
          || { echo "108-moe-expert-prefetch.patch was not applied" >&2; exit 1; }; } \

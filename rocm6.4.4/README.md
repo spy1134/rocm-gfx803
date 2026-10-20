@@ -541,6 +541,20 @@ measurements and a reproduction. In short:
   (llama-bench with every expert in RAM: 24.6 -> 25.6), identical outputs.
   Like 108, it is in `patches/ollama/llama-cpp-sched/`, because both the
   scheduler and the model graphs are compiled into the CPU build.
+- **126-moe-prefetch-slots.patch**: 108's prefetch kept two device slots, so
+  the copy of an expert split could only start once the split two back had
+  finished; with the copies already at the PCIe link's limit (13.3 GB/s) and
+  the host blocking on copy events (`ROC_CPU_WAIT_FOR_SIGNAL=1`), the GPU
+  idled between splits. A third slot lets each copy start one split
+  earlier. Qwen3.6 35B-A3B, llama-bench with every expert in RAM: pp2048
+  565 -> 599 tok/s (+6%), pp512 282 -> 331 (+17%), generation unchanged,
+  perplexity identical at every chunk. Costs one more slot of VRAM (210 MiB
+  for this model); `GGML_SCHED_PREFETCH_SLOTS=2` restores 108's behaviour
+  for a tight VRAM budget, 4 is the maximum. Through Ollama (2,800-token
+  prompt): prompts 492 / 487 -> 522 / 522 tok/s, generation 27.5 -> 27.6-27.8.
+  Where llama.cpp's fit keeps some experts in VRAM, the extra slot moves
+  about 290 MiB of them back to RAM, so those run on the CPU and the greedy
+  text can differ from a 2-slot run at a near-tie.
 - **113-116: fewer dispatches per generated token.** On gfx803 every GPU
   dispatch costs about 4.3 us of command-processor time however small the
   kernel, and a Qwen3.6 35B-A3B token issues about 1,425 of them. Four
@@ -624,6 +638,16 @@ measurements and a reproduction. In short:
   before: 110 dispatches per token fewer on Qwen3.6 35B-A3B, 24.62 -> 25.10
   tok/s (+2.0%), perplexity and greedy output identical. Needs 103, 111 and
   113.
+- **123-gdn-qk-norm-pair.patch**, **124-kv-hadamard-fold.patch** and
+  **125-attn-gate-strided.patch**: three more decode fusions with unchanged
+  arithmetic. 123 runs the two l2 norms of a DeltaNet layer's q and k as one
+  launch; 124 folds the Hadamard transforms that a q8_0 KV cache adds to
+  attention into the kernels next to them (the rope of q and k, the
+  set_rows of k and v, the sigmoid gate of the output); 125 lets that gate
+  read its values in place instead of from a copy. 90 dispatches per token
+  fewer on Qwen3.6 35B-A3B; together 26.30 -> 26.50 tok/s (+0.7%, three
+  rounds), perplexity and greedy output identical. A series: 124 needs 123,
+  125 needs 124.
 
 `patches/ollama/unapplied/` holds `109-sched-batched-host-copies.patch`, which is
 not built: with the scheduler patched and `HSA_ENABLE_SDMA=1`, MoE generation
@@ -660,9 +684,9 @@ GPU:
 The llama.cpp kernel patches 100-104, 106 and 118 are gfx803-only by
 construction: each takes effect only for `GGML_CUDA_CC_GCN4` or `__gfx803__` and
 is sized from gfx803 register and bandwidth measurements. 105 changes q5_K's dot
-product for every GPU, with the same arithmetic. 107, 108, 111-117, 119-122, 090
+product for every GPU, with the same arithmetic. 107, 108, 111-117, 119-126, 090
 and the two Ollama patches fix problems that are not specific to any GPU (107,
-108, 111-117 and 119-122 were measured on gfx803 only).
+108, 111-117 and 119-126 were measured on gfx803 only).
 Upstream llama.cpp master (checked 2026-10-03, b11382) still has the vec
 kernel 102 replaces on gfx803, unchanged; llama.cpp issue
 [#27796](https://github.com/ggml-org/llama.cpp/issues/27796) reports the same

@@ -1,0 +1,199 @@
+llama.cpp (as fetched by Ollama v0.35.1, llama.cpp b11232), on top of
+patches 108 and 112: the MoE expert prefetch of patch 108 is only two
+splits deep, and with host-blocking HIP waits the GPU idles between expert
+splits. Not gfx803-specific code; measured on gfx803.
+
+WHY
+---
+Patch 108 copies a MoE split's host expert weights into one of two device
+slots while the previous split computes. The scheduler splits a MoE layer
+at every weight kept in another buffer, so a Qwen3.6 35B-A3B layer is
+three prefetched splits (gate, up, down; one expert tensor each, 144 MiB
+Q4_K or 210 MiB Q6_K), and the two slots alternate per split: the copy for
+split k+1 goes into the slot of split k-1 and waits for it.
+
+The copies already run at the link limit (13.3 GB/s on PCIe Gen3 x16,
+1.47 s of copies per 2048-token batch). The loss is in the scheduling.
+ROC_CPU_WAIT_FOR_SIGNAL=1, which gfx8 needs so that no wait packet lands
+in the SDMA queue, makes HIP wait for events on the host: the scheduler
+thread blocks in hipStreamWaitEvent until split k-1 has finished and then
+in hipEventRecord on the copy stream for the whole copy, and only then
+builds and submits split k+1. The GPU queue never holds more than one
+split, and every split shorter than the next copy plus the host work
+leaves the GPU idle.
+
+WHAT
+----
+The number of slots is N = 3 by default; GGML_SCHED_PREFETCH_SLOTS (2 to
+4) overrides it. Prefetched splits use the slots in turn. The issue order
+is unchanged: the copy for split k+1 is issued once split k is submitted
+and waits for the slot's previous user, now split k-2, which has normally
+finished. The copy starts at once and the scheduler thread blocks only for
+the copy itself while the GPU works on splits k-1 and k. Every ordering
+of 108 holds for any N: a copy waits for the compute of its slot's
+previous user, which was submitted (and its compute_done recorded) at
+least one split earlier, and each compute waits for its own copy. No new
+wait is placed on the copy stream. GGML_SCHED_PREFETCH_SLOTS=2 restores
+exactly the behaviour of patch 108 and is the knob for tight VRAM.
+
+VRAM: N slots, each the largest one split's host weights: 210 MiB per
+slot for Qwen3.6 35B-A3B Q4_K_M, so the default third slot costs 210 MiB
+more than patch 108 (630 instead of 420 MiB; 840 MiB with 4).
+ggml_backend_sched_get_buffer_size and the reserve size count all N, so
+memory fitting sees them.
+
+VERIFIED ON REAL HARDWARE (RX 590, llama-bench, Qwen3.6 35B-A3B
+Q4_K_M, -ncmoe 99, HSA_ENABLE_SDMA=1, ROC_CPU_WAIT_FOR_SIGNAL=1, tok/s):
+
+| prompt / ubatch | 2 slots       | 3 slots       |
+| --------------- | ------------- | ------------- |
+| pp2048 / 2048   | 565.5, 565.2  | 598.7, 598.9  |
+| pp512 / 512     | 282.2, 281.6  | 331.8, 330.9  |
+| tg128           | 25.89, 26.22  | 26.07, 26.12  |
+
+Host time per 2048-token batch: the scheduler thread's wait for the
+slot's previous compute fell from 2024 to 1797 ms, the copy record stayed
+at 1468 ms (the copies' own duration), and no compute had to wait for its
+copy. Results are unchanged: llama-perplexity with 2 and 3 slots (512-token
+batches, 8 chunks) gives the same perplexity at every chunk. 0 GPU faults.
+
+Through Ollama (2,800-token prompt, two rounds, all experts placed by
+llama.cpp's fit with the desktop's VRAM in use): prompts 492 / 487 ->
+522 / 522 tok/s, generation 27.5 / 27.5 -> 27.8 / 27.6 tok/s. The fit sees
+the larger compute buffer (866 -> 1077 MiB) and keeps about 290 MiB fewer
+expert weights in VRAM; those experts then run on the CPU, whose kernels
+round differently, so Qwen3.6's greedy text differs from a 2-slot run from
+a near-tie on. Models whose weights all fit are unaffected (greedy output
+identical on Qwen3 8B, Gemma 4 E2B and Gemma 3n E2B).
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -764,6 +764,8 @@
+ #define GGML_SCHED_MAX_BACKENDS 16
+ #endif
+ 
++#define GGML_SCHED_EXPERT_MAX_SLOTS 4
++
+ #ifndef GGML_SCHED_MAX_SPLIT_INPUTS
+ #define GGML_SCHED_MAX_SPLIT_INPUTS 30
+ #endif
+@@ -841,13 +843,14 @@
+ 
+     // MoE expert prefetch: see ggml_backend_sched_assign_expert_slots
+     bool                  expert_prefetch;
++    int                   expert_n_slots;
+     ggml_backend_t        expert_copy_backend[GGML_SCHED_MAX_BACKENDS];
+-    ggml_backend_buffer_t expert_slot_buf[GGML_SCHED_MAX_BACKENDS][2];
++    ggml_backend_buffer_t expert_slot_buf[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_EXPERT_MAX_SLOTS];
+     size_t                expert_slot_size[GGML_SCHED_MAX_BACKENDS];
+     size_t                expert_slot_need[GGML_SCHED_MAX_BACKENDS];
+-    ggml_backend_event_t  expert_copy_done[GGML_SCHED_MAX_BACKENDS][2];
+-    ggml_backend_event_t  expert_compute_done[GGML_SCHED_MAX_BACKENDS][2];
+-    bool                  expert_compute_recorded[GGML_SCHED_MAX_BACKENDS][2];
++    ggml_backend_event_t  expert_copy_done[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_EXPERT_MAX_SLOTS];
++    ggml_backend_event_t  expert_compute_done[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_EXPERT_MAX_SLOTS];
++    bool                  expert_compute_recorded[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_EXPERT_MAX_SLOTS];
+     int                 * expert_split_slot; // [splits_capacity]: slot of each split, -1 = none
+     int                   expert_split_slot_cap;
+ 
+@@ -1615,12 +1618,18 @@
+ // host memory, and more than half the time at 512-token batches. Once a batch is large enough that
+ // almost every expert is used (tokens x experts-per-token >= 4 x experts, so under 2% go unused),
+ // copying all of them costs the same, needs no router output, and can start early. Such splits get
+-// their host weights in one of two device slots outside the graph allocator, alternating from one
++// their host weights in one of N device slots outside the graph allocator, used in turn from one
+ // MoE split to the next; a second backend instance on the same device (its own stream) copies the
+-// next split's weights into the other slot while the current split computes. Events order the
+-// copy after the slot's previous user and the compute after its copy.
++// next split's weights into its slot while the current split computes. Events order the copy after
++// the slot's previous user and the compute after its copy.
++//
++// N = 3 by default (GGML_SCHED_PREFETCH_SLOTS = 2..4). The copy for split k+1 is issued once split k
++// is submitted and waits for the slot's previous user, split k+1-N. With ROC_CPU_WAIT_FOR_SIGNAL=1
++// that wait blocks the scheduler thread on the host; with two slots it is split k-1, still running,
++// and the thread then also blocks for the copy, so the GPU queue holds only split k. With three it is
++// split k-2, normally finished, and the copy runs while k-1 and k are queued.
+ //
+-// VRAM cost: two slots, each the largest one split's host weights, instead of the one copy the graph
++// VRAM cost: N slots, each the largest one split's host weights, instead of the one copy the graph
+ // allocator would place; the scheduler reports the slots in its buffer size, so memory fitting
+ // counts them. GGML_SCHED_EXPERT_PREFETCH=0 disables it.
+ 
+@@ -1703,7 +1712,7 @@
+                 offset = GGML_PAD(offset, align) + ggml_backend_buft_get_alloc_size(buft, tensor_copy(split->inputs[j], b, 0));
+             }
+         }
+-        sched->expert_split_slot[i] = count[b]++ % 2;
++        sched->expert_split_slot[i] = count[b]++ % sched->expert_n_slots;
+         sched->expert_slot_need[b] = std::max(sched->expert_slot_need[b], offset);
+     }
+     if (!allocate) {
+@@ -1718,17 +1727,20 @@
+         ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[b]);
+         if (!sched->expert_copy_backend[b]) {
+             sched->expert_copy_backend[b] = ggml_backend_dev_init(dev, NULL);
+-            for (int s = 0; s < 2; s++) {
++            for (int s = 0; s < sched->expert_n_slots; s++) {
+                 sched->expert_copy_done[b][s]    = ggml_backend_event_new(dev);
+                 sched->expert_compute_done[b][s] = ggml_backend_event_new(dev);
+             }
+         }
+-        if (!sched->expert_copy_backend[b] || !sched->expert_copy_done[b][0] || !sched->expert_copy_done[b][1] ||
+-            !sched->expert_compute_done[b][0] || !sched->expert_compute_done[b][1]) {
++        bool have_events = sched->expert_copy_backend[b] != NULL;
++        for (int s = 0; s < sched->expert_n_slots; s++) {
++            have_events = have_events && sched->expert_copy_done[b][s] && sched->expert_compute_done[b][s];
++        }
++        if (!have_events) {
+             ggml_backend_sched_disable_expert_prefetch(sched, "no second stream or events on this device");
+             return;
+         }
+-        for (int s = 0; s < 2; s++) {
++        for (int s = 0; s < sched->expert_n_slots; s++) {
+             ggml_backend_buffer_free(sched->expert_slot_buf[b][s]);
+             sched->expert_slot_buf[b][s] = ggml_backend_buft_alloc_buffer(sched->bufts[b], sched->expert_slot_need[b]);
+             if (!sched->expert_slot_buf[b][s]) {
+@@ -2245,6 +2257,12 @@
+     {
+         const char * v = getenv("GGML_SCHED_EXPERT_PREFETCH");
+         sched->expert_prefetch = !(v && v[0] == '0');
++        const char * n = getenv("GGML_SCHED_PREFETCH_SLOTS");
++        sched->expert_n_slots = n ? atoi(n) : 3;
++        if (sched->expert_n_slots < 2 || sched->expert_n_slots > GGML_SCHED_EXPERT_MAX_SLOTS) {
++            GGML_LOG_WARN("%s: GGML_SCHED_PREFETCH_SLOTS=%s is outside 2..%d, using 3\n", __func__, n, GGML_SCHED_EXPERT_MAX_SLOTS);
++            sched->expert_n_slots = 3;
++        }
+     }
+ 
+     ggml_backend_sched_reset(sched);
+@@ -2265,7 +2283,7 @@
+         if (sched->expert_copy_backend[b]) {
+             ggml_backend_synchronize(sched->expert_copy_backend[b]);
+         }
+-        for (int s = 0; s < 2; s++) {
++        for (int s = 0; s < GGML_SCHED_EXPERT_MAX_SLOTS; s++) {
+             ggml_backend_buffer_free(sched->expert_slot_buf[b][s]);
+             ggml_backend_event_free(sched->expert_copy_done[b][s]);
+             ggml_backend_event_free(sched->expert_compute_done[b][s]);
+@@ -2321,9 +2339,9 @@
+ 
+     ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
+     // without allocation the slot-bound copies are still counted once by the graph allocator;
+-    // the two slots come on top, an overestimate by one split's weights
++    // the slots come on top, an overestimate by one split's weights
+     for (int b = 0; b < sched->n_backends; b++) {
+-        sizes[b] += 2 * sched->expert_slot_need[b];
++        sizes[b] += sched->expert_n_slots * sched->expert_slot_need[b];
+     }
+ }
+ 
+@@ -2442,7 +2460,7 @@
+     int backend_index = ggml_backend_sched_backend_id(sched, backend);
+     GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
+ 
+-    return ggml_gallocr_get_buffer_size(sched->galloc, backend_index) + 2 * sched->expert_slot_size[backend_index];
++    return ggml_gallocr_get_buffer_size(sched->galloc, backend_index) + sched->expert_n_slots * sched->expert_slot_size[backend_index];
+ }
+ 
+ void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend) {

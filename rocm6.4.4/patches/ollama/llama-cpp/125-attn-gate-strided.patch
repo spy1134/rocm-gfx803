@@ -1,0 +1,239 @@
+llama.cpp (as fetched by Ollama v0.35.1, llama.cpp b11232, applied after
+124): at one token, the sigmoid gate of a gated attention layer reads its
+gate values in place instead of from a CONT copy.
+Generic (all GPUs): not gfx803-specific code; measured on gfx803.
+
+WHY
+---
+Single-token decode on an RX 590 pays for every dispatch as well as for the
+work in it: each one costs about 4.3 us of command-processor time however
+small the kernel, a 2.65 us floor plus 1.65 us for the vector-L1 invalidate
+that every dispatch needs on gfx8 (docs/FINDINGS.md, "A kernel can read
+stale data from the vector L1 across dispatches").
+
+The attention layers of Qwen3.5/3.6 project q and an output gate together
+and take the gate as a strided view of the projection (every other row of
+head size). The graph copies it out with CONT (cpy_scalar, 4096 floats on
+Qwen3.6 35B-A3B) before SIGMOID -> MUL, which the CUDA backend already runs
+as one fused kernel. That kernel indexes its input by rows of n values o0
+apart, so it can read the view where it is: 10 dispatches per token fewer on
+Qwen3.6 35B-A3B (10 attention layers).
+
+Measured on an RX 590 (Qwen3.6 35B-A3B Q4_K_M, every expert in system RAM,
+llama-bench -ncmoe 99, q8_0 KV cache): taken 10 times (once per attention
+layer) per decode token, as expected; llama-perplexity at one token per
+batch gives per-chunk values and summary lines equal to the build without
+the patch, and greedy output (128 tokens) is byte-identical. 123-125
+together: tg128 26.33 / 26.26 / 26.31 -> 26.34 / 26.67 / 26.48 tok/s in
+three alternating rounds (+0.7%).
+
+WHAT
+----
+ggml_cuda_match_attn_gate (124) also folds the SIGMOID's input when it is an
+f32 CONT, read only by the SIGMOID and within 48 nodes before it, of an f32
+view whose elements are contiguous within rows and whose rows are evenly
+spaced: the CONT is skipped when the loop reaches it, and the gate reads the
+view with n = its row length and o0 = its row stride, through
+fwht_sigmoid_mul_f32 when 124's transform is folded too, otherwise through
+ggml_cuda_op_sigmoid_mul_strided, which launches
+unary_gated_op_kernel<op_sigmoid> with the view as x and the other operand
+as a contiguous g. Nothing between the CONT and the SIGMOID may write the
+view's bytes, and the MUL's output may not overlap them; graph_optimize
+keeps the viewed tensor allocated until the MUL.
+
+Numerics are unchanged: CONT copies f32 to f32 exactly, and every gate
+value is op_sigmoid(x) * g of the same x and g in the same kernel code.
+
+diff -ru a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu	2026-10-20 03:12:03.465796657 -0700 b/ggml/src/ggml-cuda/ggml-cuda.cu	2026-10-20 03:12:03.465796657 -0700
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu	2026-10-20 03:12:03.465796657 -0700
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu	2026-10-20 03:12:03.467875101 -0700
+@@ -4598,19 +4598,33 @@
+ }
+ 
+ // The sigmoid gate of a gated attention output (Qwen3.5/3.6), SIGMOID(gate) -> MUL(attn, sigmoid) as the
+-// fused unary * mul takes it, where attn is a same-bytes view of the Hadamard MUL_MAT that undoes the V
+-// rotation of the q8_0 cache on the attention output. The transform is not run when the loop reaches it; at
+-// the SIGMOID one kernel transforms and gates. With check_data the tensors' memory is known and checked too;
+-// graph_optimize calls it without, to keep the transform's input allocated until the MUL.
++// fused unary * mul takes it, with what feeds it folded in: the Hadamard MUL_MAT that undoes the V rotation
++// of the q8_0 cache on the attention output (attn is a same-bytes view of it), and the CONT that copies gate
++// out of a strided view of the q projection (the kernel reads the view in place). The folded nodes are not
++// run when the loop reaches them; at the SIGMOID one kernel computes the gated output. With check_data the
++// tensors' memory is known and checked too; graph_optimize calls it without, to keep the folded nodes'
++// inputs allocated until the MUL.
+ struct ggml_cuda_attn_gate_match {
+     int                 fwht_idx = -1;
++    int                 cont_idx = -1;
+     const ggml_tensor * fwht_src = nullptr;
++    const ggml_tensor * g        = nullptr;
+     const ggml_tensor * x        = nullptr;
+     int64_t             n        = 0;
+     int64_t             o0       = 0;
+     ggml_tensor *       dst      = nullptr;
+ };
+ 
++// rows of ne[0] values evenly spaced nb[1] apart through all higher dims
++static bool ggml_cuda_rows_evenly_spaced(const ggml_tensor * t) {
++    for (int d = 2; d < GGML_MAX_DIMS; ++d) {
++        if (t->ne[d] > 1 && t->nb[d] != t->ne[d - 1] * t->nb[d - 1]) {
++            return false;
++        }
++    }
++    return true;
++}
++
+ static bool ggml_cuda_match_attn_gate(const ggml_cgraph * cgraph, int i, ggml_cuda_attn_gate_match & m, bool check_data) {
+     if (i + 1 >= cgraph->n_nodes || !ggml_cuda_is_unary_op(cgraph->nodes[i], GGML_UNARY_OP_SIGMOID) ||
+             !ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID })) {
+@@ -4623,34 +4637,61 @@
+             !ggml_cuda_f32_contiguous(g) || ggml_nelements(g) != ggml_nelements(mul)) {
+         return false;
+     }
+-    const ggml_tensor * x = sig->src[0];
+ 
++    const ggml_tensor * x  = sig->src[0];
++    int64_t             n  = x->ne[0];
++    int64_t             o0 = x->nb[1] / sizeof(float);
++    int cont_idx = -1;
++    if (x->op == GGML_OP_CONT && ggml_cuda_f32_contiguous(x) && ggml_cuda_single_use(cgraph, x)) {
++        const ggml_tensor * v = x->src[0];
++        if (v->type == GGML_TYPE_F32 && v->nb[0] == sizeof(float) && v->nb[1] % sizeof(float) == 0 &&
++                ggml_nelements(v) == ggml_nelements(x) && ggml_cuda_rows_evenly_spaced(v)) {
++            cont_idx = ggml_cuda_node_index_before(cgraph, i, x, ggml_cuda_deferred_window);
++            if (cont_idx >= 0) {
++                x  = v;
++                n  = v->ne[0];
++                o0 = v->nb[1] / sizeof(float);
++            }
++        }
++    }
++
++    int fwht_idx = -1;
++    const ggml_tensor * fwht_src = nullptr;
+     const ggml_tensor * fwht = ggml_cuda_same_bytes_origin(cgraph, g);
+-    if (fwht == nullptr || fwht == g || fwht->op != GGML_OP_MUL_MAT || !ggml_cuda_op_mul_mat_use_fwht(fwht) ||
+-            !ggml_cuda_single_use(cgraph, fwht) || fwht->src[1]->type != GGML_TYPE_F32 ||
+-            !ggml_cuda_fwht_size_supported(fwht->src[1]->ne[0])) {
+-        return false;
++    if (fwht != nullptr && fwht != g && fwht->op == GGML_OP_MUL_MAT && ggml_cuda_op_mul_mat_use_fwht(fwht) &&
++            ggml_cuda_single_use(cgraph, fwht) && fwht->src[1]->type == GGML_TYPE_F32 &&
++            ggml_cuda_fwht_size_supported(fwht->src[1]->ne[0])) {
++        fwht_idx = ggml_cuda_node_index_before(cgraph, i, fwht, ggml_cuda_deferred_window);
++        if (fwht_idx >= 0) {
++            fwht_src = fwht->src[1];
++        }
+     }
+-    const int fwht_idx = ggml_cuda_node_index_before(cgraph, i, fwht, ggml_cuda_deferred_window);
+-    if (fwht_idx < 0) {
++    if (cont_idx < 0 && fwht_idx < 0) {
+         return false;
+     }
+-    const ggml_tensor * fwht_src = fwht->src[1];
+ 
+     if (check_data) {
+-        // the transform's input is read at the SIGMOID: nothing in between may write it
+-        if (!ggml_cuda_bytes_untouched(cgraph, fwht_idx, i, fwht_src->data, ggml_nbytes(fwht_src), false, {})) {
++        // inputs of folded nodes are read at the SIGMOID: nothing in between may write them
++        if (cont_idx >= 0 && !ggml_cuda_bytes_untouched(cgraph, cont_idx, i, x->data, ggml_nbytes(x), false, {})) {
++            return false;
++        }
++        if (fwht_idx >= 0 && !ggml_cuda_bytes_untouched(cgraph, fwht_idx, i, fwht_src->data, ggml_nbytes(fwht_src), false, {})) {
++            return false;
++        }
++        if (cont_idx >= 0 ? ggml_cuda_bytes_overlap(mul, x) : ggml_cuda_overlap_unless_alias(mul, x)) {
+             return false;
+         }
+-        if (ggml_cuda_overlap_unless_alias(mul, x) || ggml_cuda_overlap_unless_alias(mul, fwht_src)) {
++        if (ggml_cuda_overlap_unless_alias(mul, fwht_idx >= 0 ? fwht_src : g)) {
+             return false;
+         }
+     }
+     m.fwht_idx = fwht_idx;
++    m.cont_idx = cont_idx;
+     m.fwht_src = fwht_src;
++    m.g        = g;
+     m.x        = x;
+-    m.n        = x->ne[0];
+-    m.o0       = x->nb[1] / sizeof(float);
++    m.n        = n;
++    m.o0       = o0;
+     m.dst      = mul;
+     return true;
+ }
+@@ -4662,18 +4703,24 @@
+         if (!ggml_cuda_match_attn_gate(cgraph, i, m, /*check_data=*/true)) {
+             return false;
+         }
+-        ggml_cuda_op_fwht_sigmoid_mul(*ctx, m.fwht_src, (const float *) m.x->data, m.n, m.o0, (float *) m.dst->data);
++        if (m.fwht_idx >= 0) {
++            ggml_cuda_op_fwht_sigmoid_mul(*ctx, m.fwht_src, (const float *) m.x->data, m.n, m.o0, (float *) m.dst->data);
++        } else {
++            ggml_cuda_op_sigmoid_mul_strided(*ctx, (const float *) m.x->data, m.n, m.o0, (const float *) m.g->data,
++                                             (float *) m.dst->data, ggml_nelements(m.dst));
++        }
+         *skip = 1;
+         return true;
+     }
+-    if (node->op != GGML_OP_MUL_MAT || !ggml_cuda_op_mul_mat_use_fwht(node)) {
++    if (node->op != GGML_OP_CONT && !(node->op == GGML_OP_MUL_MAT && ggml_cuda_op_mul_mat_use_fwht(node))) {
+         return false;
+     }
+     const int last = std::min(cgraph->n_nodes - 2, i + ggml_cuda_deferred_window);
+     for (int j = i + 1; j <= last; ++j) {
+         ggml_cuda_attn_gate_match m;
+         if (ggml_cuda_is_unary_op(cgraph->nodes[j], GGML_UNARY_OP_SIGMOID) &&
+-                ggml_cuda_match_attn_gate(cgraph, j, m, /*check_data=*/true) && m.fwht_idx == i) {
++                ggml_cuda_match_attn_gate(cgraph, j, m, /*check_data=*/true) &&
++                (m.cont_idx == i || m.fwht_idx == i)) {
+             return true;
+         }
+     }
+@@ -4729,7 +4776,12 @@
+         }
+         ggml_cuda_attn_gate_match am;
+         if (ggml_cuda_match_attn_gate(cgraph, i, am, /*check_data=*/false)) {
+-            params->add_alloc_dep(params->user_data, root(am.fwht_src), am.dst);
++            if (am.fwht_idx >= 0) {
++                params->add_alloc_dep(params->user_data, root(am.fwht_src), am.dst);
++            }
++            if (am.cont_idx >= 0) {
++                params->add_alloc_dep(params->user_data, root(am.x), am.dst);
++            }
+         }
+     }
+ }
+diff -ru a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
+diff --git a/ggml/src/ggml-cuda/unary.cu	2026-10-20 03:12:03.481054430 -0700 b/ggml/src/ggml-cuda/unary.cu	2026-10-20 03:12:03.481054430 -0700
+--- a/ggml/src/ggml-cuda/unary.cu	2026-10-20 03:12:03.481054430 -0700
++++ b/ggml/src/ggml-cuda/unary.cu	2026-10-20 03:12:03.482498536 -0700
+@@ -721,6 +721,14 @@
+     }
+ }
+ 
++// The sigmoid gate of an attention output, op_sigmoid(x) * g as unary_gated_op_kernel computes it, with x read
++// in place from rows of n values o0 apart (the strided view that the graph copies out with CONT); g and dst
++// are contiguous. The same kernel instantiation as the fused unary * mul.
++void ggml_cuda_op_sigmoid_mul_strided(ggml_backend_cuda_context & ctx, const float * x, const int64_t n, const int64_t o0,
++                                      const float * g, float * dst, const int64_t k) {
++    unary_gated_cuda<op_sigmoid>(x, g, dst, k, n, o0, n, ctx.stream());
++}
++
+ // fwht_cuda over the rows of src (one row per warp, as fwht_cuda runs it), then op_sigmoid(x) * the
+ // transformed value as unary_gated_op_kernel computes it, x read from rows of n values o0 apart.
+ template <int N>
+diff -ru a/ggml/src/ggml-cuda/unary.cuh b/ggml/src/ggml-cuda/unary.cuh
+diff --git a/ggml/src/ggml-cuda/unary.cuh	2026-10-20 03:12:03.484205590 -0700 b/ggml/src/ggml-cuda/unary.cuh	2026-10-20 03:12:03.484205590 -0700
+--- a/ggml/src/ggml-cuda/unary.cuh	2026-10-20 03:12:03.484205590 -0700
++++ b/ggml/src/ggml-cuda/unary.cuh	2026-10-20 03:12:03.485589086 -0700
+@@ -122,6 +122,10 @@
+     return ggml_cuda_op_silu_single(gate) * up;
+ }
+ 
++// (see ggml_cuda_match_attn_gate) dst = sigmoid(x) * g over k values, x read from rows of n values o0 apart
++void ggml_cuda_op_sigmoid_mul_strided(ggml_backend_cuda_context & ctx, const float * x, int64_t n, int64_t o0,
++                                      const float * g, float * dst, int64_t k);
++
+ // (see ggml_cuda_match_attn_gate) dst = sigmoid(x) * fwht(fwht_src), x read from rows of n values o0 apart
+ void ggml_cuda_op_fwht_sigmoid_mul(ggml_backend_cuda_context & ctx, const ggml_tensor * fwht_src, const float * x,
+                                    int64_t n, int64_t o0, float * dst);
