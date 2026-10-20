@@ -171,7 +171,7 @@ Open targets in recommended order, then the done ones.
 
 | Target | Area | Expected gain | Status |
 | --- | --- | --- | --- |
-| LLM-6 | MoE prompts: expert copies, MUL_MAT_ID, dense parts | copies overlap compute since patch 108 (pp2048 295 -> 367 tok/s, against 376 with no copies at all); the rest is compute, with no breakdown | Open, profile first |
+| LLM-6 | MoE prompts: expert copies, MUL_MAT_ID, dense parts | copies overlap compute since patch 108 (pp2048 295 -> 367 tok/s, against 376 with no copies at all); of the rest, expert matmuls 42%, DeltaNet recurrence 26% (patch 117: pp2048 361 -> 455 tok/s), dense fp32 GEMMs 20%; a grouped fp32 expert GEMM is estimated at +9-23% | Open: grouped expert GEMM next |
 | RT-1 | Cost of the vector-L1 invalidate before every dispatch | 1.65 us per dispatch: ~2.4 ms of an MoE token (~6%), 2.3-2.7% of dense decode, ~2.4 ms of an SD 1.5 step. The cost is the extra ring slot, not the cache work: an empty-kernel dispatch costs 4.27-4.30 us with the shipped packet, with only the L1 bit, with poll interval 1, and with the L1 action moved onto the slot's RELEASE_MEM (no ACQUIRE_MEM), against 2.65 us without the slot | Measured, no cheaper packet; only fewer slots would help, and skipping the invalidate between kernels is not provably correct |
 | LLM-5 | Dense decode above the bandwidth bound | per 36 ms token: K-quant kernels ~2.9 ms, flash-attention decode ~2.6 ms at 5k depth, F16 `attn_v` ~1 ms, launches ~1 ms by fusion; the same kernels make up MoE generation's GPU part | Open, measured before the stale-L1 fix and patch 111 |
 | LLM-8 | MoE generation with experts in system RAM | Qwen3.6 35B-A3B, 39 ms per token before patches 113-116 (25.6 tok/s, llama-bench with a cold page cache): CPU experts ~16.7 ms, GPU kernels ~12 ms, ~1,425 dispatches at ~4.3 us each (~6 ms), hand-offs ~3 ms; 113-116 remove up to 300 dispatches per token (25.60 -> 27.51 tok/s) | Open: further fusions listed in LLM-8, each a few tenths of a ms |
@@ -219,14 +219,32 @@ the 128 where fp32 cuBLAS beats mmq.
 **Where the time goes.** A batch copies every layer's experts (about 20 GB)
 over PCIe, once per batch, so a larger batch amortizes the copy. At
 2048-token batches patch 108 hides nearly all of it (367 tok/s against 376
-with no copies at all), so what is left there is compute: the expert matmuls
-on mmq's MUL_MAT_ID (emulated int8 at ~2.4 effective TOPS), the dense
-layers, attention and scheduling. No per-part breakdown is recorded, and
-recording one is the next step: profile pp2048 with `HSA_ENABLE_SDMA=0`,
-because the same profiling run with SDMA on hung the GPU (sdma0 ring
-timeout). Kernel times carry over to the SDMA build; copy times do not.
+with no copies at all), so what is left there is compute. rocprof of one
+2048-token batch of Qwen3.6 35B-A3B (experts in system RAM, before patch
+117) splits about 6.6 s of GPU kernel time into:
+
+| Part | Time | Share | Rate |
+| --- | --- | --- | --- |
+| Expert matmuls (mmq MUL_MAT_ID) | 2.79 s | 42% | ~2.1 TFLOPS, the emulated-int8 rate |
+| DeltaNet recurrence (GATED_DELTA_NET, 30 calls of ~44 ms) | 1.71 s | 26% | ~225 GFLOP in all, under 2% of the fp32 rate |
+| Dense fp32 GEMMs on the shim (patch 106) | 1.33 s | 20% | ~4.4 TFLOPS |
+| Everything else | ~0.8 s | 12% | |
+
+Patch 117 removes most of the DeltaNet part (first option below); the
+expert matmuls are now the largest part by far.
 
 **Options.**
+- Done: patch 117 runs GATED_DELTA_NET for prompt batches with head size
+  128 on a kernel in which two lanes hold a state column in registers and
+  finish each dot product with one DPP add, with the token vectors staged
+  in LDS (FINDINGS section 9). pp2048 at 2048-token batches: 361 -> 455
+  tok/s (+26%); single-token decode keeps the old kernel. Mean KLD against
+  CPU logits 0.0107 against 0.0104 with the old kernel, within the spread
+  both GPU kernels show against the CPU.
+- Next: a grouped fp32 GEMM over all of a layer's experts in one launch,
+  at the rate of the dense fp32 GEMMs (~4.4 TFLOPS) instead of mmq's ~2.1,
+  estimated at +9-23% on pp2048 (unbuilt; the last item below shows why the
+  per-expert route does not get there).
 - Done: patch 108 copies the next MoE layer's experts into a second device
   slot on a second stream while the current layer computes, with
   `HSA_ENABLE_SDMA=1` so the copy runs on the DMA engine (FINDINGS section

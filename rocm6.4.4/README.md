@@ -568,6 +568,21 @@ measurements and a reproduction. In short:
     and its q8_1 quantize) runs as one kernel, whose q8_1 output becomes
     111's kept input (120 dispatches per token). Needs 111.
     Alone, HIP graphs off: 26.30 -> 26.70 tok/s (+1.5%).
+- **117-gdn-prefill-column-kernel.patch**: in a 2048-token prompt batch of
+  Qwen3.6 35B-A3B, the DeltaNet recurrence (GATED_DELTA_NET) took 26% of the
+  GPU time, 44 ms per call for little arithmetic, because its kernel spends a
+  whole wave on each state column and does two wave-wide reductions per
+  token. Prompt batches with head size 128 now run on a kernel in which two
+  lanes hold a column in registers and the tokens are staged in shared
+  memory; single-token decode keeps the existing kernel. llama-bench with
+  every expert in RAM, pp2048 at 2048-token batches: 361 -> 455 tok/s
+  (+26%), generation unchanged. The 128-long sums are added in a different
+  order, so results are not bit-identical, but they stay within the
+  existing GPU-versus-CPU spread: mean KL divergence against CPU logits
+  0.0107 against 0.0104 with the old kernel, perplexity 13.384 against
+  13.381 (CPU 13.355). Through Ollama (2,800-token prompt): 334 -> 401
+  tok/s (+20%); greedy output is identical on models without DeltaNet
+  layers and, on Qwen3.6, follows the old text until a near-tie.
 
 `patches/ollama/unapplied/` holds `109-sched-batched-host-copies.patch`, which is
 not built: with the scheduler patched and `HSA_ENABLE_SDMA=1`, MoE generation
@@ -604,8 +619,8 @@ GPU:
 The llama.cpp kernel patches 100-104 and 106 are gfx803-only by construction:
 each takes effect only for `GGML_CUDA_CC_GCN4` or `__gfx803__` and is sized from
 gfx803 register and bandwidth measurements. 105 changes q5_K's dot product for
-every GPU, with the same arithmetic. 107, 108, 111-116, 090 and the two Ollama
-patches fix problems that are not specific to any GPU (107, 108 and 111-116
+every GPU, with the same arithmetic. 107, 108, 111-117, 090 and the two Ollama
+patches fix problems that are not specific to any GPU (107, 108 and 111-117
 were measured on gfx803 only).
 Upstream llama.cpp master (checked 2026-10-03, b11382) still has the vec
 kernel 102 replaces on gfx803, unchanged; llama.cpp issue

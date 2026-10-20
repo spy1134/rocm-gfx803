@@ -47,6 +47,9 @@ architecture:
   register spills. MoE prompts prefetch experts over the card's DMA engines
   while the GPU computes, and MoE generation with the experts in system RAM
   runs the shared expert on the GPU while the CPU computes the routed ones.
+  Qwen3.5/3.6 prompts run the DeltaNet recurrence on a kernel that keeps its
+  state in registers (Qwen3.6 35B-A3B prompts 26% faster in 2048-token
+  batches).
 
 Text generation is limited mainly by memory bandwidth, so it had the least room
 to improve. Its gain grows with context length (20.9 to 26.5 tokens/s at 8,000

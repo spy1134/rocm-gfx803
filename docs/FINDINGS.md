@@ -115,6 +115,7 @@ run with wrong numbers, not a crash. "It runs" was never taken as evidence.
 | GPU resets: `ring sdma0 timeout` with SDMA copies on | Fixed in the image (trigger removed): a kernel waiting for scratch, the page-table update that maps it, and a user SDMA queue polling for a kernel behind it deadlock engine 0 once a second process tips page-table jobs onto that engine; CLR now waits for dependencies on the CPU (prompt speed unchanged). The engine's behaviour remains | 3 | `ROC_CPU_WAIT_FOR_SIGNAL=1` in Dockerfile-Ollama |
 | MoE generation: the GPU idles during the CPU experts, the shared expert waits for them | Faster (all GPUs) | 9 | `patches/ollama/llama-cpp-sched/112-*` |
 | MoE generation: ~1,425 GPU dispatches per token at ~4.3 us each | Faster (all GPUs) | 9 | `patches/ollama/llama-cpp/113-*` to `116-*` |
+| MoE prompts: the DeltaNet recurrence spends a wave per state column (26% of a Qwen3.6 prompt batch) | Faster (all GPUs; prompts +26%) | 9 | `patches/ollama/llama-cpp/117-*` |
 | Ollama rejects argument-less tools | Fixed (all GPUs) | 9 | `patches/ollama/ollama/` |
 | llama.cpp reserves a vision projector's memory on the wrong device | Fixed (all GPUs) | 9 | `patches/ollama/llama-cpp-server/` |
 | Ollama keeps stale free-memory figures on slow-starting GPUs | Fixed (all GPUs) | 9 | `patches/ollama/ollama/` |
@@ -1157,6 +1158,33 @@ bullets are the original findings (patches 100-105); the rest build on them.
   Arithmetic is unchanged: greedy output byte-identical on four models, and
   llama-perplexity at 1-token batches gives the same PPL in every digit with
   KL divergence 0.
+- **The DeltaNet recurrence spent a wave per state column on prompts.** In a
+  2048-token prompt batch of Qwen3.6 35B-A3B, GATED_DELTA_NET took about 44
+  ms per call, 30 calls and 1.71 s of about 6.6 s of GPU kernel time (26%),
+  for about 225 GFLOP, under 2% of the card's fp32 rate. The kernel gives
+  each 128-float state column one wave and walks the tokens in order; per
+  token every lane loads k, q, v, the gate and beta from global memory and
+  the wave does two wave-wide reductions around a few multiply-adds per
+  lane. `117-gdn-prefill-column-kernel.patch` runs batches of more than one
+  token with head size 128 on a kernel in which two neighbouring lanes hold
+  a column (64 rows each in registers) and finish each dot product with one
+  DPP add, a block of 128 threads covers 64 columns, and the token vectors
+  are staged in LDS in chunks of 16 tokens (8 with KDA). On gfx803 its token
+  loop is v_mac_f32 and v_mul_f32 only, at 159-165 VGPRs with no scratch.
+  llama-bench with every expert in RAM, pp2048 at 2048-token batches: 361
+  -> 455 tok/s (+26%); single-token decode keeps the old kernel, so
+  generation is unchanged. The 128-long sums are added in a different
+  order, so outputs are not bit-identical: test-backend-ops passes 47/47
+  GATED_DELTA_NET cases against the CPU at NMSE 1e-7 with either kernel,
+  and against CPU logits (llama-perplexity, 512-token batches, q8_0 KV
+  cache) mean KLD is 0.0107 +- 0.0005 against 0.0104 +- 0.0005 with the old
+  kernel, PPL 13.384 against 13.381 (CPU 13.355), same top token 95.3%
+  against 95.8% (+- 0.45). The recurrence carries rounding forward through
+  every token, and both GPU kernels sit about 0.01 KLD from the CPU.
+  Through Ollama a 2,800-token prompt reads 334 -> 401 tok/s (+20%); greedy
+  output is unchanged on models without DeltaNet layers, and on Qwen3.6 it
+  follows the old text for 220 characters and then diverges at a near-tie
+  (an em dash against a comma).
 
 Upstream llama.cpp has no equivalent of the third fix; issue
 [#27796](https://github.com/ggml-org/llama.cpp/issues/27796) reports the same

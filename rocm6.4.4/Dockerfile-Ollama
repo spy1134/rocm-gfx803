@@ -123,6 +123,9 @@ RUN CC=/opt/rocm/llvm/bin/clang CXX=/opt/rocm/llvm/bin/clang++ \
     && { grep -q moe_tail_rms_norm_mul_q8_1_f32 \
              build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/norm.cu \
          || { echo "116-moe-tail-norm-q8_1.patch was not applied" >&2; exit 1; }; } \
+    && { grep -q gated_delta_net_col_cuda \
+             build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/gated_delta_net.cu \
+         || { echo "117-gdn-prefill-column-kernel.patch was not applied" >&2; exit 1; }; } \
     && { grep -q ggml_backend_sched_prefetch_split \
              build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-backend.cpp \
          || { echo "108-moe-expert-prefetch.patch was not applied" >&2; exit 1; }; } \

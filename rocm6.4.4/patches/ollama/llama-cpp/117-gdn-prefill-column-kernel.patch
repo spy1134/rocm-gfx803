@@ -1,0 +1,349 @@
+llama.cpp (as fetched by Ollama v0.35.1, llama.cpp b11232, applied after
+116): GATED_DELTA_NET with head size 128 runs prompt batches on a kernel
+that gives each state column to two lanes instead of a whole wave.
+Generic (all GPUs): not gfx803-specific code; measured on gfx803.
+
+WHY
+---
+In a 2048-token prompt batch of Qwen3.6 35B-A3B, rocprof puts each
+GATED_DELTA_NET call at about 44 ms; the 30 calls (one per DeltaNet layer)
+take 1.71 s of about 6.6 s of GPU kernel time, 26%. The arithmetic is
+small: per token and head, three multiply-add passes over the 128 x 128
+state (kv = S k, the update S = g S + k delta, the output S q) and one
+scaling pass, about 225 GFLOP for the batch, which the RX 590's 7.1 fp32
+TFLOPS cover in about 32 ms. The existing kernel gives each state column
+one wave and walks the tokens one after another: per token every lane
+loads k, q, v, the gate and beta from global memory, and the wave does two
+wave-wide reductions around a few multiply-adds per lane, so the shuffles
+and the serial load latency set the pace.
+
+Measured on an RX 590 (llama-bench, Qwen3.6 35B-A3B Q4_K_M, all experts in
+system RAM with -ncmoe 99, pp2048 with 2048-token batches, 3 repetitions,
+two interleaved rounds, page cache dropped before each run,
+HSA_ENABLE_SDMA=1 ROC_CPU_WAIT_FOR_SIGNAL=1): 341.50 +- 34.93 and
+361.16 +- 1.86 tok/s without the patch, 454.99 +- 3.26 and 455.65 +- 1.37
+tok/s with it (+26%). Generation is unchanged, because single-token decode
+keeps the existing kernel.
+
+WHAT
+----
+launch_gated_delta_net runs gated_delta_net_col_cuda when n_tokens > 1 and
+S_v == 128. Two neighbouring lanes own one state column, 64 rows each held
+in registers: lane h of the pair holds rows 8m + 4h + e (m < 16, e < 4), so
+the column is read and written as float4 and both lanes read neighbouring
+float4s of the same shared-memory row. A dot product over the column is a
+sequential sum over the lane's 64 rows plus one exchange with the
+neighbour: a DPP move (quad_perm [1,0,3,2]) on HIP, __shfl_xor_sync on
+CUDA; x + y == y + x, so both lanes hold the same bits afterwards. A block
+of 128 threads takes 64 columns; the grid is (heads, sequences, 2). Each
+block stages a chunk of tokens in shared memory with coalesced loads: k_t
+and q_t (128 floats each), v_t for its 64 columns, beta_t and expf(g_t)
+(the whole gate row with KDA, so expf runs once per element rather than
+once per lane). A chunk is 16 tokens (20.6 KB) or 8 with KDA (14.4 KB),
+under 32 KB so that two blocks share a CU. Per token a lane reads k and q
+as broadcast loads and updates its 64 rows in registers. On gfx803 the
+token loop compiles to v_mac_f32 and v_mul_f32 with no v_fma_f32 (a
+quarter-rate instruction there), at 159-165 VGPRs and no scratch;
+__launch_bounds__(128, 1) allows that register count, which means one wave
+per SIMD, and the four waves of two blocks occupy a CU's four SIMDs.
+
+The kernel keeps every variant of the existing one: KDA, the snapshot
+slots of keep_rs_t, several sequences, the GQA head mapping, the fused
+snapshot store into the cache (ggml_cuda_try_gdn_cache_fusion), and 114's
+state_ids_t variant that reads the state from cache row ids[seq]. Reading
+and storing the same cache row is safe here as well: each lane reads all
+of its rows before it writes any, and no lane writes another lane's rows.
+Single tokens, head sizes 16, 32 and 64, and a state input, state output,
+snapshot-slot stride or cache-row stride that is not 16-byte aligned run
+the existing kernel.
+
+Numerics: the per-element expressions are those of the existing kernel;
+only the summation order of the 128-long dot products changes (64 rows in
+sequence and one pair add instead of a tree across the wave), so results
+are not bit-identical. test-backend-ops GATED_DELTA_NET passes 47 of 47
+cases against the CPU backend at NMSE 1e-7 with either kernel, including
+head-size-128 cases added for the check (1 to 512 tokens, across the chunk
+boundaries, two sequences, GQA, permuted inputs, KDA, 4 snapshot slots,
+the cache-store fusion). Against CPU-computed logits (llama-perplexity, 8
+chunks of 512 tokens in 512-token batches, q8_0 KV cache) the two kernels
+are equivalent: mean KLD 0.0104 +- 0.0005 with the existing kernel and
+0.0107 +- 0.0005 with this one, PPL 13.381 and 13.384 (CPU 13.355), same
+top token 95.8% and 95.3% (+- 0.45). Between the two kernels directly the
+mean KLD is 0.0037. The recurrence carries every rounding difference
+forward through the tokens; both GPU kernels sit about 0.01 KLD from the
+CPU, and this one stays within that spread.
+
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
+index dc17e36..e25733b 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net.cu
+@@ -175,6 +175,245 @@ gated_delta_net_cuda(const float * q,
+     }
+ }
+ 
++// Prompt-batch kernel for S_v == 128. The wave-per-column kernel above needs two wave-wide reductions per token
++// for a few multiply-adds per lane, so over a long batch it runs at a few percent of the ALU rate. Here two
++// neighbouring lanes own one column (64 rows each, held in registers) and the only cross-lane step per dot
++// product is one exchange between the pair. One lane per column would need 128 state registers and halve the
++// waves: a 32-head layer at one sequence would get 64 waves, fewer than the 144 SIMDs of an RX 590. Every lane
++// of a block needs the same k_t, q_t and gate, so a chunk of tokens is staged in shared memory once with
++// coalesced loads and then read as broadcasts.
++namespace gdn_col {
++constexpr int S_v             = 128;
++constexpr int cols_per_block  = 64;
++constexpr int threads         = 2 * cols_per_block;
++constexpr int rows_per_thread = S_v / 2;
++// tokens per LDS chunk; KDA stages a full gate row per token as well. Both stay under 32 KB so that two blocks
++// fit on one CU (the grid has only H * n_seqs * 2 blocks).
++template <bool KDA> constexpr int chunk = KDA ? 8 : 16;
++}
++
++static __device__ __forceinline__ float gdn_col_pair_sum(const float x) {
++#ifdef GGML_USE_HIP
++    // quad_perm [1,0,3,2] swaps neighbouring lanes in one DPP move; x + y == y + x, so both lanes of the pair
++    // hold the same bits
++    const float y = __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(x), 0xB1, 0xF, 0xF, true));
++#else
++    const float y = __shfl_xor_sync(0xffffffff, x, 1);
++#endif
++    return x + y;
++}
++
++// rows of lane half h: 8*m + 4*h + e (m < 16, e < 4), so both lanes of a pair read neighbouring float4s of the
++// same LDS row and the state of one column is read and written as float4s.
++// One block per CU at minimum: the 64 state rows plus a token's k and q take about 160 VGPRs; on AMD that is
++// one wave per SIMD, and the four waves of two blocks still cover a CU's four SIMDs.
++template <bool KDA, bool keep_rs_t, bool state_ids_t>
++__global__ void __launch_bounds__(gdn_col::threads, 1)
++gated_delta_net_col_cuda(const float * q,
++                         const float * k,
++                         const float * v,
++                         const float * g,
++                         const float * beta,
++                         const float * curr_state,
++                         float *       dst,
++                         float *       state,
++                         int64_t       H,
++                         int64_t       n_tokens,
++                         int64_t       n_seqs,
++                         int64_t       sq1,
++                         int64_t       sq2,
++                         int64_t       sq3,
++                         int64_t       sv1,
++                         int64_t       sv2,
++                         int64_t       sv3,
++                         int64_t       sb1,
++                         int64_t       sb2,
++                         int64_t       sb3,
++                         const uint3   neqk1_magic,
++                         const uint3   rq3_magic,
++                         float         scale,
++                         int64_t       state_slot_stride,
++                         int           K,
++                         const int32_t * state_ids,
++                         int64_t       state_ids_row_stride) {
++    using namespace gdn_col;
++    constexpr int T  = chunk<KDA>;
++    constexpr int NG = KDA ? T * S_v : T;
++
++    __shared__ __align__(16) float s_k[T][S_v];
++    __shared__ __align__(16) float s_q[T][S_v];
++    __shared__ __align__(16) float s_g[NG]; // expf(g), the form both formulas use
++    __shared__ float s_beta[T];
++    __shared__ float s_v[T][cols_per_block];
++
++    const int      tid      = threadIdx.x;
++    const int      half     = tid & 1;
++    const int      cl       = tid >> 1;
++    const int      col      = blockIdx.z * cols_per_block + cl;
++    const uint32_t h_idx    = blockIdx.x;
++    const uint32_t sequence = blockIdx.y;
++
++    const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
++    const uint32_t iq3 = fastdiv(sequence, rq3_magic);
++
++    float * attn_data = dst + ((int64_t) sequence * n_tokens * H + h_idx) * S_v + col;
++    state += ((int64_t) sequence * H + h_idx) * S_v * S_v + col * S_v + 4 * half;
++
++    ggml_cuda_pdl_sync();
++    const float * s_in;
++    if constexpr (state_ids_t) {
++        // read from the cache row that the fused snapshot store may overwrite in place: safe, each lane reads
++        // all of its rows here before it writes any of them, and no lane writes another lane's rows
++        s_in = curr_state + (int64_t) state_ids[sequence] * state_ids_row_stride;
++    } else {
++        s_in = curr_state + (int64_t) sequence * H * S_v * S_v;
++    }
++    s_in += (int64_t) h_idx * S_v * S_v + col * S_v + 4 * half;
++
++    float s[rows_per_thread];
++#pragma unroll
++    for (int m = 0; m < rows_per_thread / 4; m++) {
++        const float4 x = *reinterpret_cast<const float4 *>(s_in + 8 * m);
++        s[4 * m + 0] = x.x;
++        s[4 * m + 1] = x.y;
++        s[4 * m + 2] = x.z;
++        s[4 * m + 3] = x.w;
++    }
++
++    for (int64_t t0 = 0; t0 < n_tokens; t0 += T) {
++        const int nt = (int) (n_tokens - t0 < T ? n_tokens - t0 : T);
++
++        __syncthreads();
++        for (int idx = tid; idx < nt * S_v; idx += threads) {
++            const int     tt = idx / S_v;
++            const int     i  = idx % S_v;
++            const int64_t t  = t0 + tt;
++            const int64_t qk = iq3 * sq3 + t * sq2 + iq1 * sq1 + i;
++            s_k[tt][i] = k[qk];
++            s_q[tt][i] = q[qk];
++            if constexpr (KDA) {
++                s_g[idx] = expf(g[(sequence * sb3 + t * sb2 + h_idx * sb1) * S_v + i]);
++            }
++        }
++        for (int idx = tid; idx < nt * cols_per_block; idx += threads) {
++            const int tt = idx / cols_per_block;
++            const int c  = idx % cols_per_block;
++            s_v[tt][c] = v[sequence * sv3 + (t0 + tt) * sv2 + h_idx * sv1 + blockIdx.z * cols_per_block + c];
++        }
++        if (tid < nt) {
++            const int64_t gb = sequence * sb3 + (t0 + tid) * sb2 + h_idx * sb1;
++            s_beta[tid] = beta[gb];
++            if constexpr (!KDA) {
++                s_g[tid] = expf(g[gb]);
++            }
++        }
++        __syncthreads();
++
++        for (int tt = 0; tt < nt; tt++) {
++            const float4 * k4 = reinterpret_cast<const float4 *>(s_k[tt]) + half;
++            const float4 * q4 = reinterpret_cast<const float4 *>(s_q[tt]) + half;
++            const float4 * g4 = reinterpret_cast<const float4 *>(s_g + (KDA ? tt * S_v : 0)) + half;
++            const float beta_val = s_beta[tt];
++
++            float attn = 0.0f;
++            if constexpr (!KDA) {
++                const float g_val = s_g[tt];
++
++                // kv[col] = sum_i S[i][col] * k[i]
++                float kv = 0.0f;
++#pragma unroll
++                for (int m = 0; m < rows_per_thread / 4; m++) {
++                    const float4 kk = k4[2 * m];
++                    kv += s[4 * m + 0] * kk.x;
++                    kv += s[4 * m + 1] * kk.y;
++                    kv += s[4 * m + 2] * kk.z;
++                    kv += s[4 * m + 3] * kk.w;
++                }
++                kv = gdn_col_pair_sum(kv);
++
++                const float delta = (s_v[tt][cl] - g_val * kv) * beta_val;
++
++                // S[i][col] = g * S[i][col] + k[i] * delta; attn[col] = sum_i S[i][col] * q[i]
++#pragma unroll
++                for (int m = 0; m < rows_per_thread / 4; m++) {
++                    const float4 kk = k4[2 * m];
++                    const float4 qq = q4[2 * m];
++                    s[4 * m + 0] = g_val * s[4 * m + 0] + kk.x * delta;
++                    attn += s[4 * m + 0] * qq.x;
++                    s[4 * m + 1] = g_val * s[4 * m + 1] + kk.y * delta;
++                    attn += s[4 * m + 1] * qq.y;
++                    s[4 * m + 2] = g_val * s[4 * m + 2] + kk.z * delta;
++                    attn += s[4 * m + 2] * qq.z;
++                    s[4 * m + 3] = g_val * s[4 * m + 3] + kk.w * delta;
++                    attn += s[4 * m + 3] * qq.w;
++                }
++            } else {
++                // kv[col] = sum_i g[i] * S[i][col] * k[i]
++                float kv = 0.0f;
++#pragma unroll
++                for (int m = 0; m < rows_per_thread / 4; m++) {
++                    const float4 kk = k4[2 * m];
++                    const float4 gg = g4[2 * m];
++                    kv += gg.x * s[4 * m + 0] * kk.x;
++                    kv += gg.y * s[4 * m + 1] * kk.y;
++                    kv += gg.z * s[4 * m + 2] * kk.z;
++                    kv += gg.w * s[4 * m + 3] * kk.w;
++                }
++                kv = gdn_col_pair_sum(kv);
++
++                const float delta = (s_v[tt][cl] - kv) * beta_val;
++
++                // S[i][col] = g[i] * S[i][col] + k[i] * delta; attn[col] = sum_i S[i][col] * q[i]
++#pragma unroll
++                for (int m = 0; m < rows_per_thread / 4; m++) {
++                    const float4 kk = k4[2 * m];
++                    const float4 qq = q4[2 * m];
++                    const float4 gg = g4[2 * m];
++                    s[4 * m + 0] = gg.x * s[4 * m + 0] + kk.x * delta;
++                    attn += s[4 * m + 0] * qq.x;
++                    s[4 * m + 1] = gg.y * s[4 * m + 1] + kk.y * delta;
++                    attn += s[4 * m + 1] * qq.y;
++                    s[4 * m + 2] = gg.z * s[4 * m + 2] + kk.z * delta;
++                    attn += s[4 * m + 2] * qq.z;
++                    s[4 * m + 3] = gg.w * s[4 * m + 3] + kk.w * delta;
++                    attn += s[4 * m + 3] * qq.w;
++                }
++            }
++            attn = gdn_col_pair_sum(attn);
++
++            const int64_t t = t0 + tt;
++            if (half == 0) {
++                attn_data[t * S_v * H] = attn * scale;
++            }
++
++            if constexpr (keep_rs_t) {
++                // slot 0 = most recent state, slot s = s tokens back; older slots are caller-owned
++                const int64_t target_slot = n_tokens - 1 - t;
++                if (target_slot < K) {
++                    float * out = state + target_slot * state_slot_stride;
++#pragma unroll
++                    for (int m = 0; m < rows_per_thread / 4; m++) {
++                        *reinterpret_cast<float4 *>(out + 8 * m) =
++                            make_float4(s[4 * m + 0], s[4 * m + 1], s[4 * m + 2], s[4 * m + 3]);
++                    }
++                }
++            }
++        }
++    }
++
++    if constexpr (!keep_rs_t) {
++#pragma unroll
++        for (int m = 0; m < rows_per_thread / 4; m++) {
++            *reinterpret_cast<float4 *>(state + 8 * m) =
++                make_float4(s[4 * m + 0], s[4 * m + 1], s[4 * m + 2], s[4 * m + 3]);
++        }
++    }
++}
++
++static bool gdn_col_aligned(const void * p) {
++    return ((uintptr_t) p & 15) == 0;
++}
++
+ template <bool KDA, bool keep_rs_t, bool state_ids_t = false>
+ static void launch_gated_delta_net(
+         const float * q_d, const float * k_d, const float * v_d,
+@@ -188,6 +427,23 @@ static void launch_gated_delta_net(
+         float scale, int64_t state_slot_stride, int K, cudaStream_t stream,
+         const int32_t * state_ids = nullptr, int64_t state_ids_row_stride = 0) {
+     //TODO: Add chunked kernel for even faster pre-fill
++    // A single token has no batch to stage and either kernel moves the whole 64 KiB state of a head once; it
++    // stays on the wave-per-column kernel, which keeps decode output bit-identical. The column kernel moves the
++    // state as float4, so every state row start must be 16-byte aligned.
++    const bool col_ok = n_tokens > 1 && S_v == gdn_col::S_v && gdn_col_aligned(s_d) && gdn_col_aligned(state_d) &&
++        (!keep_rs_t || state_slot_stride % 4 == 0) && (!state_ids_t || state_ids_row_stride % 4 == 0);
++    if (col_ok) {
++        const dim3 grid_dims(H, n_seqs, gdn_col::S_v / gdn_col::cols_per_block);
++        const dim3 block_dims(gdn_col::threads, 1, 1);
++        ggml_cuda_kernel_launch(gated_delta_net_col_cuda<KDA, keep_rs_t, state_ids_t>,
++            ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream),
++            q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
++            n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
++            sb1, sb2, sb3, init_fastdiv_values(neqk1), init_fastdiv_values(rq3), scale, state_slot_stride, K,
++            state_ids, state_ids_row_stride);
++        return;
++    }
++
+     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+     const int num_warps = 4;
+     dim3      grid_dims(H, n_seqs, (S_v + num_warps - 1) / num_warps);
