@@ -172,9 +172,9 @@ Open targets in recommended order, then the done ones.
 | Target | Area | Expected gain | Status |
 | --- | --- | --- | --- |
 | LLM-6 | MoE prompts: expert copies, MUL_MAT_ID, dense parts | copies overlap compute since patch 108 (pp2048 295 -> 367 tok/s, against 376 with no copies at all); the rest is compute, with no breakdown | Open, profile first |
-| RT-1 | Cost of the vector-L1 invalidate before every dispatch | 1.65 us per dispatch: ~2.4 ms of an MoE token (~6%), 2.3-2.7% of dense decode, ~2.4 ms of an SD 1.5 step | Open: the cheaper-packet option is unmeasured |
+| RT-1 | Cost of the vector-L1 invalidate before every dispatch | 1.65 us per dispatch: ~2.4 ms of an MoE token (~6%), 2.3-2.7% of dense decode, ~2.4 ms of an SD 1.5 step. The cost is the extra ring slot, not the cache work: an empty-kernel dispatch costs 4.27-4.30 us with the shipped packet, with only the L1 bit, with poll interval 1, and with the L1 action moved onto the slot's RELEASE_MEM (no ACQUIRE_MEM), against 2.65 us without the slot | Measured, no cheaper packet; only fewer slots would help, and skipping the invalidate between kernels is not provably correct |
 | LLM-5 | Dense decode above the bandwidth bound | per 36 ms token: K-quant kernels ~2.9 ms, flash-attention decode ~2.6 ms at 5k depth, F16 `attn_v` ~1 ms, launches ~1 ms by fusion; the same kernels make up MoE generation's GPU part | Open, measured before the stale-L1 fix and patch 111 |
-| LLM-8 | MoE generation with experts in system RAM | shared expert overlaps the CPU experts since patch 112 (Ollama 25.3 -> 26.2 tok/s); left: the GPU split's kernels and dispatches, the fp32 router ~0.5 ms, the hand-offs, the CPU experts (at most ~3.5 ms) | Open, measured before patches 111 and 112 |
+| LLM-8 | MoE generation with experts in system RAM | Qwen3.6 35B-A3B, 39 ms per token (25.6 tok/s, llama-bench with a cold page cache): CPU experts ~16.7 ms, GPU kernels ~12 ms, ~1,425 dispatches at ~4.3 us of command-processor time each (~6 ms), hand-offs ~3 ms; the largest kernel is the q4_K matrix-vector product (258 per token, ~4.4 ms) | Open, measured 2026-10-19 with patches 111 and 112 |
 | SD-10 | fp16 GroupNorm/SiLU and GEGLU in the node | the node's kernels take fp32 only, so ComfyUI's fp16 default runs neither; a few ms of a 342 ms step | Open, unmeasured |
 | SD-11 | ComfyUI time outside the UNet | 1.7 s of an 8.5 s warm SD 1.5 image (2.7 of 10.5 s without the node) | Open, unmeasured |
 | SD-12 | SDXL VAE decode at 1024 px | 12-25 s of an 83-99 s image, by VAE precision | Open, measured end to end |
@@ -283,10 +283,19 @@ shows the drop), 2.3-2.7% of dense decode and ~2.4 ms of an fp16 SD 1.5 step
 cache, and the L2 write-back plus invalidate pair at about the same decode
 cost, so the cost is the extra packet, not the cache work.
 
-**Options.** Carrying the invalidate in a packet the dispatch already
-publishes instead of a slot of its own, if the command processor then
-handles it faster: unmeasured. Fewer dispatches: every fusion in LLM-5 and
-LLM-8 saves 4.3 us, not 2.65. Skipping the invalidate for some dispatches is
+**Measured.** The slot itself is the cost. With the packet varied through
+run-time switches in a test build of `libamdhip64`, an empty-kernel dispatch
+costs 4.27-4.30 us whether the slot carries the shipped `ACQUIRE_MEM`
+(vector L1 and scalar cache), the vector L1 bit alone, a poll interval of 1
+instead of 0xA, or no `ACQUIRE_MEM` at all with the L1 action moved onto the
+`RELEASE_MEM` that retires the slot; without the slot it costs 2.65 us. ROCr's
+gfx8 protocol for PM4 in an AQL ring needs that `RELEASE_MEM` to advance the
+read index, and the AQL dispatch and barrier packets' own acquire scopes are
+what the firmware ignores, so no packet the dispatch already publishes can
+carry the invalidate.
+
+**Options.** Fewer dispatches: every fusion in LLM-5 and LLM-8 saves 4.3 us,
+not 2.65. Skipping the invalidate for some dispatches is
 not an option without proof that their inputs cannot be stale; the bug it
 fixes returns wrong numbers without an error.
 

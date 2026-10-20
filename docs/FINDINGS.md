@@ -328,7 +328,8 @@ it, at full clocks and power.
 
 With `HSA_ENABLE_SDMA=1`, which runs ROCm's copies on user SDMA queues,
 loading a model in Ollama can deadlock SDMA engine 0. Ten seconds later the
-kernel logs `amdgpu: ring sdma0 timeout, signaled seq=N, emitted seq=N+2` and
+kernel logs `amdgpu: ring sdma0 timeout, signaled seq=N, emitted seq=N+2`
+(sometimes N+1 or N+3) and
 resets the card through BACO. VRAM is lost, every ROCm process on the card
 loses its work, and the desktop session usually goes with it. The `Failed to
 suspend process` and `cp is busy, skip halt cp` lines that follow come from
