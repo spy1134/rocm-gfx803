@@ -1,0 +1,106 @@
+llama.cpp (as fetched by Ollama v0.35.1, llama.cpp b11232, applied after
+118): the router-weighted sum of the expert outputs (moe_weighted_reduction)
+loads all of a token's expert rows before it accumulates, four columns per
+thread.
+Generic (all GPUs): not gfx803-specific code; measured on gfx803.
+
+WHY
+---
+For a prompt batch, every MoE layer sums the outputs of the routed experts
+per token, weighted by the router: with Qwen3.6 35B-A3B (8 experts used,
+hidden size 2048) and a 2048-token batch that reads 134 MB and writes
+16 MB per layer. The kernel gave each thread one column and walked the
+expert rows in a loop whose length is only known at run time, one load and
+one multiply-add per row, so each wave waited a full memory latency per
+row. On an RX 590 it ran at about 37 GB/s: 4.04 ms per call, 40 calls and
+0.16 s per 2048-token batch (rocprof medians), about 3.5 % of the batch.
+
+WHAT
+----
+A second kernel, used when the layer routes 8 experts per token and the
+expert, output and row strides allow 16-byte access, gives each thread four
+adjacent columns of one token and issues all eight float4 row loads before
+the first multiply. Every column still computes the scalar kernel's
+expressions in the same order: (x * scale) * weight for the first expert,
+then sum += (x * scale) * weight per further expert. On gfx803 both kernels
+compile each term to the same v_mul_f32 followed by v_mac_f32, so the
+result is bit-identical. Other expert counts and unaligned tensors keep the
+scalar kernel.
+
+Measured on an RX 590 (Qwen3.6 35B-A3B Q4_K_M, experts in system RAM,
+llama-bench -ncmoe 99, 2048-token batches): 4.04 -> 1.17 ms per call
+(rocprof medians), prompt processing 451 -> 463 and 442 -> 453 tok/s in
+two alternating rounds (+2.6 %). llama-perplexity at 512-token batches
+gives the same per-chunk perplexity, KL divergence and top-token agreement
+as a run without the patch, line for line.
+
+diff --git a/ggml/src/ggml-cuda/moe-weighted-reduction.cu b/ggml/src/ggml-cuda/moe-weighted-reduction.cu
+--- a/ggml/src/ggml-cuda/moe-weighted-reduction.cu
++++ b/ggml/src/ggml-cuda/moe-weighted-reduction.cu
+@@ -24,6 +24,49 @@
+     dst[token * n_embd + col] = sum;
+ }
+ 
++// One thread owns four adjacent columns of one token. All n_expert_used rows are loaded before the
++// first multiply so the loads overlap instead of each waiting for the previous accumulate; each
++// column still sums its experts in the same order and with the same expressions as the scalar kernel.
++template <int n_expert_used, bool has_scale>
++static __global__ void moe_weighted_reduction_f32_x4(const float * __restrict__ experts,
++                                                     const float * __restrict__ expert_scale,
++                                                     const float * __restrict__ weights,
++                                                     float * __restrict__ dst,
++                                                     const int64_t n_embd) {
++    const int64_t token = blockIdx.x;
++    const int64_t col   = 4 * ((int64_t) blockIdx.y * blockDim.x + threadIdx.x);
++    if (col >= n_embd) {
++        return;
++    }
++
++    const uint64_t first_row = (uint64_t) token * n_expert_used;
++    float4 x[n_expert_used];
++#pragma unroll
++    for (int e = 0; e < n_expert_used; ++e) {
++        x[e] = *(const float4 *) (experts + (first_row + e) * n_embd + col);
++    }
++
++    float4 sum;
++#pragma unroll
++    for (int e = 0; e < n_expert_used; ++e) {
++        const uint64_t row   = first_row + e;
++        const float    scale = has_scale ? expert_scale[row] : 1.0f;
++        const float    w     = weights[row];
++        if (e == 0) {
++            sum.x = (x[e].x * scale) * w;
++            sum.y = (x[e].y * scale) * w;
++            sum.z = (x[e].z * scale) * w;
++            sum.w = (x[e].w * scale) * w;
++        } else {
++            sum.x += (x[e].x * scale) * w;
++            sum.y += (x[e].y * scale) * w;
++            sum.z += (x[e].z * scale) * w;
++            sum.w += (x[e].w * scale) * w;
++        }
++    }
++    *(float4 *) (dst + token * n_embd + col) = sum;
++}
++
+ static void launch_moe_weighted_reduction(const float * experts,
+                                           const float * expert_scale,
+                                           const float * weights,
+@@ -33,6 +76,16 @@
+                                           int           n_expert_used,
+                                           cudaStream_t  stream) {
+     constexpr int threads = 256;
++    const bool aligned = n_embd % 4 == 0 && (uintptr_t) experts % 16 == 0 && (uintptr_t) dst % 16 == 0;
++    if (n_expert_used == 8 && aligned) {
++        const dim3 blocks_x4(n_tokens, (n_embd / 4 + threads - 1) / threads, 1);
++        if (expert_scale != nullptr) {
++            moe_weighted_reduction_f32_x4<8, true><<<blocks_x4, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd);
++        } else {
++            moe_weighted_reduction_f32_x4<8, false><<<blocks_x4, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd);
++        }
++        return;
++    }
+     const dim3 blocks(n_tokens, (n_embd + threads - 1) / threads, 1);
+     moe_weighted_reduction_f32
+         <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);

@@ -171,10 +171,10 @@ Open targets in recommended order, then the done ones.
 
 | Target | Area | Expected gain | Status |
 | --- | --- | --- | --- |
-| LLM-6 | MoE prompts: expert copies, MUL_MAT_ID, dense parts | copies overlap compute since patch 108 (pp2048 295 -> 367 tok/s, against 376 with no copies at all); of the rest, expert matmuls 42%, DeltaNet recurrence 26% (patch 117: pp2048 361 -> 455 tok/s), dense fp32 GEMMs 20%; a grouped fp32 expert GEMM is estimated at +9-23% | Open: grouped expert GEMM next |
+| LLM-6 | MoE prompts: expert copies, MUL_MAT_ID, dense parts | copies overlap compute since patch 108 (pp2048 295 -> 367 tok/s, against 376 with no copies at all); DeltaNet recurrence (patch 117: pp2048 361 -> 455 tok/s); expert matmuls, 62% of GPU time after 117, as a grouped fp32 GEMM (patch 118: pp2048 450 -> 547, pp512 234 -> 275); expert reduction (patch 119: +2.6%). Next limit: the per-layer expert copies (~1.5-2.5 s per 2048-token batch) once kernels drop below them | Open: copy stream is the next limit |
 | RT-1 | Cost of the vector-L1 invalidate before every dispatch | 1.65 us per dispatch: ~2.4 ms of an MoE token (~6%), 2.3-2.7% of dense decode, ~2.4 ms of an SD 1.5 step. The cost is the extra ring slot, not the cache work: an empty-kernel dispatch costs 4.27-4.30 us with the shipped packet, with only the L1 bit, with poll interval 1, and with the L1 action moved onto the slot's RELEASE_MEM (no ACQUIRE_MEM), against 2.65 us without the slot | Measured, no cheaper packet; only fewer slots would help, and skipping the invalidate between kernels is not provably correct |
 | LLM-5 | Dense decode above the bandwidth bound | per 36 ms token: K-quant kernels ~2.9 ms, flash-attention decode ~2.6 ms at 5k depth, F16 `attn_v` ~1 ms, launches ~1 ms by fusion; the same kernels make up MoE generation's GPU part | Open, measured before the stale-L1 fix and patch 111 |
-| LLM-8 | MoE generation with experts in system RAM | Qwen3.6 35B-A3B, 39 ms per token before patches 113-116 (25.6 tok/s, llama-bench with a cold page cache): CPU experts ~16.7 ms, GPU kernels ~12 ms, ~1,425 dispatches at ~4.3 us each (~6 ms), hand-offs ~3 ms; 113-116 remove up to 300 dispatches per token (25.60 -> 27.51 tok/s) | Open: further fusions listed in LLM-8, each a few tenths of a ms |
+| LLM-8 | MoE generation with experts in system RAM | Qwen3.6 35B-A3B, 39 ms per token before patches 113-116 (25.6 tok/s, llama-bench with a cold page cache): CPU experts ~16.7 ms, GPU kernels ~12 ms, ~1,425 dispatches at ~4.3 us each (~6 ms), hand-offs ~3 ms; 113-116 remove up to 300 dispatches per token (25.60 -> 27.51 tok/s), 120-122 another 230 (+0.9% and +2.0%); CPU experts run at ~91% of practical DDR4 bandwidth (36.5 GB/s), so settings are worth 0-4% at most | Open: remaining fusions listed in LLM-8 (a3 rope_multi did not fire), CPU thread pinning |
 | SD-10 | fp16 GroupNorm/SiLU and GEGLU in the node | the node's kernels take fp32 only, so ComfyUI's fp16 default runs neither; a few ms of a 342 ms step | Open, unmeasured |
 | SD-11 | ComfyUI time outside the UNet | 1.7 s of an 8.5 s warm SD 1.5 image (2.7 of 10.5 s without the node) | Open, unmeasured |
 | SD-12 | SDXL VAE decode at 1024 px | 12-25 s of an 83-99 s image, by VAE precision | Open, measured end to end |
@@ -241,10 +241,18 @@ expert matmuls are now the largest part by far.
   tok/s (+26%); single-token decode keeps the old kernel. Mean KLD against
   CPU logits 0.0107 against 0.0104 with the old kernel, within the spread
   both GPU kernels show against the CPU.
-- Next: a grouped fp32 GEMM over all of a layer's experts in one launch,
-  at the rate of the dense fp32 GEMMs (~4.4 TFLOPS) instead of mmq's ~2.1,
-  estimated at +9-23% on pp2048 (unbuilt; the last item below shows why the
-  per-expert route does not get there).
+- Done: patch 118 runs a prompt batch's expert matmuls (Q4_K and Q6_K, 16 or
+  more tokens per expert on average, GCN4 only) as one grouped fp32 GEMM per
+  call: tile list built on the GPU from the routing, no host sync, weights
+  dequantized into LDS, activations fp32, 4 waves per 128x64 tile, split-K
+  inside the tile for experts with few tokens. Per call 1.56-2.65x faster
+  than mmq at the model's shapes; pp2048 450 -> 547 tok/s (+21%), pp512 234
+  -> 275 (+17%). Closer to CPU logits than mmq (mean KLD 0.0097 against
+  0.0107), because the activations are not quantized to 8 bits. Patch 119
+  makes the expert reduction load all eight rows first (4.04 -> 1.17 ms per
+  call, +2.6%, bit-identical). With kernel time per batch now ~2.2 s, the
+  per-layer expert copies over PCIe (~1.5-2.5 s per 2048-token batch) are the
+  next limit.
 - Done: patch 108 copies the next MoE layer's experts into a second device
   slot on a second stream while the current layer computes, with
   `HSA_ENABLE_SDMA=1` so the copy runs on the DMA engine (FINDINGS section
@@ -252,17 +260,13 @@ expert matmuls are now the largest part by far.
   321 / 367 tok/s, against a 376 tok/s bound with no copies at all. At
   512-token batches the copy is still longer than the compute it hides
   behind (12 GB/s over PCIe).
-- Fused dequantization inside the SGEMM's operand load is unmeasured. Moving
-  the experts onto patch 106's route instead (the next item) was measured and
-  lost.
 - Expert matmuls through dequantization + fp32 SGEMM (patch 106's route,
   forced for every expert slice through llama.cpp's per-expert MUL_MAT_ID
   path, dev-only switch): slower, pp2048 with experts in system RAM 292 ->
   223 tok/s at 2048-token batches and 167 -> 122 at 512 (SDMA off in both).
   That path synchronizes with the host to sort tokens by expert and then runs
-  a dequantization and a GEMM per expert, 256 of each per layer. A grouped
-  kernel that reads the quantized experts directly is the remaining form of
-  this lever (unbuilt).
+  a dequantization and a GEMM per expert, 256 of each per layer; patch 118's
+  grouped kernel avoids both.
 - MUL_MAT_ID tile choice for gfx803: measured, not a lever. Forcing every
   tile width from 8 to 64 for the expert matmuls (dev-only override) left
   pp2048 within noise: 171-176 tok/s at 1024-token batches for every width,
@@ -400,12 +404,14 @@ a token (~2.4 ms, RT-1); 24.5-24.6 with 111 added; and 25.2-25.7 with 112
 llama-bench, page cache dropped first): CPU experts ~16.7 ms, GPU kernels ~12
 ms, ~1,425 dispatches at ~4.3 us each (~6 ms, ~1,064 of them on the critical
 path), hand-offs ~3 ms. Patches 113-116 remove up to 300 dispatches and a
-2 MiB state copy per DeltaNet layer: 25.60 -> 27.51 tok/s. Still in the same
-trace, each worth a few tenths of a ms: the DeltaNet gate math (softplus,
-sigmoid) inside the recurrence kernel, the gated norm with its q8_1
-quantize, the two L2 norms as one launch, RMS norm with the multi-section
-rope, the rotation kernels a q8_0 KV cache adds to attention, and one launch
-for projections that share a quantized input. HIP graphs cost 1-3% here
+2 MiB state copy per DeltaNet layer: 25.60 -> 27.51 tok/s. Patches 120-122
+remove 230 more, bit-identical: the DeltaNet gate math inside the recurrence
+kernel and the gated norm with its q8_1 quantize (+0.9% together), and one
+launch for the projections that share a quantized input (+2.0%). Still in
+the same trace, each worth a few tenths of a ms: the two L2 norms as one
+launch, RMS norm with the multi-section rope (a fusion built for it found no
+matching node chain on the card), and the rotation kernels a q8_0 KV cache
+adds to attention. HIP graphs cost 1-3% here
 (llama-bench 27.51 -> 27.93 tok/s with them off), within noise through
 Ollama. The tables below are from the earlier profile.
 

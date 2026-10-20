@@ -126,6 +126,21 @@ RUN CC=/opt/rocm/llvm/bin/clang CXX=/opt/rocm/llvm/bin/clang++ \
     && { grep -q gated_delta_net_col_cuda \
              build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/gated_delta_net.cu \
          || { echo "117-gdn-prefill-column-kernel.patch was not applied" >&2; exit 1; }; } \
+    && { grep -qF 'ggml_cuda_mmid_f32(' \
+             build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/mmq.cu \
+         || { echo "118-moe-expert-f32-gemm.patch was not applied" >&2; exit 1; }; } \
+    && { grep -qF moe_weighted_reduction_f32_x4 \
+             build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/moe-weighted-reduction.cu \
+         || { echo "119-moe-weighted-reduction-x4.patch was not applied" >&2; exit 1; }; } \
+    && { grep -qF gdn_gate_softplus \
+             build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/gated_delta_net.cu \
+         || { echo "120-gdn-decode-gates.patch was not applied" >&2; exit 1; }; } \
+    && { grep -qF gated_rms_norm_silu_q8_1_f32 \
+             build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/norm.cu \
+         || { echo "121-gdn-gated-norm-q8_1.patch was not applied" >&2; exit 1; }; } \
+    && { grep -qF mul_mat_vec_q_group \
+             build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/mmvq.cu \
+         || { echo "122-mmvq-shared-input-group.patch was not applied" >&2; exit 1; }; } \
     && { grep -q ggml_backend_sched_prefetch_split \
              build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-backend.cpp \
          || { echo "108-moe-expert-prefetch.patch was not applied" >&2; exit 1; }; } \

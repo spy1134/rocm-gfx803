@@ -26,6 +26,7 @@ without this project's patches.
 | A coding agent's first request (12,000-token prompt) | 18 min | 71 s | 15x |
 | Prompt processing, MoE model with experts in system RAM, without and with expert prefetch (Qwen3.6 35B-A3B through Ollama, 3,100-token prompt) | 165 tokens/s | 196 tokens/s | 1.2x |
 | Text generation, MoE model with experts in system RAM, without and with the dispatch fusions (Qwen3.6 35B-A3B through Ollama) | 22.7 tokens/s | 24.2 tokens/s | 1.07x |
+| Prompt processing, MoE model with experts in system RAM, without and with the fp32 expert GEMM (Qwen3.6 35B-A3B through Ollama, 2,800-token prompt, mean of two rounds) | 395 tokens/s | 483 tokens/s | 1.22x |
 | Text generation (Qwen3 8B, short context, llama-bench on Ollama's llama.cpp) | 27 tokens/s | 30.5 tokens/s | 1.1x |
 
 The largest gains come from replacing the code paths that were slowest on this
@@ -49,7 +50,9 @@ architecture:
   runs the shared expert on the GPU while the CPU computes the routed ones.
   Qwen3.5/3.6 prompts run the DeltaNet recurrence on a kernel that keeps its
   state in registers (Qwen3.6 35B-A3B prompts 26% faster in 2048-token
-  batches).
+  batches), and MoE prompts run the expert matmuls as grouped fp32 GEMMs
+  instead of emulated int8 dot products (another 21%, and closer
+  to CPU results).
 
 Text generation is limited mainly by memory bandwidth, so it had the least room
 to improve. Its gain grows with context length (20.9 to 26.5 tokens/s at 8,000

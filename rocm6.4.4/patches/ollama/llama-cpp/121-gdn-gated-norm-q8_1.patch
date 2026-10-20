@@ -1,0 +1,382 @@
+llama.cpp (as fetched by Ollama v0.35.1, llama.cpp b11232, applied after
+120; needs 111 and 116): at one token, a Gated DeltaNet layer's gated
+output norm (RMS norm times weight times silu(z)) and the q8_1 quantize of
+its result for the output projection run as one kernel.
+Generic (all GPUs): not gfx803-specific code; measured on gfx803.
+
+WHY
+---
+Single-token decode on an RX 590 pays for every dispatch as well as for the
+work in it: each one costs about 4.3 us of command-processor time however
+small the kernel, a 2.65 us floor plus 1.65 us for the vector-L1 invalidate
+that every dispatch needs on gfx8 (docs/FINDINGS.md, "A kernel can read
+stale data from the vector L1 across dispatches"). A Qwen3.6 35B-A3B decode
+token with the routed experts in system RAM issues about 1,425 dispatches,
+about 1,064 of them on the critical path.
+
+Every Gated DeltaNet layer (Qwen3.5/3.6, Qwen3-Next) ends with a gated
+norm of the recurrence output, one RMS norm per head row (32 rows of 128
+on Qwen3.6 35B-A3B) times the norm weight, times silu(z), followed by the
+output projection ssm_out, a matrix-vector product that first quantizes
+its input to q8_1. At one token that is three small kernels before the
+product: the fused RMS norm * weight, the fused silu * mul and
+quantize_q8_1. One kernel does all three: 60 dispatches per token fewer on
+Qwen3.6 35B-A3B (30 DeltaNet layers).
+
+Measured on an RX 590 (llama-bench, Qwen3.6 35B-A3B Q4_K_M, all experts in
+system RAM with -ncmoe 99, tg128, 5 repetitions, three alternating rounds,
+HSA_ENABLE_SDMA=1 ROC_CPU_WAIT_FOR_SIGNAL=1), patches 120 and 121
+together: 24.58, 24.46, 24.57 -> 24.72, 24.78, 24.79 tok/s (+0.9%). Both
+fire in all 30 DeltaNet layers of every decode token. With this patch
+alone and with both, greedy 128-token output is byte-identical to the
+build without them, and llama-perplexity with -ub 1 (every token through
+the decode path) prints the same perplexity for every chunk. No GPU
+faults in any run.
+
+WHAT
+----
+ggml_cuda_try_deferred_fusion (120) also calls ggml_cuda_try_gated_norm.
+ggml_cuda_match_gated_norm matches, anchored at a SILU, the chain
+RMS_NORM(x) -> MUL(weight), SILU(z), MUL(normed, silu) right after the
+SILU, and a MUL_MAT that reads the product directly or through one
+RESHAPE/VIEW of all its bytes, with x and z of the same shape and one
+token (rows of fewer than 1024 columns, a multiple of 32; a total length
+that needs no q8_1 padding), all f32, the intermediate nodes read only
+along the chain, and all nodes within 48 of the SILU in the graph being
+evaluated. In the graph the z projection sits between the norm and the
+SILU, so the RMS_NORM and its MUL are skipped when the loop reaches them
+(the match depends only on the graph), and at the SILU
+gated_rms_norm_silu_q8_1_f32 computes all of it.
+
+The kernel uses the block of rms_norm_f32 for rows under 1024, 256
+threads per row, with its per-thread element order and the same
+block_reduce; then per element scale * x * weight, times silu(z) as the
+fused unary * mul computes it (ggml_cuda_op_silu_single), written out and
+quantized in the same 32-lane groups and butterfly reductions as
+quantize_q8_1 (amax, sum, d = amax / 127, roundf(x / d), ds from lane 0).
+Nothing between the RMS_NORM and the SILU may write x or the weight; the
+output may be x or z itself (an exact alias, each element is read by the
+thread that writes it) and must not overlap them otherwise.
+graph_optimize keeps x allocated until the gated MUL runs.
+
+As in 116, the q8_1 copy is kept as mmvq_src1_pending, keyed by the
+tensor the MUL_MAT reads, and becomes 111's kept input once the
+evaluation loop has run the overwrite check for the group; ssm_out's
+matrix-vector product then skips its quantize. GGML_CUDA_DISABLE_FUSION=1
+turns this off with the other fusions.
+
+Numerics are unchanged: every value is computed with the expressions,
+element order, block reduction and quantization groups of the three
+kernels it replaces. On gfx803 the kernel is rms_norm_f32<256, true>'s
+instruction sequence up to the rsqrt (v_mac for the sum of squares, the
+same reduction tree and LDS step), then the silu sequence of
+unary_gated_op_kernel<op_silu> (same exp reduction, correctly rounded
+division), three v_mul for scale * x * weight * silu, then quantize_q8_1's
+sequence (amax and sum butterflies, the two divisions, the roundf
+expansion, the f16 conversions). Two forms differ and give the same bits:
+the first step of the sum butterfly is a v_mac (an unfused multiply-add
+that rounds like the separate multiply and add) recomputing the product
+it adds, and the first amax step takes |x| from the register where
+quantize_q8_1 canonicalizes the loaded value (v_mul by 1.0), a no-op on a
+value a v_mul produced. v_fma appears only inside the division
+expansions, as in the separate kernels.
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3978,6 +3978,147 @@
+     return false;
+ }
+ 
++// The gated output norm of a Gated DeltaNet layer at one token: RMS_NORM(x) -> MUL(weight), later
++// SILU(z) -> MUL(normed, silu) at silu_idx + 1, read by a matrix-vector product directly or through one
++// RESHAPE/VIEW (ssm_out). RMS_NORM and its MUL are not run; at the SILU one kernel computes all four and the
++// q8_1 copy the product reads. With check_data the tensors' memory is known and checked too; graph_optimize
++// calls it without, to keep x allocated until the fused kernel.
++struct ggml_cuda_gated_norm_match {
++    int                 norm_idx     = -1;
++    int                 norm_mul_idx = -1;
++    const ggml_tensor * x            = nullptr;
++    const ggml_tensor * rms_norm     = nullptr;
++    const ggml_tensor * w            = nullptr;
++    const ggml_tensor * z            = nullptr;
++    ggml_tensor *       out          = nullptr;
++    const ggml_tensor * mmvq_src1    = nullptr;
++};
++
++static bool ggml_cuda_match_gated_norm(const ggml_cgraph * cgraph, int silu_idx, ggml_cuda_gated_norm_match & m,
++        bool check_data) {
++    if (silu_idx + 1 >= cgraph->n_nodes) {
++        return false;
++    }
++    const ggml_tensor * silu = cgraph->nodes[silu_idx];
++    ggml_tensor *       out  = cgraph->nodes[silu_idx + 1];
++    if (!ggml_cuda_is_unary_op(silu, GGML_UNARY_OP_SILU) || !ggml_cuda_f32_contiguous(silu) ||
++            !ggml_cuda_single_use(cgraph, silu)) {
++        return false;
++    }
++    if (out->op != GGML_OP_MUL || !ggml_cuda_f32_contiguous(out) || (out->flags & GGML_TENSOR_FLAG_OUTPUT) ||
++            ggml_cuda_node_use_count(cgraph, out) != 1) {
++        return false;
++    }
++    const ggml_tensor * normed = ggml_cuda_other_src(out, silu);
++    if (normed == nullptr || normed == silu || normed->op != GGML_OP_MUL || !ggml_cuda_f32_contiguous(normed) ||
++            !ggml_cuda_single_use(cgraph, normed)) {
++        return false;
++    }
++    const ggml_tensor * norm = normed->src[0]->op == GGML_OP_RMS_NORM ? normed->src[0] : normed->src[1];
++    const ggml_tensor * w    = ggml_cuda_other_src(normed, norm);
++    if (norm->op != GGML_OP_RMS_NORM || w == nullptr || w == norm || !ggml_cuda_f32_contiguous(norm) ||
++            !ggml_cuda_single_use(cgraph, norm)) {
++        return false;
++    }
++    const ggml_tensor * x = norm->src[0];
++    const ggml_tensor * z = silu->src[0];
++    if (x->type != GGML_TYPE_F32 || x->nb[0] != sizeof(float) || z->type != GGML_TYPE_F32 || z->nb[0] != sizeof(float) ||
++            !ggml_is_contiguous_rows(x) || !ggml_is_contiguous_rows(z) || x->ne[2] != 1 || x->ne[3] != 1 ||
++            !ggml_are_same_shape(x, z) || !ggml_are_same_shape(x, out) || !ggml_are_same_shape(x, normed)) {
++        return false;
++    }
++    if (!ggml_cuda_f32_contiguous(w) || w->ne[0] != x->ne[0] || ggml_nrows(w) != 1 ||
++            !ggml_cuda_gated_rms_norm_q8_1_supported(x->ne[0], ggml_nelements(out))) {
++        return false;
++    }
++
++    // the matrix-vector product that reads the result, directly or through a reshape that keeps its bytes
++    const ggml_tensor * src1 = out;
++    int k = silu_idx + 2;
++    for (; k < cgraph->n_nodes && k <= silu_idx + 1 + ggml_cuda_deferred_window; ++k) {
++        const ggml_tensor * n = cgraph->nodes[k];
++        if (src1 == out && (n->op == GGML_OP_RESHAPE || n->op == GGML_OP_VIEW) && n->src[0] == out) {
++            if (n->view_src != out || n->view_offs != 0 || !ggml_is_contiguous(n) || (n->flags & GGML_TENSOR_FLAG_OUTPUT) ||
++                    ggml_cuda_node_use_count(cgraph, n) != 1) {
++                return false;
++            }
++            src1 = n;
++            continue;
++        }
++        if (n->src[0] == src1 || n->src[1] == src1) {
++            break;
++        }
++    }
++    if (k == cgraph->n_nodes || k > silu_idx + 1 + ggml_cuda_deferred_window || cgraph->nodes[k]->op != GGML_OP_MUL_MAT ||
++            cgraph->nodes[k]->src[1] != src1 || ggml_nrows(src1) != 1) {
++        return false;
++    }
++
++    const int norm_idx     = ggml_cuda_node_index_before(cgraph, silu_idx, norm, ggml_cuda_deferred_window);
++    const int norm_mul_idx = ggml_cuda_node_index_before(cgraph, silu_idx, normed, ggml_cuda_deferred_window);
++    if (norm_idx < 0 || norm_mul_idx < 0) {
++        return false;
++    }
++
++    if (check_data) {
++        // x and the weight are read at the SILU instead of at the norm: nothing in between may write them.
++        // out is written while other threads of its row still read x and z: an exact alias (in-place) is
++        // safe, as each element is read by the thread that writes it; any other overlap is not
++        if (!ggml_cuda_bytes_untouched(cgraph, norm_idx, silu_idx, x->data, ggml_nbytes(x), false, { normed }) ||
++                !ggml_cuda_bytes_untouched(cgraph, norm_mul_idx, silu_idx, w->data, ggml_nbytes(w), false, {})) {
++            return false;
++        }
++        if (ggml_cuda_bytes_overlap(out, w)) {
++            return false;
++        }
++        for (const ggml_tensor * t : { x, z }) {
++            if (ggml_cuda_bytes_overlap(out, t) && (t->data != out->data || !ggml_are_same_stride(t, out))) {
++                return false;
++            }
++        }
++    }
++
++    m.norm_idx     = norm_idx;
++    m.norm_mul_idx = norm_mul_idx;
++    m.x            = x;
++    m.rms_norm     = norm;
++    m.w            = w;
++    m.z            = z;
++    m.out          = out;
++    m.mmvq_src1    = src1;
++    return true;
++}
++
++// Returns true when node i was handled: an RMS_NORM or its MUL that is not run because the fused kernel at
++// the SILU after it computes it, or that SILU (then *skip covers the gated MUL). The skip decision is the same
++// graph-only match the SILU makes later, so the two cannot disagree.
++static bool ggml_cuda_try_gated_norm(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i, int * skip) {
++    const ggml_tensor * node = cgraph->nodes[i];
++    if (ggml_cuda_is_unary_op(node, GGML_UNARY_OP_SILU)) {
++        ggml_cuda_gated_norm_match m;
++        if (!ggml_cuda_match_gated_norm(cgraph, i, m, /*check_data=*/true)) {
++            return false;
++        }
++        ggml_cuda_op_gated_rms_norm_silu_q8_1(*ctx, m.x, m.rms_norm, m.w, m.z, m.out, m.mmvq_src1);
++        *skip = 1;
++        return true;
++    }
++    if (node->op != GGML_OP_RMS_NORM && node->op != GGML_OP_MUL) {
++        return false;
++    }
++    const int last = std::min(cgraph->n_nodes - 1, i + ggml_cuda_deferred_window);
++    for (int j = i + 1; j <= last; ++j) {
++        if (!ggml_cuda_is_unary_op(cgraph->nodes[j], GGML_UNARY_OP_SILU)) {
++            continue;
++        }
++        ggml_cuda_gated_norm_match m;
++        if (ggml_cuda_match_gated_norm(cgraph, j, m, /*check_data=*/true) && (i == m.norm_idx || i == m.norm_mul_idx)) {
++            return true;
++        }
++    }
++    return false;
++}
++
+ // Runs before ggml_cuda_try_fuse for every node. Returns true when the node was handled here: a node that is
+ // not run because a fused kernel later in the graph computes it, or the node that runs that kernel (then *skip
+ // is the number of following nodes it covered). One token, main stream only.
+@@ -3990,6 +4131,9 @@
+     if (ggml_cuda_try_gdn_gates(ctx, cgraph, i, skip)) {
+         return true;
+     }
++    if (ggml_cuda_try_gated_norm(ctx, cgraph, i, skip)) {
++        return true;
++    }
+     return false;
+ }
+ 
+@@ -4002,6 +4146,10 @@
+             params->add_alloc_dep(params->user_data, root(gm.alpha), cgraph->nodes[i]);
+             params->add_alloc_dep(params->user_data, root(gm.beta_raw), cgraph->nodes[i]);
+         }
++        ggml_cuda_gated_norm_match nm;
++        if (ggml_cuda_match_gated_norm(cgraph, i, nm, /*check_data=*/false)) {
++            params->add_alloc_dep(params->user_data, root(nm.x), nm.out);
++        }
+     }
+ }
+ 
+diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -1,4 +1,5 @@
+ #include "norm.cuh"
++#include "unary.cuh"
+ #include <cstdint>
+ 
+ template <int block_size>
+@@ -831,3 +832,98 @@
+     std::copy(dst->ne, dst->ne + GGML_MAX_DIMS, pending.ne);
+     std::copy(dst->nb, dst->nb + GGML_MAX_DIMS, pending.nb);
+ }
++
++// The gated output norm of a Gated DeltaNet layer at one token, in one kernel: per head row the RMS norm times
++// its weight, times silu(z), and that result quantized to q8_1 for the output projection. Each step repeats
++// the expressions of the kernels it replaces (rms_norm_f32<256, true>, unary_gated_op_kernel<op_silu>,
++// quantize_q8_1) with the same block size and per-thread element order, the same block reduction and the same
++// 32-lane quantization groups, so every value is bit-identical to running those kernels one after another.
++template <int block_size>
++static __global__ void gated_rms_norm_silu_q8_1_f32(
++        const float * x, const float * mul, const float * z, float * dst, void * vy,
++        const int ncols, const int64_t stride_row_x, const int64_t stride_row_z, const float eps) {
++    const int row = blockIdx.x;
++    const int tid = threadIdx.x;
++
++    x   += row*stride_row_x;
++    z   += row*stride_row_z;
++    dst += (int64_t) row*ncols;
++
++    float tmp = 0.0f;
++    for (int col = tid; col < ncols; col += block_size) {
++        const float xi = x[col];
++        tmp += xi * xi;
++    }
++
++    extern __shared__ float s_sum[];
++    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
++
++    const float mean  = tmp / ncols;
++    const float scale = rsqrtf(mean + eps);
++
++    block_q8_1 * y = (block_q8_1 *) vy + (int64_t) row*(ncols / QK8_1);
++    for (int col = tid; col < ncols; col += block_size) {
++        const float normed = scale * x[col] * mul[col];
++        const float xi     = ggml_cuda_op_silu_single(z[col]) * normed;
++        dst[col] = xi;
++
++        float amax = fabsf(xi);
++        float sum  = xi;
++        amax = warp_reduce_max<QK8_1>(amax);
++        sum  = warp_reduce_sum<QK8_1>(sum);
++
++        const float  d = amax / 127.0f;
++        const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
++
++        const int ib  = col / QK8_1;
++        const int iqs = col % QK8_1;
++        y[ib].qs[iqs] = q;
++        if (iqs == 0) {
++            y[ib].ds = make_half2(d, sum);
++        }
++    }
++}
++
++bool ggml_cuda_gated_rms_norm_q8_1_supported(const int64_t ncols, const int64_t nelements) {
++    // the 256-thread block rms_norm_f32 uses for rows under 1024; whole 32-lane groups per row so that the
++    // quantization shuffles never diverge; no q8_1 padding blocks after the last row
++    return ncols < 1024 && ncols % QK8_1 == 0 && nelements % MATRIX_ROW_PADDING == 0;
++}
++
++void ggml_cuda_op_gated_rms_norm_silu_q8_1(ggml_backend_cuda_context & ctx,
++                                           const ggml_tensor *         x,
++                                           const ggml_tensor *         rms_norm,
++                                           const ggml_tensor *         mul_w,
++                                           const ggml_tensor *         z,
++                                           ggml_tensor *               dst,
++                                           const ggml_tensor *         mmvq_src1) {
++    const int64_t ncols = x->ne[0];
++    const int64_t nrows = ggml_nrows(x);
++    GGML_ASSERT(ggml_cuda_gated_rms_norm_q8_1_supported(ncols, ggml_nelements(dst)));
++    GGML_ASSERT(x->nb[0] == sizeof(float) && z->nb[0] == sizeof(float) && ggml_is_contiguous(dst));
++    GGML_ASSERT(x->ne[2] == 1 && x->ne[3] == 1 && z->ne[2] == 1 && z->ne[3] == 1);
++    GGML_ASSERT(mmvq_src1->data == dst->data && ggml_nbytes(mmvq_src1) == ggml_nbytes(dst));
++    GGML_ASSERT(ctx.curr_stream_no == 0);
++
++    float eps = 0.0f;
++    memcpy(&eps, rms_norm->op_params, sizeof(float));
++
++    // the kept q8_1 copy is replaced by this one when the group is committed; freeing it before the new
++    // allocation keeps pool frees in reverse allocation order, which the VMM pool requires
++    ctx.mmvq_src1_invalidate();
++    const size_t q8_1_size = ggml_nelements(dst) * sizeof(block_q8_1) / QK8_1;
++    auto & pending = ctx.mmvq_src1_pending;
++    pending.q8_1   = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), q8_1_size);
++
++    cudaStream_t stream = ctx.stream();
++    gated_rms_norm_silu_q8_1_f32<256><<<nrows, 256, 32 * sizeof(float), stream>>>(
++        (const float *) x->data, (const float *) mul_w->data, (const float *) z->data, (float *) dst->data,
++        pending.q8_1->get(), (int) ncols, (int64_t) (x->nb[1] / sizeof(float)), (int64_t) (z->nb[1] / sizeof(float)),
++        eps);
++    CUDA_CHECK(cudaGetLastError());
++
++    pending.data   = mmvq_src1->data;
++    pending.nbytes = ggml_nbytes(mmvq_src1);
++    std::copy(mmvq_src1->ne, mmvq_src1->ne + GGML_MAX_DIMS, pending.ne);
++    std::copy(mmvq_src1->nb, mmvq_src1->nb + GGML_MAX_DIMS, pending.nb);
++}
+diff --git a/ggml/src/ggml-cuda/norm.cuh b/ggml/src/ggml-cuda/norm.cuh
+--- a/ggml/src/ggml-cuda/norm.cuh
++++ b/ggml/src/ggml-cuda/norm.cuh
+@@ -33,3 +33,15 @@
+                                          const ggml_tensor *         rms_norm,
+                                          const ggml_tensor *         mul_w,
+                                          ggml_tensor *               dst);
++
++// (see ggml_cuda_match_gated_norm) Gated DeltaNet output norm at one token: RMS norm * weight * silu(z),
++// writing dst and its q8_1 copy, which becomes the next mmvq's kept input for mmvq_src1 (dst or a view of it)
++bool ggml_cuda_gated_rms_norm_q8_1_supported(int64_t ncols, int64_t nelements);
++
++void ggml_cuda_op_gated_rms_norm_silu_q8_1(ggml_backend_cuda_context & ctx,
++                                           const ggml_tensor *         x,
++                                           const ggml_tensor *         rms_norm,
++                                           const ggml_tensor *         mul_w,
++                                           const ggml_tensor *         z,
++                                           ggml_tensor *               dst,
++                                           const ggml_tensor *         mmvq_src1);

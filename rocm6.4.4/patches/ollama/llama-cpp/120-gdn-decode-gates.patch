@@ -1,0 +1,506 @@
+llama.cpp (as fetched by Ollama v0.35.1, llama.cpp b11232, applied after
+119; needs 114 and 117): at one token, GATED_DELTA_NET computes its decay
+and beta from the raw gate inputs, so the softplus and sigmoid kernels
+before it are not dispatched.
+Generic (all GPUs): not gfx803-specific code; measured on gfx803.
+
+WHY
+---
+Single-token decode on an RX 590 pays for every dispatch as well as for the
+work in it: each one costs about 4.3 us of command-processor time however
+small the kernel, a 2.65 us floor plus 1.65 us for the vector-L1 invalidate
+that every dispatch needs on gfx8 (docs/FINDINGS.md, "A kernel can read
+stale data from the vector L1 across dispatches"). A Qwen3.6 35B-A3B decode
+token with the routed experts in system RAM issues about 1,425 dispatches,
+about 1,064 of them on the critical path.
+
+Each Gated DeltaNet layer (Qwen3.5/3.6, Qwen3-Next) feeds GATED_DELTA_NET
+two per-head gates: the decay g = softplus(alpha + dt_bias) * a and
+beta = sigmoid(b). At one token they are one float per head (32 on
+Qwen3.6 35B-A3B), yet each costs a dispatch of its own: the fused
+softplus * a kernel and the sigmoid kernel. The decode kernel already loads
+both values and takes expf of the decay in every lane, so computing them
+there costs a few instructions per lane and no memory traffic: 60
+dispatches per token fewer on Qwen3.6 35B-A3B (30 DeltaNet layers).
+
+Measured on an RX 590 (llama-bench, Qwen3.6 35B-A3B Q4_K_M, all experts in
+system RAM with -ncmoe 99, tg128, 5 repetitions, three alternating rounds,
+HSA_ENABLE_SDMA=1 ROC_CPU_WAIT_FOR_SIGNAL=1), patches 120 and 121
+together: 24.58, 24.46, 24.57 -> 24.72, 24.78, 24.79 tok/s (+0.9%). Both
+fire in all 30 DeltaNet layers of every decode token. With this patch
+alone and with both, greedy 128-token output is byte-identical to the
+build without them, and llama-perplexity with -ub 1 (every token through
+the decode path) prints the same perplexity for every chunk. No GPU
+faults in any run.
+
+WHAT
+----
+ggml_cuda_try_deferred_fusion runs in the evaluation loop after
+ggml_cuda_try_defer_state_rows and before ggml_cuda_try_fuse.
+ggml_cuda_match_gdn_gates matches a GATED_DELTA_NET with one token, one
+sequence and a scalar decay per head (not KDA) whose decay input is a
+RESHAPE of MUL(SOFTPLUS(alpha), a) and whose beta input is SIGMOID(b), all
+f32 and contiguous, one value per head, with SOFTPLUS, MUL, the RESHAPE
+and SIGMOID read only along that chain, in the shapes for which the
+separate path runs the fused unary * mul kernel. All the nodes must lie
+within 48 nodes before the GATED_DELTA_NET in the graph being evaluated,
+so a chain split across two graphs (patch 112's head and tail) runs
+unfused. The match depends only on the graph, so the SOFTPLUS, MUL and
+SIGMOID are skipped when the loop reaches them, and at the
+GATED_DELTA_NET the op launches a gates_t variant of the decode kernel
+that reads alpha, a and b and computes
+  g    = expf(softplus(alpha[h]) * a[h])
+  beta = 1 / (1 + expf(-b[h]))
+with the expressions of op_softplus, the fused unary * mul and op_sigmoid
+in unary.cu. The snapshot store into the cache
+(ggml_cuda_try_gdn_cache_fusion) and 114's state read from the cache row
+combine with it as before. No node that runs between a skipped node and
+the GATED_DELTA_NET may write alpha, a or b, and the op's output must not
+overlap them; graph_optimize keeps alpha and b allocated until the
+GATED_DELTA_NET runs. Prompt batches never match and keep the separate
+kernels and 117's column kernel. GGML_CUDA_DISABLE_FUSION=1 turns this
+off with the other fusions.
+
+Numerics are unchanged: each lane evaluates the expressions of the
+separate kernels in the same order, and the f32 values the separate
+kernels store are the values the registers hold. On gfx803 the folded
+softplus, its product with a, the expf of the decay and the sigmoid
+compile to the instruction sequences of unary_gated_op_kernel<op_softplus>,
+unary_op_kernel<op_sigmoid> and the kernel's own expf (same range
+reduction constants, v_mac/v_mad order, v_exp/v_log, the correctly
+rounded division; v_fma only inside that division, as in the sigmoid
+kernel). The low half of the expf argument is formed as v_mad_f32
+(a * softplus - high half), an unfused multiply-add that rounds like the
+separate multiply and subtract, where the separate path subtracts from
+the stored product: the same bits. The variants without gates compile as
+before.
+
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
+--- a/ggml/src/ggml-cuda/gated_delta_net.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net.cu
+@@ -1,7 +1,19 @@
+ #include "gated_delta_net.cuh"
+ #include "ggml-cuda/common.cuh"
+ 
+-template <int S_v, bool KDA, bool keep_rs_t, bool state_ids_t>
++// op_softplus and op_sigmoid of unary.cu, the kernels whose work the gates_t variant takes over: the same
++// expressions keep the decay and beta of every head bit-identical to computing them in separate kernels
++static __device__ __forceinline__ float gdn_gate_softplus(float x) {
++    return (x > 20.0f) ? x : logf(1.0f + expf(x));
++}
++
++static __device__ __forceinline__ float gdn_gate_sigmoid(float x) {
++    return 1.0f / (1.0f + expf(-x));
++}
++
++// gates_t: g holds softplus inputs, beta holds sigmoid inputs and gate_a the per-head decay factors, one value
++// per head (one token, one sequence); the decay is softplus(g) * gate_a, the order of the fused unary * mul
++template <int S_v, bool KDA, bool keep_rs_t, bool state_ids_t, bool gates_t>
+ __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
+ gated_delta_net_cuda(const float * q,
+                                      const float * k,
+@@ -29,7 +41,9 @@
+                                      int64_t       state_slot_stride,
+                                      int           K,
+                                      const int32_t * state_ids,
+-                                     int64_t       state_ids_row_stride) {
++                                     int64_t       state_ids_row_stride,
++                                     const float * gate_a) {
++    static_assert(!gates_t || !KDA, "folded gates take one decay per head");
+     const uint32_t h_idx    = blockIdx.x;
+     const uint32_t sequence = blockIdx.y;
+     // each warp owns one column, using warp-level primitives to reduce across rows
+@@ -78,7 +92,12 @@
+         const float * beta_t = beta + gb_offset;
+         const float * g_t    = g    + gb_offset * (KDA ? S_v : 1);
+ 
+-        const float beta_val = *beta_t;
++        float beta_val;
++        if constexpr (gates_t) {
++            beta_val = gdn_gate_sigmoid(*beta_t);
++        } else {
++            beta_val = *beta_t;
++        }
+ 
+         // Cache k and q in registers
+         float k_reg[rows_per_lane];
+@@ -91,7 +110,12 @@
+         }
+ 
+         if constexpr (!KDA) {
+-            const float g_val = expf(*g_t);
++            float g_val;
++            if constexpr (gates_t) {
++                g_val = expf(gdn_gate_softplus(*g_t) * gate_a[h_idx]);
++            } else {
++                g_val = expf(*g_t);
++            }
+ 
+             // kv[col] = (S^T @ k)[col] = sum_i S[i][col] * k[i]
+             float kv_shard = 0.0f;
+@@ -414,7 +438,7 @@
+     return ((uintptr_t) p & 15) == 0;
+ }
+ 
+-template <bool KDA, bool keep_rs_t, bool state_ids_t = false>
++template <bool KDA, bool keep_rs_t, bool state_ids_t = false, bool gates_t = false>
+ static void launch_gated_delta_net(
+         const float * q_d, const float * k_d, const float * v_d,
+         const float * g_d, const float * b_d, const float * s_d,
+@@ -425,12 +449,12 @@
+         int64_t sb1,   int64_t sb2, int64_t sb3,
+         int64_t neqk1, int64_t rq3,
+         float scale, int64_t state_slot_stride, int K, cudaStream_t stream,
+-        const int32_t * state_ids = nullptr, int64_t state_ids_row_stride = 0) {
++        const int32_t * state_ids = nullptr, int64_t state_ids_row_stride = 0, const float * gate_a = nullptr) {
+     //TODO: Add chunked kernel for even faster pre-fill
+     // A single token has no batch to stage and either kernel moves the whole 64 KiB state of a head once; it
+     // stays on the wave-per-column kernel, which keeps decode output bit-identical. The column kernel moves the
+     // state as float4, so every state row start must be 16-byte aligned.
+-    const bool col_ok = n_tokens > 1 && S_v == gdn_col::S_v && gdn_col_aligned(s_d) && gdn_col_aligned(state_d) &&
++    const bool col_ok = !gates_t && n_tokens > 1 && S_v == gdn_col::S_v && gdn_col_aligned(s_d) && gdn_col_aligned(state_d) &&
+         (!keep_rs_t || state_slot_stride % 4 == 0) && (!state_ids_t || state_ids_row_stride % 4 == 0);
+     if (col_ok) {
+         const dim3 grid_dims(H, n_seqs, gdn_col::S_v / gdn_col::cols_per_block);
+@@ -455,33 +479,33 @@
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
+     switch (S_v) {
+         case 16:
+-            ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t, state_ids_t>, launch_params,
++            ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t, state_ids_t, gates_t>, launch_params,
+                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K,
+-                state_ids, state_ids_row_stride);
++                state_ids, state_ids_row_stride, gate_a);
+             break;
+         case 32:
+-            ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t, state_ids_t>, launch_params,
++            ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t, state_ids_t, gates_t>, launch_params,
+                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K,
+-                state_ids, state_ids_row_stride);
++                state_ids, state_ids_row_stride, gate_a);
+             break;
+         case 64: {
+-            ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t, state_ids_t>, launch_params,
++            ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t, state_ids_t, gates_t>, launch_params,
+                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K,
+-                state_ids, state_ids_row_stride);
++                state_ids, state_ids_row_stride, gate_a);
+             break;
+         }
+         case 128: {
+-            ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, state_ids_t>, launch_params,
++            ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, state_ids_t, gates_t>, launch_params,
+                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K,
+-                state_ids, state_ids_row_stride);
++                state_ids, state_ids_row_stride, gate_a);
+             break;
+         }
+         default:
+@@ -491,7 +515,8 @@
+ }
+ 
+ static void ggml_cuda_op_gated_delta_net_impl(
+-        ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_gated_delta_net_fused_cache * cache) {
++        ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_gated_delta_net_fused_cache * cache,
++        const ggml_cuda_gdn_gates * gates = nullptr) {
+     ggml_tensor * src_q     = dst->src[0];
+     ggml_tensor * src_k     = dst->src[1];
+     ggml_tensor * src_v     = dst->src[2];
+@@ -568,6 +593,37 @@
+     const ggml_tensor * state_rows = src_state->view_src ? src_state->view_src : src_state;
+     const ggml_backend_cuda_context::gdn_state_rows * deferred =
+         ctx.deferred_state_rows.empty() ? nullptr : ctx.deferred_state_rows_find(state_rows);
++
++    if (gates != nullptr) {
++        GGML_ASSERT(ggml_cuda_gated_delta_net_gates_ok(dst));
++        const float *   s_in       = deferred ? deferred->cache : s_d;
++        const int32_t * ids        = deferred ? deferred->ids : nullptr;
++        const int64_t   ids_stride = deferred ? deferred->row_stride : 0;
++        if (deferred != nullptr) {
++            GGML_ASSERT(ggml_cuda_gated_delta_net_state_from_rows_ok(dst));
++            if (keep_rs) {
++                launch_gated_delta_net<false, true, true, true>(q_d, k_d, v_d, gates->alpha, gates->beta, s_in, dst_d,
++                    state_d, S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
++                    sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream, ids, ids_stride, gates->a);
++            } else {
++                launch_gated_delta_net<false, false, true, true>(q_d, k_d, v_d, gates->alpha, gates->beta, s_in, dst_d,
++                    state_d, S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
++                    sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream, ids, ids_stride, gates->a);
++            }
++        } else {
++            if (keep_rs) {
++                launch_gated_delta_net<false, true, false, true>(q_d, k_d, v_d, gates->alpha, gates->beta, s_in, dst_d,
++                    state_d, S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
++                    sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream, ids, ids_stride, gates->a);
++            } else {
++                launch_gated_delta_net<false, false, false, true>(q_d, k_d, v_d, gates->alpha, gates->beta, s_in, dst_d,
++                    state_d, S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
++                    sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream, ids, ids_stride, gates->a);
++            }
++        }
++        return;
++    }
++
+     if (deferred != nullptr) {
+         GGML_ASSERT(ggml_cuda_gated_delta_net_state_from_rows_ok(dst));
+         if (keep_rs) {
+@@ -615,6 +671,21 @@
+         src_v->ne[3] == 1 && src_g->ne[0] != src_v->ne[0];
+ }
+ 
++bool ggml_cuda_gated_delta_net_gates_ok(const ggml_tensor * dst) {
++    const ggml_tensor * src_v    = dst->src[2];
++    const ggml_tensor * src_g    = dst->src[3];
++    const ggml_tensor * src_beta = dst->src[4];
++    // the kernel reads the raw gate inputs at the offsets of g and beta, which with one token, one sequence
++    // and a beta row stride of one float are the head index
++    return dst->type == GGML_TYPE_F32 && src_g->ne[0] == 1 && src_v->ne[0] > 1 &&
++        src_v->ne[2] == 1 && src_v->ne[3] == 1 && src_beta->nb[1] == sizeof(float);
++}
++
++void ggml_cuda_op_gated_delta_net_gates(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
++        const ggml_cuda_gated_delta_net_fused_cache * cache, const ggml_cuda_gdn_gates & gates) {
++    ggml_cuda_op_gated_delta_net_impl(ctx, dst, cache, &gates);
++}
++
+ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     ggml_cuda_op_gated_delta_net_impl(ctx, dst, nullptr);
+ }
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cuh b/ggml/src/ggml-cuda/gated_delta_net.cuh
+--- a/ggml/src/ggml-cuda/gated_delta_net.cuh
++++ b/ggml/src/ggml-cuda/gated_delta_net.cuh
+@@ -13,6 +13,22 @@
+ // GET_ROWS that feeds it
+ bool ggml_cuda_gated_delta_net_state_from_rows_ok(const ggml_tensor * dst);
+ 
++// the decode gates read raw, one float per head: decay g = softplus(alpha) * a, beta = sigmoid(beta)
++struct ggml_cuda_gdn_gates {
++    const float * alpha;
++    const float * a;
++    const float * beta;
++};
++
++// whether this op (one token, one sequence, scalar decay) can take its gates raw
++bool ggml_cuda_gated_delta_net_gates_ok(const ggml_tensor * dst);
++
++// the op with the softplus * a and sigmoid of its gate inputs computed in its own kernel; cache may be null
++// (see ggml_cuda_try_gdn_gates)
++void ggml_cuda_op_gated_delta_net_gates(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
++                                        const ggml_cuda_gated_delta_net_fused_cache * cache,
++                                        const ggml_cuda_gdn_gates & gates);
++
+ // same op, but writes the snapshot(s) into the cache instead of dst (see ggml_cuda_try_gdn_cache_fusion)
+ void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+                                               ggml_cuda_gated_delta_net_fused_cache cache);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3834,6 +3834,177 @@
+     return true;
+ }
+ 
++// Index of t among the `window` nodes before node_idx, or -1.
++static int ggml_cuda_node_index_before(const ggml_cgraph * cgraph, int node_idx, const ggml_tensor * t, int window) {
++    for (int j = node_idx - 1; j >= 0 && j >= node_idx - window; --j) {
++        if (cgraph->nodes[j] == t) {
++            return j;
++        }
++    }
++    return -1;
++}
++
++static bool ggml_cuda_single_use(const ggml_cgraph * cgraph, const ggml_tensor * t) {
++    return !(t->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_cuda_node_use_count(cgraph, t) == 1;
++}
++
++static bool ggml_cuda_f32_contiguous(const ggml_tensor * t) {
++    return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t);
++}
++
++static bool ggml_cuda_is_unary_op(const ggml_tensor * t, ggml_unary_op op) {
++    return t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == op;
++}
++
++// How far apart the nodes of one deferred pattern may lie; the scheduler's dependency nodes may sit between them.
++static constexpr int ggml_cuda_deferred_window = 48;
++
++// A one-token GATED_DELTA_NET whose decay is RESHAPE(MUL(SOFTPLUS(alpha), a)) and whose beta is
++// SIGMOID(beta_raw), one value per head, with SOFTPLUS, MUL and SIGMOID read only along that chain. The three
++// small nodes are not run; the GDN kernel computes softplus(alpha) * a and sigmoid(beta_raw) itself. With
++// check_data the tensors' memory is known and checked too; graph_optimize calls it without, to keep alpha and
++// beta_raw allocated until the GDN.
++struct ggml_cuda_gdn_gates_match {
++    int                 softplus_idx = -1;
++    int                 mul_idx      = -1;
++    int                 sigmoid_idx  = -1;
++    const ggml_tensor * alpha        = nullptr;
++    const ggml_tensor * a            = nullptr;
++    const ggml_tensor * beta_raw     = nullptr;
++};
++
++static bool ggml_cuda_match_gdn_gates(const ggml_cgraph * cgraph, int gdn_idx, ggml_cuda_gdn_gates_match & m,
++        bool check_data) {
++    const ggml_tensor * gdn = cgraph->nodes[gdn_idx];
++    if (gdn->op != GGML_OP_GATED_DELTA_NET || !ggml_cuda_gated_delta_net_gates_ok(gdn)) {
++        return false;
++    }
++    const int64_t H = gdn->src[2]->ne[1];
++
++    const ggml_tensor * g    = gdn->src[3];
++    const ggml_tensor * beta = gdn->src[4];
++    if (g->op != GGML_OP_RESHAPE || g->view_src == nullptr || g->view_src != g->src[0] || g->view_offs != 0 ||
++            !ggml_cuda_single_use(cgraph, g)) {
++        return false;
++    }
++    const ggml_tensor * mul = g->src[0];
++    if (mul->op != GGML_OP_MUL || !ggml_cuda_f32_contiguous(mul) || ggml_nelements(mul) != H ||
++            !ggml_cuda_single_use(cgraph, mul)) {
++        return false;
++    }
++    const ggml_tensor * sp = ggml_cuda_is_unary_op(mul->src[0], GGML_UNARY_OP_SOFTPLUS) ? mul->src[0] : mul->src[1];
++    const ggml_tensor * a  = ggml_cuda_other_src(mul, sp);
++    if (!ggml_cuda_is_unary_op(sp, GGML_UNARY_OP_SOFTPLUS) || a == nullptr || a == sp ||
++            !ggml_cuda_f32_contiguous(sp) || !ggml_cuda_single_use(cgraph, sp)) {
++        return false;
++    }
++    const ggml_tensor * alpha = sp->src[0];
++    // the shapes for which the separate path runs the fused unary * mul kernel, whose expression the GDN repeats
++    if (!ggml_cuda_f32_contiguous(alpha) || !ggml_cuda_f32_contiguous(a) ||
++            !ggml_are_same_shape(alpha, a) || !ggml_are_same_shape(alpha, mul)) {
++        return false;
++    }
++    if (!ggml_cuda_is_unary_op(beta, GGML_UNARY_OP_SIGMOID) || !ggml_cuda_f32_contiguous(beta) ||
++            ggml_nelements(beta) != H || !ggml_cuda_single_use(cgraph, beta)) {
++        return false;
++    }
++    const ggml_tensor * beta_raw = beta->src[0];
++    if (!ggml_cuda_f32_contiguous(beta_raw) || ggml_nelements(beta_raw) != H) {
++        return false;
++    }
++
++    const int sp_idx  = ggml_cuda_node_index_before(cgraph, gdn_idx, sp, ggml_cuda_deferred_window);
++    const int mul_idx = ggml_cuda_node_index_before(cgraph, gdn_idx, mul, ggml_cuda_deferred_window);
++    const int sig_idx = ggml_cuda_node_index_before(cgraph, gdn_idx, beta, ggml_cuda_deferred_window);
++    if (sp_idx < 0 || mul_idx < 0 || sig_idx < 0) {
++        return false;
++    }
++
++    if (check_data) {
++        // alpha, a and beta_raw are read when the GDN runs instead of at their own nodes: no node that runs in
++        // between may write them, and the GDN's own output must not hold them
++        if (!ggml_cuda_bytes_untouched(cgraph, sp_idx, gdn_idx, alpha->data, ggml_nbytes(alpha), false, { mul, beta }) ||
++                !ggml_cuda_bytes_untouched(cgraph, mul_idx, gdn_idx, a->data, ggml_nbytes(a), false, { beta }) ||
++                !ggml_cuda_bytes_untouched(cgraph, sig_idx, gdn_idx, beta_raw->data, ggml_nbytes(beta_raw), false, { sp, mul })) {
++            return false;
++        }
++        for (const ggml_tensor * t : { alpha, a, beta_raw }) {
++            if (ggml_cuda_bytes_overlap(gdn, t)) {
++                return false;
++            }
++        }
++    }
++
++    m.softplus_idx = sp_idx;
++    m.mul_idx      = mul_idx;
++    m.sigmoid_idx  = sig_idx;
++    m.alpha        = alpha;
++    m.a            = a;
++    m.beta_raw     = beta_raw;
++    return true;
++}
++
++// Returns true when node i was handled: a SOFTPLUS, MUL or SIGMOID that is not run because the
++// GATED_DELTA_NET after it computes it, or that GATED_DELTA_NET, with the snapshot store into the cache when
++// ggml_cuda_try_fuse would have fused it (then *skip is the number of following nodes it covered). The skip
++// decision is the same graph-only match the GATED_DELTA_NET makes later, so the two cannot disagree.
++static bool ggml_cuda_try_gdn_gates(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i, int * skip) {
++    ggml_tensor * node = cgraph->nodes[i];
++    if (node->op == GGML_OP_GATED_DELTA_NET) {
++        ggml_cuda_gdn_gates_match m;
++        if (!ggml_cuda_match_gdn_gates(cgraph, i, m, /*check_data=*/true)) {
++            return false;
++        }
++        const ggml_cuda_gdn_gates gates = { (const float *) m.alpha->data, (const float *) m.a->data,
++                                            (const float *) m.beta_raw->data };
++        ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
++        const int nodes_to_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
++        ggml_cuda_op_gated_delta_net_gates(*ctx, node, nodes_to_skip > 0 ? &fused_state_cpy : nullptr, gates);
++        *skip = nodes_to_skip > 0 ? nodes_to_skip : 0;
++        return true;
++    }
++    if (node->op != GGML_OP_UNARY && node->op != GGML_OP_MUL) {
++        return false;
++    }
++    const int last = std::min(cgraph->n_nodes - 1, i + ggml_cuda_deferred_window);
++    for (int j = i + 1; j <= last; ++j) {
++        if (cgraph->nodes[j]->op != GGML_OP_GATED_DELTA_NET) {
++            continue;
++        }
++        ggml_cuda_gdn_gates_match m;
++        return ggml_cuda_match_gdn_gates(cgraph, j, m, /*check_data=*/true) &&
++            (i == m.softplus_idx || i == m.mul_idx || i == m.sigmoid_idx);
++    }
++    return false;
++}
++
++// Runs before ggml_cuda_try_fuse for every node. Returns true when the node was handled here: a node that is
++// not run because a fused kernel later in the graph computes it, or the node that runs that kernel (then *skip
++// is the number of following nodes it covered). One token, main stream only.
++static bool ggml_cuda_try_deferred_fusion(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i, int * skip) {
++    *skip = 0;
++    static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
++    if (disable_fusion || ctx->curr_stream_no != 0 || !ctx->stream_context().concurrent_events.empty()) {
++        return false;
++    }
++    if (ggml_cuda_try_gdn_gates(ctx, cgraph, i, skip)) {
++        return true;
++    }
++    return false;
++}
++
++// graph_optimize: inputs that a fused kernel reads later than their original reader stay allocated until it runs
++static void ggml_cuda_add_deferred_fusion_alloc_deps(ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
++    auto root = [](const ggml_tensor * t) { return const_cast<ggml_tensor *>(t->view_src ? t->view_src : t); };
++    for (int i = 0; i < cgraph->n_nodes; ++i) {
++        ggml_cuda_gdn_gates_match gm;
++        if (ggml_cuda_match_gdn_gates(cgraph, i, gm, /*check_data=*/false)) {
++            params->add_alloc_dep(params->user_data, root(gm.alpha), cgraph->nodes[i]);
++            params->add_alloc_dep(params->user_data, root(gm.beta_raw), cgraph->nodes[i]);
++        }
++    }
++}
++
+ // Runs before ggml_cuda_try_fuse for every node. Returns true when the node was handled here: a
+ // recurrent-state GET_ROWS (for the conv state also its CONCAT and CPY) that is not run because its
+ // consumer reads and writes the cache rows itself, or the SSM_CONV that runs a planned conv step (then
+@@ -4812,6 +4983,14 @@
+                     i += defer_skip;
+                     continue;
+                 }
++                if (ggml_cuda_try_deferred_fusion(cuda_ctx, cgraph, i, &defer_skip)) {
++                    for (int j = 1; j <= defer_skip; j++) {
++                        cuda_ctx->mmvq_src1_invalidate_if_written(cgraph->nodes[i + j]);
++                    }
++                    cuda_ctx->mmvq_src1_commit_pending();
++                    i += defer_skip;
++                    continue;
++                }
+                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                 for (int j = 1; j <= nodes_to_skip; j++) {
+                     cuda_ctx->mmvq_src1_invalidate_if_written(cgraph->nodes[i + j]);
+@@ -5136,6 +5315,7 @@
+                 }
+             }
+         }
++        ggml_cuda_add_deferred_fusion_alloc_deps(cgraph, params);
+     }
+ 
+ #ifdef USE_CUDA_GRAPH

@@ -1,0 +1,544 @@
+llama.cpp (as fetched by Ollama v0.35.1, llama.cpp b11232, applied after
+117): MoE expert matmuls of prompt batches with Q4_K and Q6_K weights run
+as a grouped fp32 GEMM that dequantizes the weights on their way into
+shared memory, instead of mmq.
+gfx803-specific: engages only on GCN4 (cc == GGML_CUDA_CC_GCN4).
+
+WHY
+---
+In a 2048-token prompt batch of Qwen3.6 35B-A3B (Q4_K_M; 256 experts, 8 per
+token, expert ffn 512, hidden 2048) on an RX 590, the 120 MUL_MAT_ID calls
+(gate, up and down in 40 layers) take about 2.03 s of the batch's 3.26 s of
+GPU kernel time, 62%. Each call is 34.4 GFLOP, and mul_mat_q runs a Q4_K
+call in 16.3 ms (2.1 TFLOPS) and a Q6_K call in 21.7 ms (1.6 TFLOPS).
+gfx803 has no integer dot instruction: mmq builds each int8 dot product
+from byte extracts and 24-bit multiply-adds, about three instructions per
+multiply-add, after quantizing the activations to 8 bits. The card's fp32
+multiply-add (v_mac_f32) runs at one per lane per clock, and the base
+image's gfx803 SGEMM reaches 3.8-4.8 TFLOPS with it; patch 106 already
+sends dense prompt matmuls there. MUL_MAT_ID cannot take that route: every
+expert gets a different, data-dependent set of tokens (64 on average at
+2048 tokens) whose counts exist only on the device, so one GEMM per expert
+would need a copy to the host and a stream synchronization per call.
+
+GPUs with a native int8 dot instruction (dp4a, v_dot4, MMA) run mmq's
+products at full rate and keep it; the kernel is only engaged on GCN4,
+the same host test patch 100 uses for its gfx803 tile table.
+
+WHAT
+----
+New mmid-f32.cuh; ggml_cuda_mul_mat_q tries ggml_cuda_mmid_f32 first for
+calls with expert ids.
+1. mm_ids_helper sorts the token slots by expert as before (forward map).
+   A one-block kernel turns its expert bounds into a tile list on the
+   device: one entry per expert and run of up to 64 tokens. The GEMM is
+   launched for the largest tile count the call can have, (slots +
+   experts*63)/64 times ne01/128 blocks, and blocks past the real count
+   exit at once. No host synchronization, so HIP graphs still capture the
+   call. Blocks go out by expert, then token tile, then row tile, so
+   concurrent blocks share an expert's weights and a token tile's
+   activations in L2.
+2. mmid_f32_gemm: a block of 4 waves computes 128 weight rows x 64 tokens
+   of one expert, 32 K values per stage (one Q4_K sub-block, one Q6_K pair
+   of 16-value scales). Two threads per row dequantize its 32 values
+   straight from the quantized block into fp32 shared memory (Q4_K: the
+   16-byte header and 16 quant bytes; Q6_K: 16 low-bit bytes, 16 high-bit
+   bytes, the int8 scale and d), next to the fp32 activation rows gathered
+   through ids_src1. The global loads for the next stage are issued before
+   the current stage's multiply-adds and dequantized after them. A wave
+   owns 16 tokens and each lane an 8x4 block of outputs, so a K step is
+   three 16-byte LDS reads and 32 v_mac_f32. Results go to dst through
+   ids_dst.
+3. Most experts' last tile holds fewer than 64 tokens. With 1-16 tokens
+   the four waves split each stage's 32 K values four ways, with 17-32 two
+   ways, and add their partial sums through shared memory at the end, so
+   every SIMD keeps doing useful multiply-adds.
+4. The kernel takes a call when the batch averages at least 16 tokens per
+   expert (512 tokens for this model; below that most tiles hold one
+   partly filled group of 16 and the per-tile dequantization outweighs
+   the gain), the weights are Q4_K or Q6_K with ne00 a multiple of 256 and
+   ne01 a multiple of 128, and src1/dst are f32 with 16-byte aligned rows.
+   Everything else, decode included, runs as before.
+
+gfx803 details. The nibble masks pass through an empty asm statement: with
+the constants visible LLVM emits v_bfe_u32 + v_cvt_f32_ubyte0 per value,
+without them one v_cvt_f32_ubyteN per value. Dequantization is one
+v_mad_f32 per value and the multiply-adds are v_mac_f32 only; there is no
+v_fma_f32 (a quarter-rate instruction on gfx803) in the kernels.
+block_q6_K is 210 bytes, so half of its blocks start 2 bytes off a 4-byte
+boundary; their 16-byte loads stay single loads because gfx8 runs in
+unaligned mode under amdkfd, as the base image's SGEMM also relies on.
+Both kernels use 112-115 VGPRs, no scratch and 24 KB of shared memory: two
+blocks, two waves per SIMD, per CU. In a full tile 93% (Q4_K) and 91%
+(Q6_K) of the VALU instructions are the multiply-adds.
+
+Measured on an RX 590. test-backend-ops MUL_MAT_ID passes 953 of 953
+cases against the CPU backend, including cases added for the check at
+Qwen3.6 35B-A3B's expert shapes (256 experts, 8 used, 512 and 2048
+tokens) with uniform and skewed routing (a few experts get most tokens,
+many get none or one), and small and strided-expert shapes. Op time
+against mmq at those shapes: gate/up Q4_K (512 x 2048) 1.56-1.70x faster,
+down Q4_K (2048 x 512) 2.45-2.65x, down Q6_K 1.87x at 2048 tokens and
+1.31-1.62x at 512.
+
+llama-bench, Qwen3.6 35B-A3B Q4_K_M, all experts in system RAM with
+-ncmoe 99, page cache dropped before each run, HSA_ENABLE_SDMA=1
+ROC_CPU_WAIT_FOR_SIGNAL=1, runs alternating with and without the patch:
+pp2048 (2048-token batches) 447-451 -> 546-548 tok/s (+21%), pp512
+233-235 -> 274-275 tok/s (+17%), tg128 unchanged.
+
+Numerics: results are not bit-identical to mmq. mmq quantizes the
+activations to q8_1 before its integer products; this kernel keeps them in
+fp32 and dequantizes the weights as ggml's CPU code does (each value one
+non-fused multiply-add), so it lands closer to the CPU reference. Against
+CPU-computed logits (llama-perplexity, 8 chunks of 512 tokens in
+512-token batches, q8_0 KV cache): mean KLD 0.00965 +- 0.00042 with this
+patch and 0.01070 +- 0.00051 with mmq, PPL 13.350 and 13.384 (CPU
+13.355), same top token 95.64% and 95.29%.
+
+diff --git a/ggml/src/ggml-cuda/mmid-f32.cuh b/ggml/src/ggml-cuda/mmid-f32.cuh
+new file mode 100644
+--- /dev/null
++++ b/ggml/src/ggml-cuda/mmid-f32.cuh
+@@ -0,0 +1,419 @@
++#pragma once
++
++// Grouped fp32 GEMM for MUL_MAT_ID prompt batches with Q4_K or Q6_K experts on
++// GCN4 (gfx803 class), which has no int8 dot instruction for mmq.
++
++#include "common.cuh"
++#include "mmid.cuh"
++
++#define MMID_F32_BM 128 // weight rows (dst columns) per tile
++#define MMID_F32_NW 4   // waves per block, 16 tokens each
++#define MMID_F32_KT 32  // K values per LDS stage: one Q4_K sub-block, one Q6_K scale pair
++
++// Below this many tokens per expert on average most tiles hold one partly
++// filled wave of 16 tokens, so the dequantization, done once per tile, is
++// spread over too few multiply-adds to beat mmq.
++#define MMID_F32_MIN_AVG_TOKENS 16
++
++// One entry per (expert, run of up to bn tokens): x = expert, y = first row of
++// the expert's slice in ids_src1/ids_dst, z = token count.
++static __global__ void mmid_f32_tile_list(const int32_t * __restrict__ expert_bounds, const int n_experts, const int bn,
++                                          int4 * __restrict__ tiles, int * __restrict__ n_tiles) {
++    __shared__ int scan[256];
++    int base = 0;
++    for (int e0 = 0; e0 < n_experts; e0 += 256) {
++        const int e = e0 + threadIdx.x;
++        int b0 = 0;
++        int n  = 0;
++        if (e < n_experts) {
++            b0 = expert_bounds[e];
++            n  = expert_bounds[e + 1] - b0;
++        }
++        const int cnt = (n + bn - 1) / bn;
++        scan[threadIdx.x] = cnt;
++        __syncthreads();
++        for (int off = 1; off < 256; off <<= 1) {
++            const int v = threadIdx.x >= off ? scan[threadIdx.x - off] : 0;
++            __syncthreads();
++            scan[threadIdx.x] += v;
++            __syncthreads();
++        }
++        const int start = base + scan[threadIdx.x] - cnt;
++        for (int t = 0; t < cnt; ++t) {
++            tiles[start + t] = make_int4(e, b0 + t*bn, min(bn, n - t*bn), 0);
++        }
++        base += scan[255];
++        __syncthreads();
++    }
++    if (threadIdx.x == 0) {
++        *n_tiles = base;
++    }
++}
++
++static __device__ __forceinline__ float mmid_f32_half(const uint32_t bits) {
++    return (float) __builtin_bit_cast(_Float16, (uint16_t) bits);
++}
++
++static __device__ __forceinline__ uint32_t mmid_f32_u8(const uint32_t w, const int i) {
++    return (w >> (8*i)) & 0xFF;
++}
++
++// With the 0x0F0F0F0F nibble masks visible, LLVM turns every weight value into
++// v_bfe_u32 + v_cvt_f32_ubyte0; with the masks opaque one v_cvt_f32_ubyte<e>
++// per value remains, a third fewer instructions in the dequantization.
++static __device__ __forceinline__ uint32_t mmid_f32_opaque(uint32_t v) {
++#if defined(__HIP_DEVICE_COMPILE__)
++    asm volatile("" : "+v"(v));
++#endif // defined(__HIP_DEVICE_COMPILE__)
++    return v;
++}
++
++// Weight values of q (its four bytes) for K positions 4*i..4*i+3 of the thread.
++static __device__ __forceinline__ void mmid_f32_put4(float * v, const int i, const uint32_t q, const float s, const float c) {
++    v[4*i + 0] = (float) ((q >>  0) & 0xFF)*s + c;
++    v[4*i + 1] = (float) ((q >>  8) & 0xFF)*s + c;
++    v[4*i + 2] = (float) ((q >> 16) & 0xFF)*s + c;
++    v[4*i + 3] = (float) ((q >> 24) & 0xFF)*s + c;
++}
++
++// The weight operand of one stage for one thread: VPT consecutive K values of
++// one row, starting at value VPT*part of the 32-value stage. load() issues the
++// global loads; dequant() runs after the stage's multiply-adds, when they have
++// arrived. A stage is one Q4_K sub-block, or one Q6_K group with two 16-value
++// scales, so the scale selection is uniform across the block.
++template <ggml_type type, int VPT> struct mmid_f32_wq;
++
++template <int VPT> struct mmid_f32_wq<GGML_TYPE_Q4_K, VPT> {
++    static constexpr int NQ = VPT/16;
++    uint4 hdr; // d, dmin, scales[12]
++    uint4 qs[NQ];
++
++    __device__ __forceinline__ void load(const char * xr, const int k0, const int part) {
++        const char * b = xr + (k0/QK_K)*sizeof(block_q4_K);
++        const int    j = (k0 % QK_K)/64;
++        hdr = *(const uint4 *) b;
++#pragma unroll
++        for (int i = 0; i < NQ; ++i) {
++            qs[i] = *(const uint4 *) (b + 16 + 32*j + VPT*part + 16*i);
++        }
++    }
++
++    __device__ __forceinline__ void dequant(const int k0, const int part, const uint32_t m4, const uint32_t m2, float v[VPT]) const {
++        GGML_UNUSED(part);
++        GGML_UNUSED(m2);
++        const int sb = (k0 % QK_K)/32;
++        const int sh = 4*(sb % 2);
++        const float d    = mmid_f32_half(hdr.x);
++        const float dmin = mmid_f32_half(hdr.x >> 16);
++        uint32_t sc;
++        uint32_t m;
++        if (sb < 4) {
++            sc = mmid_f32_u8(hdr.y, sb) & 63;
++            m  = mmid_f32_u8(hdr.z, sb) & 63;
++        } else {
++            sc = (mmid_f32_u8(hdr.w, sb - 4) & 0xF) | ((mmid_f32_u8(hdr.y, sb - 4) >> 6) << 4);
++            m  = (mmid_f32_u8(hdr.w, sb - 4) >>  4) | ((mmid_f32_u8(hdr.z, sb - 4) >> 6) << 4);
++        }
++        const float s  = d*(float) sc;
++        const float mn = -(dmin*(float) m);
++#pragma unroll
++        for (int i = 0; i < NQ; ++i) {
++            mmid_f32_put4(v, 4*i + 0, (qs[i].x >> sh) & m4, s, mn);
++            mmid_f32_put4(v, 4*i + 1, (qs[i].y >> sh) & m4, s, mn);
++            mmid_f32_put4(v, 4*i + 2, (qs[i].z >> sh) & m4, s, mn);
++            mmid_f32_put4(v, 4*i + 3, (qs[i].w >> sh) & m4, s, mn);
++        }
++    }
++};
++
++// block_q6_K is 210 bytes, so every other block starts 2 bytes past a 4-byte
++// boundary. gfx8 runs with SH_MEM_CONFIG in unaligned mode under amdkfd, so
++// these stay single wide loads (the gfx803 SGEMM in the base image relies on
++// the same).
++template <int VPT> struct mmid_f32_wq<GGML_TYPE_Q6_K, VPT> {
++    static constexpr int NQ = VPT/16;
++    uint4    ql[NQ];
++    uint4    qh[NQ];
++    uint32_t sc; // the int8 scales of the thread's values: one per 16
++    uint32_t d;
++
++    __device__ __forceinline__ void load(const char * xr, const int k0, const int part) {
++        const char * b = xr + (k0/QK_K)*sizeof(block_q6_K);
++        const int    w = k0 % QK_K;
++        const int    n = w/128;
++        const int    g = (w % 128)/32;
++#pragma unroll
++        for (int i = 0; i < NQ; ++i) {
++            ql[i] = *(const uint4 *) (b + 64*n + 32*(g % 2) + VPT*part + 16*i);
++            qh[i] = *(const uint4 *) (b + QK_K/2 + 32*n + VPT*part + 16*i);
++        }
++        if constexpr (NQ == 2) {
++            sc = *(const uint16_t *) (b + QK_K/2 + QK_K/4 + 8*n + 2*g);
++        } else {
++            sc = *(const uint8_t *) (b + QK_K/2 + QK_K/4 + 8*n + 2*g + part);
++        }
++        d = *(const uint16_t *) (b + QK_K/2 + QK_K/4 + QK_K/16);
++    }
++
++    __device__ __forceinline__ void dequant(const int k0, const int part, const uint32_t m4, const uint32_t m2, float v[VPT]) const {
++        GGML_UNUSED(part);
++        const int g   = (k0 % 128)/32;
++        const int shl = 4*(g/2);
++        const int shh = 2*g;
++        const float dd = mmid_f32_half(d);
++#pragma unroll
++        for (int i = 0; i < NQ; ++i) {
++            const float s = dd*(float) (int8_t) mmid_f32_u8(sc, i);
++            const float c = -32.0f*s;
++            mmid_f32_put4(v, 4*i + 0, ((ql[i].x >> shl) & m4) | (((qh[i].x >> shh) & m2) << 4), s, c);
++            mmid_f32_put4(v, 4*i + 1, ((ql[i].y >> shl) & m4) | (((qh[i].y >> shh) & m2) << 4), s, c);
++            mmid_f32_put4(v, 4*i + 2, ((ql[i].z >> shl) & m4) | (((qh[i].z >> shh) & m2) << 4), s, c);
++            mmid_f32_put4(v, 4*i + 3, ((ql[i].w >> shl) & m4) | (((qh[i].w >> shh) & m2) << 4), s, c);
++        }
++    }
++};
++
++// dst[ids_dst[j], mt*BM + r] = sum_k W_e[r, k] * src1[ids_src1[j], k] for the
++// tokens j of one tile entry. A block of NW waves computes 128 weight rows x
++// 16*NW tokens. A wave takes one group of 16 tokens for all 128 rows, each
++// lane an 8x4 block (rows 4*tr..+3 and 64+4*tr..+3, tokens 4*tc..+3), so per
++// K step a lane reads three float4 from LDS for 32 multiply-adds. Most experts
++// get fewer tokens than a tile holds; then the waves of a token group split
++// each stage's K range (ns slices) and add their sums through LDS at the end,
++// so that every SIMD keeps working instead of one wave per tile. Each row is
++// dequantized by NW/2 threads, VPT values each.
++template <ggml_type type>
++static __global__ void __launch_bounds__(64*MMID_F32_NW, 2) mmid_f32_gemm(
++        const char * __restrict__ x, const int64_t nb01, const int64_t nb02,
++        const char * __restrict__ y, const int64_t nb11,
++        const int32_t * __restrict__ ids_src1, const int32_t * __restrict__ ids_dst,
++        const int4 * __restrict__ tiles, const int * __restrict__ n_tiles,
++        float * __restrict__ dst, const int64_t s1, const int K, const int m_tiles) {
++    constexpr int NW  = MMID_F32_NW;
++    constexpr int BM  = MMID_F32_BM;
++    constexpr int BN  = 16*NW;
++    constexpr int KT  = MMID_F32_KT;
++    constexpr int VPT = 2*KT/NW;
++    __shared__ float smem[KT*BM + KT*BN];
++    static_assert((NW - 1)*32*64 <= KT*BM + KT*BN, "partial sums do not fit");
++    float (*As)[BM] = (float (*)[BM]) smem;
++    float (*Bs)[BN] = (float (*)[BN]) (smem + KT*BM);
++
++    const int nt = blockIdx.x / m_tiles;
++    const int mt = blockIdx.x - nt*m_tiles;
++    if (nt >= *n_tiles) {
++        return;
++    }
++    const int4 tile = tiles[nt];
++    const int  nj   = tile.z;
++
++    const int tid  = threadIdx.x;
++    const int row  = tid % BM;
++    const int part = tid / BM;
++    const int tok  = tid % BN;
++    const int kg   = tid / BN;
++    const char * xr = x + tile.x*nb02 + (int64_t) (mt*BM + row)*nb01;
++    // Columns past nj read a valid row; their outputs are never stored.
++    const float * yr = (const float *) (y + (int64_t) ids_src1[tile.y + min(tok, nj - 1)]*nb11) + 8*kg;
++
++    const int ngroups = nj <= 16 ? 1 : nj <= 32 ? 2 : 4;
++    const int ns      = NW/ngroups;
++    const int lane    = tid % 64;
++    const int wave    = __builtin_amdgcn_readfirstlane(tid / 64);
++    const int tg      = wave / ns;
++    const int ks      = wave % ns;
++    const int tr      = lane % 16;
++    const int tc      = lane / 16;
++    const bool active = 16*tg < nj;
++
++    mmid_f32_wq<type, VPT> wq;
++    float4 ya;
++    float4 yb;
++    auto fetch = [&](const int k0) {
++        wq.load(xr, k0, part);
++        ya = *(const float4 *) (yr + k0);
++        yb = *(const float4 *) (yr + k0 + 4);
++    };
++
++    float acc[8][4];
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            acc[i][j] = 0.0f;
++        }
++    }
++
++    const uint32_t m4 = mmid_f32_opaque(0x0F0F0F0F);
++    const uint32_t m2 = mmid_f32_opaque(0x03030303);
++
++    fetch(0);
++    for (int k0 = 0; k0 < K; k0 += KT) {
++        {
++            float v[VPT];
++            wq.dequant(k0, part, m4, m2, v);
++#pragma unroll
++            for (int k = 0; k < VPT; ++k) {
++                As[VPT*part + k][row] = v[k];
++            }
++            Bs[8*kg + 0][tok] = ya.x;
++            Bs[8*kg + 1][tok] = ya.y;
++            Bs[8*kg + 2][tok] = ya.z;
++            Bs[8*kg + 3][tok] = ya.w;
++            Bs[8*kg + 4][tok] = yb.x;
++            Bs[8*kg + 5][tok] = yb.y;
++            Bs[8*kg + 6][tok] = yb.z;
++            Bs[8*kg + 7][tok] = yb.w;
++        }
++        __syncthreads();
++        if (k0 + KT < K) {
++            fetch(k0 + KT);
++        }
++        auto step = [&](const int k) {
++            const float4 a0 = *(const float4 *) &As[k][4*tr];
++            const float4 a1 = *(const float4 *) &As[k][64 + 4*tr];
++            const float4 b  = *(const float4 *) &Bs[k][16*tg + 4*tc];
++            const float av[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
++            const float bv[4] = {b.x, b.y, b.z, b.w};
++#pragma unroll
++            for (int i = 0; i < 8; ++i) {
++#pragma unroll
++                for (int j = 0; j < 4; ++j) {
++                    acc[i][j] += av[i]*bv[j];
++                }
++            }
++        };
++        // Full tiles take the straight 32-step sequence, so the LDS reads of
++        // each step are issued during the previous step's multiply-adds.
++        if (ns == 1) {
++            if (active) {
++#pragma unroll
++                for (int k = 0; k < KT; ++k) {
++                    step(k);
++                }
++            }
++        } else {
++            for (int kc = ks*(KT/ns); kc < (ks + 1)*(KT/ns); kc += 8) {
++#pragma unroll
++                for (int kk = 0; kk < 8; ++kk) {
++                    step(kc + kk);
++                }
++            }
++        }
++        __syncthreads();
++    }
++
++    if (ns > 1) {
++        // Lane-contiguous, so each of the 32 stores and loads per lane covers
++        // 64 consecutive words: no bank conflicts.
++        float * red = smem + (tg*(ns - 1) + ks - 1)*(32*64) + lane;
++        if (ks > 0 && active) {
++#pragma unroll
++            for (int i = 0; i < 8; ++i) {
++#pragma unroll
++                for (int j = 0; j < 4; ++j) {
++                    red[(4*i + j)*64] = acc[i][j];
++                }
++            }
++        }
++        __syncthreads();
++        if (ks > 0) {
++            return;
++        }
++        for (int p = 1; p < ns; ++p) {
++            const float * part_sum = smem + (tg*(ns - 1) + p - 1)*(32*64) + lane;
++#pragma unroll
++            for (int i = 0; i < 8; ++i) {
++#pragma unroll
++                for (int j = 0; j < 4; ++j) {
++                    acc[i][j] += part_sum[(4*i + j)*64];
++                }
++            }
++        }
++    }
++
++    if (!active) {
++        return;
++    }
++#pragma unroll
++    for (int j = 0; j < 4; ++j) {
++        const int t = 16*tg + 4*tc + j;
++        if (t < nj) {
++            float * d = dst + (int64_t) ids_dst[tile.y + t]*s1 + mt*BM;
++            *(float4 *) (d +      4*tr) = make_float4(acc[0][j], acc[1][j], acc[2][j], acc[3][j]);
++            *(float4 *) (d + 64 + 4*tr) = make_float4(acc[4][j], acc[5][j], acc[6][j], acc[7][j]);
++        }
++    }
++}
++
++// Runs MUL_MAT_ID as the grouped fp32 GEMM and returns true, or returns false
++// and leaves the call to mmq.
++static bool ggml_cuda_mmid_f32(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++                               const ggml_tensor * ids, ggml_tensor * dst) {
++    // With a native int8 dot instruction mmq's quantized products run at full
++    // rate and stay ahead of fp32 tiles; GCN4 emulates them at ~3 VALU each.
++    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
++    if (cc != GGML_CUDA_CC_GCN4) {
++        return false;
++    }
++
++    GGML_TENSOR_BINARY_OP_LOCALS;
++
++    const int64_t n_expert_used = ids->ne[0];
++    const int64_t ne_get_rows   = ne12*n_expert_used;
++    if (ne_get_rows < MMID_F32_MIN_AVG_TOKENS*ne02) {
++        return false;
++    }
++
++    const bool supported = (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q6_K) &&
++        nb00 == ggml_type_size(src0->type) && ne00 % QK_K == 0 && ne01 % MMID_F32_BM == 0 &&
++        ne03 == 1 && ne13 == 1 && ne1 == n_expert_used && ids->nb[0] == sizeof(int32_t) &&
++        src1->type == GGML_TYPE_F32 && nb10 == sizeof(float) && nb11 % 16 == 0 && nb12 % nb11 == 0 &&
++        (uintptr_t) src1->data % 16 == 0 && dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst) &&
++        (uintptr_t) dst->data % 16 == 0 && ne_get_rows < (1 << 22);
++    if (!supported) {
++        return false;
++    }
++
++    cudaStream_t stream = ctx.stream();
++
++    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
++    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
++    ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
++
++    const int     bn        = 16*MMID_F32_NW;
++    const int64_t max_tiles = (ne_get_rows + ne02*(bn - 1))/bn;
++    ggml_cuda_pool_alloc<int4> tiles(ctx.pool(), max_tiles);
++    ggml_cuda_pool_alloc<int>  n_tiles(ctx.pool(), 1);
++
++    {
++        const int si1  = ids->nb[1] / ggml_element_size(ids);
++        const int sis1 = nb12 / nb11;
++        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
++            ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ false, stream);
++        CUDA_CHECK(cudaGetLastError());
++    }
++
++    mmid_f32_tile_list<<<1, 256, 0, stream>>>(expert_bounds.get(), ne02, bn, tiles.get(), n_tiles.get());
++    CUDA_CHECK(cudaGetLastError());
++
++    // The tile count exists only on the device; launching for the largest
++    // possible count, with surplus blocks exiting at once, avoids a host sync.
++    const int     m_tiles  = ne01 / MMID_F32_BM;
++    const int64_t n_blocks = max_tiles*m_tiles;
++    GGML_ASSERT(n_blocks < INT_MAX);
++
++    const char * x = (const char *) src0->data;
++    const char * y = (const char *) src1->data;
++    float      * d = (float *) dst->data;
++    const int64_t s1 = nb1 / sizeof(float);
++    if (src0->type == GGML_TYPE_Q4_K) {
++        mmid_f32_gemm<GGML_TYPE_Q4_K><<<n_blocks, 64*MMID_F32_NW, 0, stream>>>(x, nb01, nb02, y, nb11,
++            ids_src1.get(), ids_dst.get(), tiles.get(), n_tiles.get(), d, s1, ne00, m_tiles);
++    } else {
++        mmid_f32_gemm<GGML_TYPE_Q6_K><<<n_blocks, 64*MMID_F32_NW, 0, stream>>>(x, nb01, nb02, y, nb11,
++            ids_src1.get(), ids_dst.get(), tiles.get(), n_tiles.get(), d, s1, ne00, m_tiles);
++    }
++    CUDA_CHECK(cudaGetLastError());
++    return true;
++}
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -2,6 +2,7 @@
+ #include "mmq.cuh"
+ #include "quantize.cuh"
+ #include "mmid.cuh"
++#include "mmid-f32.cuh"
+ 
+ #include <cstdint>
+ 
+@@ -228,6 +229,10 @@
+         return;
+     }
+ 
++    if (ggml_cuda_mmid_f32(ctx, src0, src1, ids, dst)) {
++        return;
++    }
++
+     GGML_ASSERT(ne13 == 1);
+     GGML_ASSERT(nb12 % nb11 == 0);
+     GGML_ASSERT(nb2  % nb1  == 0);

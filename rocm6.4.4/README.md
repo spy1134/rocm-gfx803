@@ -508,9 +508,12 @@ measurements and a reproduction. In short:
   stream, over the DMA engines (`HSA_ENABLE_SDMA=1`, set in
   `Dockerfile-Ollama`). Qwen3.6 35B-A3B pp2048 at 512 / 1024 / 2048-token
   batches (llama-bench, development tree): 193 / 250 / 295 -> 243 / 321 / 367
-  tok/s. Through Ollama's default 512-token batches in the image, a 3,100-token
+  tok/s. Through Ollama in the image, with its own batch choice, a 3,100-token
   prompt reads 165 -> 196 tok/s and a 11,900-token prompt 174 -> 193 tok/s, and
-  generation is 4% faster. SDMA copies on gfx8 need
+  generation is 4% faster. (Ollama picks the batch from the context length and
+  the free VRAM: 512 tokens for contexts up to 4,096, 1,024 above that, 2,048
+  above 32,768 when the predicted VRAM use leaves room; Qwen3.6 35B-A3B at a
+  32k context gets 2,048 here.) SDMA copies on gfx8 need
   `ROC_CPU_WAIT_FOR_SIGNAL=1` (also set in `Dockerfile-Ollama`): without it a
   copy that waits for a running kernel puts that wait into the SDMA queue, and
   while another ROCm process (a TTS server, ComfyUI, a training job) is open
@@ -583,6 +586,44 @@ measurements and a reproduction. In short:
   13.381 (CPU 13.355). Through Ollama (2,800-token prompt): 334 -> 401
   tok/s (+20%); greedy output is identical on models without DeltaNet
   layers and, on Qwen3.6, follows the old text until a near-tie.
+- **118-moe-expert-f32-gemm.patch**: after 117 the MoE expert matmuls
+  (MUL_MAT_ID) took 62% of the GPU time of a 2048-token prompt batch of
+  Qwen3.6 35B-A3B. llama.cpp runs them on its quantized-integer kernel
+  (mmq), which on gfx803 builds every int8 dot product from about three
+  instructions because the chip has no dot instruction. On GCN4 only, prompt
+  batches with Q4_K or Q6_K experts (16 or more tokens per expert on
+  average) now run as one grouped fp32 GEMM per call: the tile list is
+  built on the GPU from the expert routing, the weights are dequantized on
+  their way into shared memory, and the activations stay fp32. Per call
+  1.56-2.65x faster at the model's shapes; llama-bench with every expert in
+  RAM: pp2048 447-451 -> 546-548 tok/s (+21%), pp512 233-235 -> 274-275
+  (+17%), generation unchanged. Results are not bit-identical to mmq, which
+  quantizes the activations to 8 bits first; they are closer to the CPU:
+  mean KL divergence against CPU logits 0.0097 (mmq 0.0107), perplexity
+  13.350 (mmq 13.384, CPU 13.355). Through Ollama with 119-122 (2,800-token
+  prompt, two rounds): prompts 384 / 406 -> 476 / 490 tok/s, generation
+  24.8 / 26.1 -> 25.6 / 27.7 tok/s; greedy output identical on Qwen3 8B,
+  Gemma 4 E2B and Gemma 3n E2B, and on Qwen3.6 a different but equally
+  faithful text from an early near-tie.
+- **119-moe-weighted-reduction-x4.patch**: the router-weighted sum of the
+  expert outputs ran at about 37 GB/s on prompt batches because each thread
+  waited for one expert row at a time. With 8 experts per token it now
+  loads all eight rows of four columns before it accumulates, in the same
+  order: 4.04 -> 1.17 ms per call, pp2048 +2.6%, bit-identical.
+- **120-gdn-decode-gates.patch** and **121-gdn-gated-norm-q8_1.patch**: two
+  more decode fusions in the DeltaNet layers, with unchanged arithmetic. 120
+  computes the decay (softplus of alpha times A) and the beta sigmoid inside
+  the recurrence kernel; 121 runs the gated output norm (RMS norm times
+  weight times silu(z)) and the q8_1 quantize of its result as one kernel,
+  whose q8_1 output becomes 111's kept input. 60 dispatches per token fewer
+  each; together, llama-bench with every expert in RAM: 24.54 -> 24.76 tok/s
+  (+0.9%), perplexity and greedy output identical.
+- **122-mmvq-shared-input-group.patch**: at one token, the matrix-vector
+  products that read the same input (DeltaNet qkv, z, alpha and beta;
+  attention q, k and v) run as one launch, each row computed exactly as
+  before: 110 dispatches per token fewer on Qwen3.6 35B-A3B, 24.62 -> 25.10
+  tok/s (+2.0%), perplexity and greedy output identical. Needs 103, 111 and
+  113.
 
 `patches/ollama/unapplied/` holds `109-sched-batched-host-copies.patch`, which is
 not built: with the scheduler patched and `HSA_ENABLE_SDMA=1`, MoE generation
@@ -616,12 +657,12 @@ GPU:
   now twice the first discovery's duration, between 3 and 30 s; GPUs that start
   quickly keep 3 s.
 
-The llama.cpp kernel patches 100-104 and 106 are gfx803-only by construction:
-each takes effect only for `GGML_CUDA_CC_GCN4` or `__gfx803__` and is sized from
-gfx803 register and bandwidth measurements. 105 changes q5_K's dot product for
-every GPU, with the same arithmetic. 107, 108, 111-117, 090 and the two Ollama
-patches fix problems that are not specific to any GPU (107, 108 and 111-117
-were measured on gfx803 only).
+The llama.cpp kernel patches 100-104, 106 and 118 are gfx803-only by
+construction: each takes effect only for `GGML_CUDA_CC_GCN4` or `__gfx803__` and
+is sized from gfx803 register and bandwidth measurements. 105 changes q5_K's dot
+product for every GPU, with the same arithmetic. 107, 108, 111-117, 119-122, 090
+and the two Ollama patches fix problems that are not specific to any GPU (107,
+108, 111-117 and 119-122 were measured on gfx803 only).
 Upstream llama.cpp master (checked 2026-10-03, b11382) still has the vec
 kernel 102 replaces on gfx803, unchanged; llama.cpp issue
 [#27796](https://github.com/ggml-org/llama.cpp/issues/27796) reports the same

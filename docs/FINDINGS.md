@@ -1093,8 +1093,9 @@ bullets are the original findings (patches 100-105); the rest build on them.
   found no mismatch. The scheduler is compiled into `libggml-base`, which
   `Dockerfile-Ollama` installs from its CPU build, so the patch is applied
   before that build (`patches/ollama/llama-cpp-sched/`) and the build checks
-  the installed library for it. In the image, through Ollama's default
-  512-token batches, a 3,100-token prompt reads 165 -> 196 tok/s and a
+  the installed library for it. In the image, through Ollama with its own
+  batch choice (from the context length and free VRAM, 512 to 2,048 tokens;
+  see rocm6.4.4/README.md), a 3,100-token prompt reads 165 -> 196 tok/s and a
   11,900-token prompt 174 -> 193 tok/s, with no GPU fault. On a short prompt
   the greedy text with prefetch on follows the text with it off for 295
   characters and then diverges at a near-tie; with prefetch off the text is
@@ -1257,13 +1258,27 @@ What decided those numbers:
 - **Threads: one per core.** 16 threads on the 8-core CPU dropped decode to
   2.7 tok/s.
 
-Generation moves only about 12 GB/s from RAM, well under the memory's
-bandwidth, so the limit is the CPU's expert math and the roughly 80 GPU/CPU
-handoffs per token. Against the CPU backend the model's logits differ by a
-KL divergence of 0.014 (same top token 93.9%), in line with dense models
+Averaged over a whole token, generation moves about 15 GB/s from RAM, but the
+CPU expert phase is not compute-bound: its 609.5 MB of expert weights per token
+(Q4_K gate, up and down, Q6_K down in half the layers) are read in about 16.7 ms,
+36.5 GB/s, about 90% of the practical DDR4-2800 read rate. The rest of the token
+is GPU work and the roughly 80 GPU/CPU handoffs, the part the decode fusions
+(patches 113-116, 120-122) shorten. Against the CPU backend the model's logits
+differ by a KL divergence of 0.014 (same top token 93.9%), in line with dense models
 that are known to be right on this stack (Qwen3 8B 0.010, Qwen3.5 9B 0.007).
 It is the first local model here that completes Qwen Code's tool-calling
 tasks.
+
+On gfx803 the quantized-integer matmul kernel (mmq) is the slow path for MoE
+prompts. Without an int8 dot instruction each multiply-add of mmq's int8 dot
+products costs about three instructions, so the expert matmuls of a
+2048-token Qwen3.6 35B-A3B batch ran at 1.6-2.1 TFLOPS and took 62% of the
+batch's GPU time. Dequantizing the Q4_K/Q6_K weights into shared memory and
+multiplying in fp32 (v_mac_f32, one per lane per clock) is faster and also more
+accurate, because the activations are no longer rounded to 8 bits: patch 118
+does that for prompt batches as one grouped GEMM per call, 1.56-2.65x per call,
+pp2048 450 -> 547 tok/s, mean KL divergence against CPU logits 0.0097 against
+mmq's 0.0107. Chips with a native dot instruction keep mmq.
 
 Each patch header in `rocm6.4.4/patches/ollama/` has the full measurements and
 a reproduction.
