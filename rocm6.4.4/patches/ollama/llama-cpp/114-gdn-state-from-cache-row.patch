@@ -1,0 +1,422 @@
+llama.cpp (as fetched by Ollama v0.35.1, llama.cpp b11232, applied after
+113): at one sequence, GATED_DELTA_NET reads its recurrent state from the
+cache row instead of from a GET_ROWS copy of it.
+Generic (all GPUs): not gfx803-specific code; measured on gfx803.
+
+WHY
+---
+Single-token decode on an RX 590 pays for every dispatch as well as for the
+work in it: each one costs about 4.3 us of command-processor time however
+small the kernel, a 2.65 us floor plus 1.65 us for the vector-L1 invalidate
+that every dispatch needs on gfx8 (docs/FINDINGS.md, "A kernel can read
+stale data from the vector L1 across dispatches"). A Qwen3.6 35B-A3B decode
+token with the routed experts in system RAM issues about 1,425 dispatches,
+about 1,064 of them on the critical path.
+
+Each Gated DeltaNet layer (Qwen3.5/3.6, Qwen3-Next) starts a step by
+copying its recurrent state out of the recurrent cache with GET_ROWS, one
+2 MiB row on Qwen3.6 35B-A3B (32 heads of 128 x 128 f32), and
+GATED_DELTA_NET reads that copy. The op's fused snapshot store already
+writes the new state straight into the cache row. For one sequence the copy
+only moves bytes the op can read where they are: 30 dispatches and 60 MiB
+of copies per token on Qwen3.6 35B-A3B (30 DeltaNet layers).
+
+Alone, with HIP graphs off (tg128 x5, two rounds): 26.30 -> 26.93 tok/s (+2.4%).
+
+Measured on an RX 590 (llama-bench, Qwen3.6 35B-A3B Q4_K_M, all experts in
+system RAM with -ncmoe 99, tg128, 5 repetitions, page cache dropped before
+each run, HSA_ENABLE_SDMA=1 ROC_CPU_WAIT_FOR_SIGNAL=1), patches 113-116
+together: 25.60 -> 27.51 tok/s with HIP graphs (the default), 26.21 ->
+27.93 tok/s with GGML_CUDA_DISABLE_GRAPHS=1. With this patch alone and with
+all four, greedy 128-token output is byte-identical to the build without
+them, and llama-perplexity with -ub 1 (every token through the decode path)
+gives mean KLD 0 and the same perplexity in every digit.
+
+WHAT
+----
+ggml_cuda_try_defer_state_rows runs before ggml_cuda_try_fuse for every
+node. On the main stream, with no concurrent streams active, it skips a
+GET_ROWS that copies one f32 row (one row id) out of a cache when its only
+user is a RESHAPE read only by a GATED_DELTA_NET as its state, the op is
+not KDA, has one sequence and an f32 contiguous state
+(ggml_cuda_gated_delta_net_state_from_rows_ok), and no node in between
+writes the cache or the row ids. The skipped node is recorded in the
+context's deferred_state_rows, cleared at the start of every graph compute.
+GATED_DELTA_NET then launches a template variant (state_ids_t) that reads
+the state at cache + ids[0] * row stride; like the GET_ROWS, it reads the
+row id on the device, so a captured HIP graph needs nothing new. Reading
+and storing the same cache row in one kernel is safe because each warp
+reads its whole state column before it writes that column, and no warp
+writes another warp's column. With several sequences one sequence's store
+could hit a row another sequence still has to read, which is why the path
+takes one sequence only. graph_optimize keeps the row ids allocated until
+the GATED_DELTA_NET runs. GGML_CUDA_DISABLE_FUSION=1 turns this off.
+
+Numerics are unchanged: the kernel is the same code with a different state
+pointer; on gfx803 the two variants compile to identical floating-point
+instruction sequences.
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 362c781..b2ae494 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1685,6 +1685,26 @@ struct ggml_backend_cuda_context {
+             mmvq_src1_invalidate();
+         }
+     }
++
++    // recurrent-state GET_ROWS that the evaluation loop did not run because the GATED_DELTA_NET reading
++    // them reads the cache row through the row ids itself. Filled while walking one graph, cleared
++    // before the next.
++    struct gdn_state_rows {
++        const ggml_tensor * rows;        // the GET_ROWS node that was not run
++        const float *       cache;       // first byte of row 0 of the cache view it reads
++        const int32_t *     ids;         // its row ids (device)
++        int64_t             row_stride;  // floats between cache rows
++    };
++    std::vector<gdn_state_rows> deferred_state_rows;
++
++    const gdn_state_rows * deferred_state_rows_find(const ggml_tensor * rows) const {
++        for (const gdn_state_rows & r : deferred_state_rows) {
++            if (r.rows == rows) {
++                return &r;
++            }
++        }
++        return nullptr;
++    }
+ };
+ 
+ struct ggml_cuda_mm_fusion_args_host {
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
+index 1b431a7..dc17e36 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net.cu
+@@ -1,7 +1,7 @@
+ #include "gated_delta_net.cuh"
+ #include "ggml-cuda/common.cuh"
+ 
+-template <int S_v, bool KDA, bool keep_rs_t>
++template <int S_v, bool KDA, bool keep_rs_t, bool state_ids_t>
+ __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
+ gated_delta_net_cuda(const float * q,
+                                      const float * k,
+@@ -27,7 +27,9 @@ gated_delta_net_cuda(const float * q,
+                                      const uint3   rq3_magic,
+                                      float         scale,
+                                      int64_t       state_slot_stride,
+-                                     int           K) {
++                                     int           K,
++                                     const int32_t * state_ids,
++                                     int64_t       state_ids_row_stride) {
+     const uint32_t h_idx    = blockIdx.x;
+     const uint32_t sequence = blockIdx.y;
+     // each warp owns one column, using warp-level primitives to reduce across rows
+@@ -44,7 +46,9 @@ gated_delta_net_cuda(const float * q,
+     const int64_t state_in_offset      = sequence * H * S_v * S_v + h_idx * S_v * S_v;
+     const int64_t state_out_offset     = (sequence * H + h_idx) * S_v * S_v;
+     state += state_out_offset;
+-    curr_state += state_in_offset + col * S_v;
++    if constexpr (!state_ids_t) {
++        curr_state += state_in_offset + col * S_v;
++    }
+     attn_data += (sequence * n_tokens * H + h_idx) * S_v;
+ 
+     constexpr int warp_size = ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v;
+@@ -54,6 +58,11 @@ gated_delta_net_cuda(const float * q,
+     // state is stored transposed: M[col][i] = S[i][col], row col is contiguous
+ 
+     ggml_cuda_pdl_sync();
++    if constexpr (state_ids_t) {
++        // the state is read from its cache row, which the fused snapshot store may overwrite in place:
++        // safe because this warp reads its whole column here, before it writes that same column
++        curr_state += (int64_t) state_ids[sequence] * state_ids_row_stride + h_idx * S_v * S_v + col * S_v;
++    }
+ #pragma unroll
+     for (int r = 0; r < rows_per_lane; r++) {
+         const int i = r * warp_size + lane;
+@@ -166,7 +175,7 @@ gated_delta_net_cuda(const float * q,
+     }
+ }
+ 
+-template <bool KDA, bool keep_rs_t>
++template <bool KDA, bool keep_rs_t, bool state_ids_t = false>
+ static void launch_gated_delta_net(
+         const float * q_d, const float * k_d, const float * v_d,
+         const float * g_d, const float * b_d, const float * s_d,
+@@ -176,7 +185,8 @@ static void launch_gated_delta_net(
+         int64_t sv1,   int64_t sv2, int64_t sv3,
+         int64_t sb1,   int64_t sb2, int64_t sb3,
+         int64_t neqk1, int64_t rq3,
+-        float scale, int64_t state_slot_stride, int K, cudaStream_t stream) {
++        float scale, int64_t state_slot_stride, int K, cudaStream_t stream,
++        const int32_t * state_ids = nullptr, int64_t state_ids_row_stride = 0) {
+     //TODO: Add chunked kernel for even faster pre-fill
+     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+     const int num_warps = 4;
+@@ -189,29 +199,33 @@ static void launch_gated_delta_net(
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
+     switch (S_v) {
+         case 16:
+-            ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t>, launch_params,
++            ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t, state_ids_t>, launch_params,
+                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
++                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K,
++                state_ids, state_ids_row_stride);
+             break;
+         case 32:
+-            ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t>, launch_params,
++            ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t, state_ids_t>, launch_params,
+                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
++                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K,
++                state_ids, state_ids_row_stride);
+             break;
+         case 64: {
+-            ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t>, launch_params,
++            ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t, state_ids_t>, launch_params,
+                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
++                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K,
++                state_ids, state_ids_row_stride);
+             break;
+         }
+         case 128: {
+-            ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t>, launch_params,
++            ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, state_ids_t>, launch_params,
+                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
++                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K,
++                state_ids, state_ids_row_stride);
+             break;
+         }
+         default:
+@@ -294,6 +308,24 @@ static void ggml_cuda_op_gated_delta_net_impl(
+         state_slot_stride = cache->slot_stride;
+     }
+ 
++    // the GET_ROWS that copies the state out of the cache was not run (ggml_cuda_try_defer_state_rows)
++    const ggml_tensor * state_rows = src_state->view_src ? src_state->view_src : src_state;
++    const ggml_backend_cuda_context::gdn_state_rows * deferred =
++        ctx.deferred_state_rows.empty() ? nullptr : ctx.deferred_state_rows_find(state_rows);
++    if (deferred != nullptr) {
++        GGML_ASSERT(ggml_cuda_gated_delta_net_state_from_rows_ok(dst));
++        if (keep_rs) {
++            launch_gated_delta_net<false, true, true>(q_d, k_d, v_d, g_d, b_d, deferred->cache, dst_d, state_d,
++                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
++                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream, deferred->ids, deferred->row_stride);
++        } else {
++            launch_gated_delta_net<false, false, true>(q_d, k_d, v_d, g_d, b_d, deferred->cache, dst_d, state_d,
++                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
++                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream, deferred->ids, deferred->row_stride);
++        }
++        return;
++    }
++
+     if (kda) {
+         if (keep_rs) {
+             launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+@@ -317,6 +349,16 @@ static void ggml_cuda_op_gated_delta_net_impl(
+     }
+ }
+ 
++bool ggml_cuda_gated_delta_net_state_from_rows_ok(const ggml_tensor * dst) {
++    const ggml_tensor * src_v     = dst->src[2];
++    const ggml_tensor * src_g     = dst->src[3];
++    const ggml_tensor * src_state = dst->src[5];
++    // one sequence only: with several, one sequence's state store could hit the cache row another
++    // sequence still has to read, from a different block
++    return dst->type == GGML_TYPE_F32 && src_state->type == GGML_TYPE_F32 && ggml_is_contiguous(src_state) &&
++        src_v->ne[3] == 1 && src_g->ne[0] != src_v->ne[0];
++}
++
+ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     ggml_cuda_op_gated_delta_net_impl(ctx, dst, nullptr);
+ }
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cuh b/ggml/src/ggml-cuda/gated_delta_net.cuh
+index f9bf437..170419d 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cuh
++++ b/ggml/src/ggml-cuda/gated_delta_net.cuh
+@@ -9,6 +9,10 @@ struct ggml_cuda_gated_delta_net_fused_cache {
+ 
+ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
++// whether this op can read its state straight from the recurrent cache through the row ids of the
++// GET_ROWS that feeds it
++bool ggml_cuda_gated_delta_net_state_from_rows_ok(const ggml_tensor * dst);
++
+ // same op, but writes the snapshot(s) into the cache instead of dst (see ggml_cuda_try_gdn_cache_fusion)
+ void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+                                               ggml_cuda_gated_delta_net_fused_cache cache);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 1b9b876..1bd0528 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3574,6 +3574,116 @@ static int ggml_cuda_try_fuse_mm_reshape_add(ggml_backend_cuda_context * cuda_ct
+     return 0;
+ }
+ 
++// A GET_ROWS that copies one recurrent-state row out of its cache for one sequence and is read, through
++// a RESHAPE, only by the first later node of type consumer_op that uses it. Returns that node's index or
++// -1. What lies between the two is for the caller to check.
++static int ggml_cuda_match_state_rows(const ggml_cgraph * cgraph, int i, ggml_op consumer_op,
++        const ggml_tensor ** reshape_out) {
++    const ggml_tensor * rows = cgraph->nodes[i];
++    const ggml_tensor * src  = rows->src[0];
++    const ggml_tensor * ids  = rows->src[1];
++    if (rows->op != GGML_OP_GET_ROWS || rows->type != GGML_TYPE_F32 || src->type != GGML_TYPE_F32 ||
++            ids->type != GGML_TYPE_I32 || src->nb[0] != sizeof(float) || !ggml_is_contiguous(rows) ||
++            rows->ne[0] != src->ne[0] || ggml_nrows(rows) != 1 || ggml_nelements(ids) != 1 ||
++            (rows->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_cuda_node_use_count(cgraph, rows) != 1) {
++        return -1;
++    }
++
++    const ggml_tensor * reshape = nullptr;
++    int j = i + 1;
++    for (; j < cgraph->n_nodes && reshape == nullptr; ++j) {
++        const ggml_tensor * n = cgraph->nodes[j];
++        if (n->src[0] == rows) {
++            reshape = n;
++        }
++    }
++    if (reshape == nullptr || reshape->op != GGML_OP_RESHAPE || reshape->view_src != rows ||
++            (reshape->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_cuda_node_use_count(cgraph, reshape) != 1) {
++        return -1;
++    }
++
++    for (; j < cgraph->n_nodes; ++j) {
++        const ggml_tensor * n = cgraph->nodes[j];
++        if (n->src[0] == reshape || n->src[1] == reshape || (consumer_op == GGML_OP_GATED_DELTA_NET && n->src[5] == reshape)) {
++            break;
++        }
++    }
++    if (j == cgraph->n_nodes || cgraph->nodes[j]->op != consumer_op) {
++        return -1;
++    }
++    *reshape_out = reshape;
++    return j;
++}
++
++// true when no node in (i0, i1) other than those in skip writes the given bytes; with reads, also none
++// reads them (needed when a store to them moves later)
++static bool ggml_cuda_bytes_untouched(const ggml_cgraph * cgraph, int i0, int i1, const void * cache, size_t nbytes,
++        bool reads, std::initializer_list<const ggml_tensor *> skip) {
++    for (int j = i0 + 1; j < i1; ++j) {
++        const ggml_tensor * n = cgraph->nodes[j];
++        if (ggml_cuda_is_view_or_noop(n) || std::find(skip.begin(), skip.end(), n) != skip.end()) {
++            continue;
++        }
++        if (ggml_cuda_bytes_overlap(n->data, ggml_nbytes(n), cache, nbytes)) {
++            return false;
++        }
++        if (reads) {
++            for (int s = 0; s < GGML_MAX_SRC; ++s) {
++                const ggml_tensor * t = n->src[s];
++                if (t != nullptr && std::find(skip.begin(), skip.end(), t) == skip.end() &&
++                        ggml_cuda_bytes_overlap(t->data, ggml_nbytes(t), cache, nbytes)) {
++                    return false;
++                }
++            }
++        }
++    }
++    return true;
++}
++
++static bool ggml_cuda_try_defer_gdn_state(ggml_backend_cuda_context * ctx, const ggml_cgraph * cgraph, int i) {
++    const ggml_tensor * reshape = nullptr;
++    const int gdn_idx = ggml_cuda_match_state_rows(cgraph, i, GGML_OP_GATED_DELTA_NET, &reshape);
++    if (gdn_idx < 0) {
++        return false;
++    }
++    const ggml_tensor * rows = cgraph->nodes[i];
++    const ggml_tensor * gdn  = cgraph->nodes[gdn_idx];
++    if (gdn->src[5] != reshape || !ggml_cuda_gated_delta_net_state_from_rows_ok(gdn) ||
++            ggml_nelements(reshape) != ggml_nelements(gdn->src[5])) {
++        return false;
++    }
++    const ggml_tensor * src   = rows->src[0];
++    const ggml_tensor * cache = src->view_src ? src->view_src : src;
++    const ggml_tensor * ids   = rows->src[1];
++    // the state and the row ids are read when the GDN runs, so neither may change before it
++    if (!ggml_cuda_bytes_untouched(cgraph, i, gdn_idx, cache->data, ggml_nbytes(cache), false, {}) ||
++            !ggml_cuda_bytes_untouched(cgraph, i, gdn_idx, ids->data, ggml_nbytes(ids), false, {})) {
++        return false;
++    }
++    ctx->deferred_state_rows.push_back({ rows, (const float *) src->data, (const int32_t *) rows->src[1]->data,
++                                       (int64_t) (src->nb[1] / sizeof(float)) });
++    return true;
++}
++
++// Runs before ggml_cuda_try_fuse for every node. Returns true when the node is a recurrent-state
++// GET_ROWS that is not run because the GATED_DELTA_NET reading it reads the cache row itself.
++static bool ggml_cuda_try_defer_state_rows(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i, int * skip) {
++    *skip = 0;
++    static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
++    if (disable_fusion) {
++        return false;
++    }
++
++    const ggml_tensor * node = cgraph->nodes[i];
++    if (node->op != GGML_OP_GET_ROWS || ctx->curr_stream_no != 0 || !ctx->stream_context().concurrent_events.empty()) {
++        return false;
++    }
++    if (ggml_cuda_try_defer_gdn_state(ctx, cgraph, i)) {
++        return true;
++    }
++    return false;
++}
++
+ // try and fuse nodes and return the number of nodes to skip
+ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+ 
+@@ -4482,6 +4592,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 }
+ 
+                 cuda_ctx->mmvq_src1_invalidate_if_written(node);
++                int defer_skip = 0;
++                if (ggml_cuda_try_defer_state_rows(cuda_ctx, cgraph, i, &defer_skip)) {
++                    for (int j = 1; j <= defer_skip; j++) {
++                        cuda_ctx->mmvq_src1_invalidate_if_written(cgraph->nodes[i + j]);
++                    }
++                    i += defer_skip;
++                    continue;
++                }
+                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                 for (int j = 1; j <= nodes_to_skip; j++) {
+                     cuda_ctx->mmvq_src1_invalidate_if_written(cgraph->nodes[i + j]);
+@@ -4583,6 +4701,7 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
+ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+     cuda_ctx->mmvq_src1_invalidate();
++    cuda_ctx->deferred_state_rows.clear();
+ 
+     ggml_cuda_set_device(cuda_ctx->device);
+ 
+@@ -4757,6 +4876,23 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+         }
+     }
+ 
++    if (!disable_fusion) {
++        // a GATED_DELTA_NET whose state GET_ROWS is not run reads the row ids itself, later than the
++        // GET_ROWS would have: keep them allocated until it runs
++        auto root = [](const ggml_tensor * t) { return const_cast<ggml_tensor *>(t->view_src ? t->view_src : t); };
++        for (int i = 0; i < cgraph->n_nodes; ++i) {
++            if (cgraph->nodes[i]->op != GGML_OP_GET_ROWS) {
++                continue;
++            }
++            ggml_tensor *       ids     = root(cgraph->nodes[i]->src[1]);
++            const ggml_tensor * reshape = nullptr;
++            int j = -1;
++            if ((j = ggml_cuda_match_state_rows(cgraph, i, GGML_OP_GATED_DELTA_NET, &reshape)) >= 0) {
++                params->add_alloc_dep(params->user_data, ids, cgraph->nodes[j]);
++            }
++        }
++    }
++
+ #ifdef USE_CUDA_GRAPH
+     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+     const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);

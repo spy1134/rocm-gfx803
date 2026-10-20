@@ -174,7 +174,7 @@ Open targets in recommended order, then the done ones.
 | LLM-6 | MoE prompts: expert copies, MUL_MAT_ID, dense parts | copies overlap compute since patch 108 (pp2048 295 -> 367 tok/s, against 376 with no copies at all); the rest is compute, with no breakdown | Open, profile first |
 | RT-1 | Cost of the vector-L1 invalidate before every dispatch | 1.65 us per dispatch: ~2.4 ms of an MoE token (~6%), 2.3-2.7% of dense decode, ~2.4 ms of an SD 1.5 step. The cost is the extra ring slot, not the cache work: an empty-kernel dispatch costs 4.27-4.30 us with the shipped packet, with only the L1 bit, with poll interval 1, and with the L1 action moved onto the slot's RELEASE_MEM (no ACQUIRE_MEM), against 2.65 us without the slot | Measured, no cheaper packet; only fewer slots would help, and skipping the invalidate between kernels is not provably correct |
 | LLM-5 | Dense decode above the bandwidth bound | per 36 ms token: K-quant kernels ~2.9 ms, flash-attention decode ~2.6 ms at 5k depth, F16 `attn_v` ~1 ms, launches ~1 ms by fusion; the same kernels make up MoE generation's GPU part | Open, measured before the stale-L1 fix and patch 111 |
-| LLM-8 | MoE generation with experts in system RAM | Qwen3.6 35B-A3B, 39 ms per token (25.6 tok/s, llama-bench with a cold page cache): CPU experts ~16.7 ms, GPU kernels ~12 ms, ~1,425 dispatches at ~4.3 us of command-processor time each (~6 ms), hand-offs ~3 ms; the largest kernel is the q4_K matrix-vector product (258 per token, ~4.4 ms) | Open, measured 2026-10-19 with patches 111 and 112 |
+| LLM-8 | MoE generation with experts in system RAM | Qwen3.6 35B-A3B, 39 ms per token before patches 113-116 (25.6 tok/s, llama-bench with a cold page cache): CPU experts ~16.7 ms, GPU kernels ~12 ms, ~1,425 dispatches at ~4.3 us each (~6 ms), hand-offs ~3 ms; 113-116 remove up to 300 dispatches per token (25.60 -> 27.51 tok/s) | Open: further fusions listed in LLM-8, each a few tenths of a ms |
 | SD-10 | fp16 GroupNorm/SiLU and GEGLU in the node | the node's kernels take fp32 only, so ComfyUI's fp16 default runs neither; a few ms of a 342 ms step | Open, unmeasured |
 | SD-11 | ComfyUI time outside the UNet | 1.7 s of an 8.5 s warm SD 1.5 image (2.7 of 10.5 s without the node) | Open, unmeasured |
 | SD-12 | SDXL VAE decode at 1024 px | 12-25 s of an 83-99 s image, by VAE precision | Open, measured end to end |
@@ -378,6 +378,19 @@ the fix, a difference that matches 1.65 us on each of the ~1,450 dispatches of
 a token (~2.4 ms, RT-1); 24.5-24.6 with 111 added; and 25.2-25.7 with 112
 (SDMA off and on).
 
+**Current budget.** With patches 111 and 112 a token takes 39 ms (25.6 tok/s,
+llama-bench, page cache dropped first): CPU experts ~16.7 ms, GPU kernels ~12
+ms, ~1,425 dispatches at ~4.3 us each (~6 ms, ~1,064 of them on the critical
+path), hand-offs ~3 ms. Patches 113-116 remove up to 300 dispatches and a
+2 MiB state copy per DeltaNet layer: 25.60 -> 27.51 tok/s. Still in the same
+trace, each worth a few tenths of a ms: the DeltaNet gate math (softplus,
+sigmoid) inside the recurrence kernel, the gated norm with its q8_1
+quantize, the two L2 norms as one launch, RMS norm with the multi-section
+rope, the rotation kernels a q8_0 KV cache adds to attention, and one launch
+for projections that share a quantized input. HIP graphs cost 1-3% here
+(llama-bench 27.51 -> 27.93 tok/s with them off), within noise through
+Ollama. The tables below are from the earlier profile.
+
 | Part | Per token | How it was measured |
 | --- | --- | --- |
 | CPU expert matmuls | 17.2 ms | GGML_SCHEDTIME split timer (568.0 ms over 33 tokens); 0.56 GB of Q4_K expert weights per token is ~33 GB/s, reaching ~80% of the practical DDR4-2800 read ceiling (39-41 GB/s). At most ~3.5 ms/token is recoverable on the CPU side. |
@@ -387,7 +400,7 @@ a token (~2.4 ms, RT-1); 24.5-24.6 with 111 added; and 25.2-25.7 with 112
 What does not change it: CPU threads (4: 21.6, 8: 23.7, 12: 23.0, 16: 18.6
 tok/s), the thread pool's polling (`--poll` 0/50/100), HIP graphs (on: 23.4,
 off: 24.0; they are captured once per split and replayed, 2523 replays to 71
-captures), `ROC_ACTIVE_WAIT_TIMEOUT` (100 to 10000 us), and disabling transparent
+captures; see the current budget above), `ROC_ACTIVE_WAIT_TIMEOUT` (100 to 10000 us), and disabling transparent
 huge pages. Transparent huge pages for the expert buffer (madvise) are
 untested.
 

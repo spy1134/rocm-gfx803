@@ -111,6 +111,18 @@ RUN CC=/opt/rocm/llvm/bin/clang CXX=/opt/rocm/llvm/bin/clang++ \
     && { grep -q mmvq_src1_invalidate_if_written \
              build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/ggml-cuda.cu \
          || { echo "111-mmvq-reuse-quantized-src1.patch was not applied" >&2; exit 1; }; } \
+    && { grep -q ggml_cuda_try_fuse_mm_reshape_add \
+             build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/ggml-cuda.cu \
+         || { echo "113-mmv-fuse-add-through-reshape.patch was not applied" >&2; exit 1; }; } \
+    && { grep -q ggml_cuda_gated_delta_net_state_from_rows_ok \
+             build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/gated_delta_net.cu \
+         || { echo "114-gdn-state-from-cache-row.patch was not applied" >&2; exit 1; }; } \
+    && { grep -q ssm_conv_step_silu_f32 \
+             build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/ssm-conv.cu \
+         || { echo "115-ssm-conv-decode-step.patch was not applied" >&2; exit 1; }; } \
+    && { grep -q moe_tail_rms_norm_mul_q8_1_f32 \
+             build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/norm.cu \
+         || { echo "116-moe-tail-norm-q8_1.patch was not applied" >&2; exit 1; }; } \
     && { grep -q ggml_backend_sched_prefetch_split \
              build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-backend.cpp \
          || { echo "108-moe-expert-prefetch.patch was not applied" >&2; exit 1; }; } \

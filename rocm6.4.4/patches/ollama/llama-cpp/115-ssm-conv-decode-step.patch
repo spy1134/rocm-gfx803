@@ -1,0 +1,350 @@
+llama.cpp (as fetched by Ollama v0.35.1, llama.cpp b11232, applied after
+114): the decode step of a Gated DeltaNet convolution, with its state read
+from and written to the cache, runs as one kernel.
+Generic (all GPUs): not gfx803-specific code; measured on gfx803.
+
+WHY
+---
+Single-token decode on an RX 590 pays for every dispatch as well as for the
+work in it: each one costs about 4.3 us of command-processor time however
+small the kernel, a 2.65 us floor plus 1.65 us for the vector-L1 invalidate
+that every dispatch needs on gfx8 (docs/FINDINGS.md, "A kernel can read
+stale data from the vector L1 across dispatches"). A Qwen3.6 35B-A3B decode
+token with the routed experts in system RAM issues about 1,425 dispatches,
+about 1,064 of them on the critical path.
+
+At one token the causal convolution of a Gated DeltaNet layer (Qwen3.5/3.6,
+Qwen3-Next) is four dispatches: GET_ROWS copies the conv state (d_conv - 1
+= 3 columns per channel) out of the cache, CONCAT appends the token's
+column of the qkv projection, CPY stores the last 3 columns of the window
+back into the cache, and SSM_CONV (with SILU fused) convolves the 4-column
+window. None touches more than 128 KiB (8192 channels x 4 columns of f32 on
+Qwen3.6 35B-A3B), so the chain is almost all dispatch cost, and one kernel
+can do all of it: 90 dispatches per token fewer on Qwen3.6 35B-A3B (30
+DeltaNet layers).
+
+Alone, with HIP graphs off (tg128 x5, two rounds): 26.30 -> 27.00 tok/s (+2.7%).
+
+Measured on an RX 590 (llama-bench, Qwen3.6 35B-A3B Q4_K_M, all experts in
+system RAM with -ncmoe 99, tg128, 5 repetitions, page cache dropped before
+each run, HSA_ENABLE_SDMA=1 ROC_CPU_WAIT_FOR_SIGNAL=1), patches 113-116
+together: 25.60 -> 27.51 tok/s with HIP graphs (the default), 26.21 ->
+27.93 tok/s with GGML_CUDA_DISABLE_GRAPHS=1. With this patch alone and with
+all four, greedy 128-token output is byte-identical to the build without
+them, and llama-perplexity with -ub 1 (every token through the decode path)
+gives mean KLD 0 and the same perplexity in every digit.
+
+WHAT
+----
+For one sequence and one token, ggml_cuda_try_defer_state_rows matches the
+conv-state GET_ROWS whose RESHAPE feeds a dim-0 CONCAT(state, new input),
+together with the CONCAT's two users: the view of its last d_conv - 1
+columns that a CPY stores into the same cache, and SSM_CONV followed by
+SILU. The plan is recorded in the context's conv_step_plans, and GET_ROWS,
+CONCAT and CPY are not run. At the SSM_CONV, ssm_conv_step_silu_f32 (one
+thread per channel) reads the channel's state from cache row ids[0] and its
+new input, writes the shifted window to the CPY's cache row, and computes
+the convolution and SILU with the expressions and summation order of
+ssm_conv_f32 at one token. When both rows are the same row, the in-place
+update is safe because a thread writes only values it has already read.
+The match refuses when any node in between writes the cache, the row ids
+or the new input, or reads the cache, and when the SILU output overlaps
+anything the kernel reads; graph_optimize keeps the row ids and the new
+input allocated until the SSM_CONV. d_conv 3 or 4, f32 only, main stream
+only; every other case runs the four kernels as before, and
+GGML_CUDA_DISABLE_FUSION=1 turns this off.
+
+Numerics are unchanged: same expressions and summation order as
+ssm_conv_f32 (the taps compile to the same v_mac sequence on gfx803), no
+new fma.
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index b2ae494..ae37450 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1697,6 +1697,22 @@ struct ggml_backend_cuda_context {
+     };
+     std::vector<gdn_state_rows> deferred_state_rows;
+ 
++    // decode conv-state chains (GET_ROWS, CONCAT, CPY) that the evaluation loop does not run because
++    // their SSM_CONV reads and writes the cache rows itself. Filled while walking one graph, cleared
++    // before the next.
++    struct ssm_conv_step_plan {
++        const ggml_tensor * ssm_conv;    // the SSM_CONV that runs the whole chain
++        const ggml_tensor * concat;      // not run
++        const ggml_tensor * cpy;         // not run
++        const float *       cache;       // row 0 of the conv-state cache view
++        const int32_t *     ids;
++        int64_t             row_stride;  // floats between cache rows
++        float *             state_out;   // cache row the CPY writes
++        const float *       x_new;       // the token's conv input (CONCAT src1)
++        int64_t             x_new_stride;// floats between channels of x_new
++    };
++    std::vector<ssm_conv_step_plan> conv_step_plans;
++
+     const gdn_state_rows * deferred_state_rows_find(const ggml_tensor * rows) const {
+         for (const gdn_state_rows & r : deferred_state_rows) {
+             if (r.rows == rows) {
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 1bd0528..09b3f71 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3665,8 +3665,90 @@ static bool ggml_cuda_try_defer_gdn_state(ggml_backend_cuda_context * ctx, const
+     return true;
+ }
+ 
+-// Runs before ggml_cuda_try_fuse for every node. Returns true when the node is a recurrent-state
+-// GET_ROWS that is not run because the GATED_DELTA_NET reading it reads the cache row itself.
++static bool ggml_cuda_try_plan_conv_step(ggml_backend_cuda_context * ctx, const ggml_cgraph * cgraph, int i) {
++    const ggml_tensor * reshape = nullptr;
++    const int concat_idx = ggml_cuda_match_state_rows(cgraph, i, GGML_OP_CONCAT, &reshape);
++    if (concat_idx < 0) {
++        return false;
++    }
++    const ggml_tensor * rows   = cgraph->nodes[i];
++    const ggml_tensor * concat = cgraph->nodes[concat_idx];
++    const ggml_tensor * x_new  = concat->src[1];
++    const int64_t d_conv   = concat->ne[0];
++    const int64_t channels = concat->ne[1];
++    if (concat->src[0] != reshape || ggml_get_op_params_i32(concat, 0) != 0 || concat->type != GGML_TYPE_F32 ||
++            !ggml_is_contiguous(concat) || concat->ne[2] != 1 || concat->ne[3] != 1 ||
++            reshape->ne[0] != d_conv - 1 || reshape->ne[1] != channels || x_new->type != GGML_TYPE_F32 ||
++            x_new->ne[0] != 1 || x_new->ne[1] != channels || ggml_nrows(x_new) != channels ||
++            (concat->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_cuda_node_use_count(cgraph, concat) != 2) {
++        return false;
++    }
++
++    // the two users of the window: the view of its last d_conv-1 columns that one CPY stores into the
++    // cache, and the SSM_CONV (+ SILU)
++    const ggml_tensor * last = nullptr;
++    int cpy_idx  = -1;
++    int conv_idx = -1;
++    for (int j = concat_idx + 1; j < cgraph->n_nodes && (cpy_idx < 0 || conv_idx < 0); ++j) {
++        const ggml_tensor * n = cgraph->nodes[j];
++        if (n->op == GGML_OP_VIEW && n->src[0] == concat) {
++            last = n;
++        } else if (n->op == GGML_OP_CPY && last != nullptr && n->src[0] == last) {
++            cpy_idx = j;
++        } else if (n->op == GGML_OP_SSM_CONV && n->src[0] == concat) {
++            conv_idx = j;
++        }
++    }
++    if (cpy_idx < 0 || conv_idx < 0 || conv_idx + 1 >= cgraph->n_nodes) {
++        return false;
++    }
++    const ggml_tensor * cpy      = cgraph->nodes[cpy_idx];
++    const ggml_tensor * conv     = cgraph->nodes[conv_idx];
++    const ggml_tensor * silu     = cgraph->nodes[conv_idx + 1];
++    const ggml_tensor * cache_wr = cpy->src[1];
++    if (last->view_offs != sizeof(float) || last->ne[0] != d_conv - 1 || last->ne[1] != channels ||
++            last->nb[1] != concat->nb[1] || ggml_cuda_node_use_count(cgraph, last) != 1 ||
++            cache_wr->type != GGML_TYPE_F32 || !ggml_is_contiguous(cache_wr) ||
++            ggml_nelements(cache_wr) != (d_conv - 1) * channels || (cpy->flags & GGML_TENSOR_FLAG_OUTPUT) ||
++            ggml_cuda_node_use_count(cgraph, cpy) != 0) {
++        return false;
++    }
++    if (!ggml_cuda_can_fuse(cgraph, conv_idx, { GGML_OP_SSM_CONV, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU }) ||
++            conv->src[1]->ne[0] != d_conv || conv->src[0]->ne[1] != channels ||
++            !ggml_cuda_ssm_conv_step_supported(conv, silu)) {
++        return false;
++    }
++
++    const ggml_tensor * src   = rows->src[0];
++    const ggml_tensor * cache = src->view_src ? src->view_src : src;
++    const ggml_tensor * cache_wr_root = cache_wr->view_src ? cache_wr->view_src : cache_wr;
++    if (cache_wr_root != cache) {
++        return false;
++    }
++    // the state, the row ids and the new input are read, and the cache row written, when the SSM_CONV
++    // runs: nothing in between may write any of them or read the cache
++    const ggml_tensor * ids = rows->src[1];
++    const int last_idx = std::max(cpy_idx, conv_idx);
++    if (!ggml_cuda_bytes_untouched(cgraph, i, last_idx, cache->data, ggml_nbytes(cache), true, { concat, cpy }) ||
++            !ggml_cuda_bytes_untouched(cgraph, i, last_idx, ids->data, ggml_nbytes(ids), false, { concat, cpy }) ||
++            !ggml_cuda_bytes_untouched(cgraph, concat_idx, last_idx, x_new->data, ggml_nbytes(x_new), false, { cpy })) {
++        return false;
++    }
++    // the deferred window and the conv output must not share bytes with what the step kernel reads
++    if (ggml_cuda_bytes_overlap(silu, cache) || ggml_cuda_bytes_overlap(silu, x_new) || ggml_cuda_bytes_overlap(silu, conv->src[1])) {
++        return false;
++    }
++
++    ctx->conv_step_plans.push_back({ conv, concat, cpy, (const float *) src->data, (const int32_t *) rows->src[1]->data,
++                                    (int64_t) (src->nb[1] / sizeof(float)), (float *) cache_wr->data,
++                                    (const float *) x_new->data, (int64_t) (x_new->nb[1] / sizeof(float)) });
++    return true;
++}
++
++// Runs before ggml_cuda_try_fuse for every node. Returns true when the node was handled here: a
++// recurrent-state GET_ROWS (for the conv state also its CONCAT and CPY) that is not run because its
++// consumer reads and writes the cache rows itself, or the SSM_CONV that runs a planned conv step (then
++// *skip is the SILU fused into it).
+ static bool ggml_cuda_try_defer_state_rows(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i, int * skip) {
+     *skip = 0;
+     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+@@ -3675,12 +3757,27 @@ static bool ggml_cuda_try_defer_state_rows(ggml_backend_cuda_context * ctx, ggml
+     }
+ 
+     const ggml_tensor * node = cgraph->nodes[i];
++    for (const ggml_backend_cuda_context::ssm_conv_step_plan & plan : ctx->conv_step_plans) {
++        if (node == plan.concat || node == plan.cpy) {
++            return true;
++        }
++        if (node == plan.ssm_conv) {
++            ggml_cuda_op_ssm_conv_step(*ctx, plan.ssm_conv, cgraph->nodes[i + 1], plan.cache, plan.ids, plan.row_stride,
++                                       plan.x_new, plan.x_new_stride, plan.state_out);
++            *skip = 1;
++            return true;
++        }
++    }
++
+     if (node->op != GGML_OP_GET_ROWS || ctx->curr_stream_no != 0 || !ctx->stream_context().concurrent_events.empty()) {
+         return false;
+     }
+     if (ggml_cuda_try_defer_gdn_state(ctx, cgraph, i)) {
+         return true;
+     }
++    if (ggml_cuda_try_plan_conv_step(ctx, cgraph, i)) {
++        return true;
++    }
+     return false;
+ }
+ 
+@@ -4702,6 +4799,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+     cuda_ctx->mmvq_src1_invalidate();
+     cuda_ctx->deferred_state_rows.clear();
++    cuda_ctx->conv_step_plans.clear();
+ 
+     ggml_cuda_set_device(cuda_ctx->device);
+ 
+@@ -4877,8 +4975,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+     }
+ 
+     if (!disable_fusion) {
+-        // a GATED_DELTA_NET whose state GET_ROWS is not run reads the row ids itself, later than the
+-        // GET_ROWS would have: keep them allocated until it runs
++        // a GATED_DELTA_NET whose state GET_ROWS is not run reads the row ids itself, and a planned conv
++        // step reads the ids and the token's conv input at its SSM_CONV, later than the GET_ROWS and the
++        // CONCAT would have: keep them allocated until the consumer runs
+         auto root = [](const ggml_tensor * t) { return const_cast<ggml_tensor *>(t->view_src ? t->view_src : t); };
+         for (int i = 0; i < cgraph->n_nodes; ++i) {
+             if (cgraph->nodes[i]->op != GGML_OP_GET_ROWS) {
+@@ -4889,6 +4988,15 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+             int j = -1;
+             if ((j = ggml_cuda_match_state_rows(cgraph, i, GGML_OP_GATED_DELTA_NET, &reshape)) >= 0) {
+                 params->add_alloc_dep(params->user_data, ids, cgraph->nodes[j]);
++            } else if ((j = ggml_cuda_match_state_rows(cgraph, i, GGML_OP_CONCAT, &reshape)) >= 0) {
++                const ggml_tensor * concat = cgraph->nodes[j];
++                for (int k = j + 1; k < cgraph->n_nodes; ++k) {
++                    if (cgraph->nodes[k]->op == GGML_OP_SSM_CONV && cgraph->nodes[k]->src[0] == concat) {
++                        params->add_alloc_dep(params->user_data, ids, cgraph->nodes[k]);
++                        params->add_alloc_dep(params->user_data, root(concat->src[1]), cgraph->nodes[k]);
++                        break;
++                    }
++                }
+             }
+         }
+     }
+diff --git a/ggml/src/ggml-cuda/ssm-conv.cu b/ggml/src/ggml-cuda/ssm-conv.cu
+index 1463169..f8c9990 100644
+--- a/ggml/src/ggml-cuda/ssm-conv.cu
++++ b/ggml/src/ggml-cuda/ssm-conv.cu
+@@ -204,3 +204,81 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
+                           out->nb[2], nc, nr, n_t, n_s, stream);
+     }
+ }
++
++// One decode step of the conv chain GET_ROWS(conv state) -> CONCAT(state, x) ->
++// CPY(last d_conv-1 columns -> cache row) -> SSM_CONV -> SILU, for one sequence and one token. Each
++// thread owns one channel: it reads that channel's d_conv-1 state values from the cache row the row ids
++// name and the channel's new input, writes the shifted window to the cache row of this step, and
++// computes the convolution with the same expressions and summation order as ssm_conv_f32 at n_t == 1.
++// The in-place case (both rows the same) is safe because a thread writes only the values it read.
++template <size_t d_conv>
++static __global__ void ssm_conv_step_silu_f32(const float * cache, const int32_t * ids, const int64_t row_stride,
++                                              const float * x_new, const int64_t x_new_stride,
++                                              const float * w_ptr, const int w_nb1, float * state_out,
++                                              float * dst, const int nr) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= nr) {
++        return;
++    }
++
++    const float * state_in = cache + (int64_t) ids[0] * row_stride + (int64_t) tid * (d_conv - 1);
++    const int     stride_w = w_nb1 / sizeof(float);
++
++    float x[d_conv] = { 0.0f };
++    float w[d_conv] = { 0.0f };
++
++#pragma unroll
++    for (size_t j = 0; j < d_conv; j++) {
++        w[j] = w_ptr[tid * stride_w + j];
++    }
++
++    const float b = 0.0f;
++
++#pragma unroll
++    for (size_t j = 0; j < d_conv - 1; j++) {
++        x[j] = state_in[j];
++    }
++    x[d_conv - 1] = x_new[tid * x_new_stride];
++
++#pragma unroll
++    for (size_t j = 0; j < d_conv - 1; j++) {
++        state_out[(int64_t) tid * (d_conv - 1) + j] = x[j + 1];
++    }
++
++    float sumf = 0.0f;
++#pragma unroll
++    for (size_t j = 0; j < d_conv; j++) {
++        sumf += x[j] * w[j];
++    }
++    sumf += b;
++    dst[tid] = ggml_cuda_op_silu_single(sumf);
++}
++
++bool ggml_cuda_ssm_conv_step_supported(const ggml_tensor * ssm_conv, const ggml_tensor * silu) {
++    const ggml_tensor * w = ssm_conv->src[1];
++    const int64_t nc = w->ne[0];
++    return (nc == 3 || nc == 4) && w->type == GGML_TYPE_F32 && w->nb[0] == sizeof(float) &&
++        silu->type == GGML_TYPE_F32 && ggml_is_contiguous(silu) && silu->ne[0] == ssm_conv->src[0]->ne[1] &&
++        silu->ne[1] == 1 && silu->ne[2] == 1 && silu->ne[3] == 1;
++}
++
++void ggml_cuda_op_ssm_conv_step(ggml_backend_cuda_context & ctx, const ggml_tensor * ssm_conv, ggml_tensor * silu,
++                                const float * cache, const int32_t * ids, int64_t row_stride,
++                                const float * x_new, int64_t x_new_stride, float * state_out) {
++    const ggml_tensor * w  = ssm_conv->src[1];
++    const int64_t       nc = w->ne[0];
++    const int           nr = (int) silu->ne[0];
++    GGML_ASSERT(ggml_cuda_ssm_conv_step_supported(ssm_conv, silu));
++
++    const int    threads = 128;
++    const dim3   blocks((nr + threads - 1) / threads, 1, 1);
++    cudaStream_t stream  = ctx.stream();
++    if (nc == 4) {
++        ssm_conv_step_silu_f32<4><<<blocks, threads, 0, stream>>>(cache, ids, row_stride, x_new, x_new_stride,
++            (const float *) w->data, (int) w->nb[1], state_out, (float *) silu->data, nr);
++    } else {
++        ssm_conv_step_silu_f32<3><<<blocks, threads, 0, stream>>>(cache, ids, row_stride, x_new, x_new_stride,
++            (const float *) w->data, (int) w->nb[1], state_out, (float *) silu->data, nr);
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
+diff --git a/ggml/src/ggml-cuda/ssm-conv.cuh b/ggml/src/ggml-cuda/ssm-conv.cuh
+index 8514ca8..a9c7b22 100644
+--- a/ggml/src/ggml-cuda/ssm-conv.cuh
++++ b/ggml/src/ggml-cuda/ssm-conv.cuh
+@@ -1,3 +1,11 @@
+ #include "common.cuh"
+ 
+ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node = nullptr, ggml_tensor * silu_dst = nullptr);
++
++// (see ggml_cuda_try_defer_state_rows in ggml-cuda.cu) the decode-step conv chain with the state read from and
++// written to the cache directly
++bool ggml_cuda_ssm_conv_step_supported(const ggml_tensor * ssm_conv, const ggml_tensor * silu);
++
++void ggml_cuda_op_ssm_conv_step(ggml_backend_cuda_context & ctx, const ggml_tensor * ssm_conv, ggml_tensor * silu,
++                                const float * cache, const int32_t * ids, int64_t row_stride,
++                                const float * x_new, int64_t x_new_stride, float * state_out);

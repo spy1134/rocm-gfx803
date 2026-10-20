@@ -1,0 +1,375 @@
+llama.cpp (as fetched by Ollama v0.35.1, llama.cpp b11232, applied after
+115; needs 111): the end of a MoE layer at one token (weighted expert sum,
+shared expert and residual adds, the next layer's RMS norm and the q8_1
+quantize of its output) runs as one kernel.
+Generic (all GPUs): not gfx803-specific code; measured on gfx803.
+
+WHY
+---
+Single-token decode on an RX 590 pays for every dispatch as well as for the
+work in it: each one costs about 4.3 us of command-processor time however
+small the kernel, a 2.65 us floor plus 1.65 us for the vector-L1 invalidate
+that every dispatch needs on gfx8 (docs/FINDINGS.md, "A kernel can read
+stale data from the vector L1 across dispatches"). A Qwen3.6 35B-A3B decode
+token with the routed experts in system RAM issues about 1,425 dispatches,
+about 1,064 of them on the critical path.
+
+At the end of every MoE layer at one token the CUDA backend runs four
+kernels on single rows of 2048 floats (Qwen3.6 35B-A3B): the router-weighted
+sum of the expert outputs (moe_weighted_reduction), the add of the shared
+expert and the residual (one fused add), the next layer's RMS norm times
+its weight (one fused kernel), and the q8_1 quantize of that result for
+the matrix-vector products that read it (with 111, once per input). They
+are almost all dispatch cost: 120 dispatches per token fewer on Qwen3.6
+35B-A3B (40 layers).
+
+Alone, with HIP graphs off (tg128 x5, two rounds): 26.30 -> 26.70 tok/s (+1.5%).
+
+Measured on an RX 590 (llama-bench, Qwen3.6 35B-A3B Q4_K_M, all experts in
+system RAM with -ncmoe 99, tg128, 5 repetitions, page cache dropped before
+each run, HSA_ENABLE_SDMA=1 ROC_CPU_WAIT_FOR_SIGNAL=1), patches 113-116
+together: 25.60 -> 27.51 tok/s with HIP graphs (the default), 26.21 ->
+27.93 tok/s with GGML_CUDA_DISABLE_GRAPHS=1. With this patch alone and with
+all four, greedy 128-token output is byte-identical to the build without
+them, and llama-perplexity with -ub 1 (every token through the decode path)
+gives mean KLD 0 and the same perplexity in every digit.
+
+WHAT
+----
+ggml_cuda_try_fuse extends the moe_weighted_reduction match by the four
+nodes after it, ADD(shared expert), ADD(residual), RMS_NORM and
+MUL(weight), when all are f32, contiguous and one token of a row length
+that is a multiple of 1024, and ggml_can_fuse_subgraph allows it with the
+residual stream h and the normed row as outputs (main stream only).
+moe_tail_rms_norm_mul_q8_1_f32 runs it as one block of 1024 threads, the
+block size rms_norm_f32 uses for rows of 1024 and more: per column the
+expression of moe_weighted_reduction_f32, then (moe + shared) + residual in
+the fused add's order, writing h and accumulating x * x in rms_norm_f32's
+thread order; the same block reduction; then scale * h * weight, written
+out and quantized in the same 32-lane groups and butterfly reductions as
+quantize_q8_1. h may be the shared-expert or residual tensor itself (an
+in-place add); any other overlap of h with an input refuses.
+graph_optimize keeps the experts, weights, shared expert and residual
+allocated until the group's last node.
+
+This depends on 111. The q8_1 copy is kept in the context as
+mmvq_src1_pending and becomes 111's kept input (mmvq_src1) once the
+evaluation loop has checked every node of the group for writes, which
+would otherwise drop it for the group's own write of the normed row; the
+next layer's first matrix-vector product then skips its quantize. 111's
+kept buffer is released before the new one is allocated, so pool frees
+stay in reverse allocation order as the VMM pool requires.
+
+Numerics are unchanged: every value is bit-identical to running the four
+kernels in turn (same expressions, per-thread element order, block
+reduction and quantization groups). On gfx803 the reduction and x * x
+compile to v_mac as in the original kernels, and v_fma appears only inside
+the division expansions, as in rms_norm_f32 and quantize_q8_1.
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index ae37450..32a3ecc 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1686,6 +1686,31 @@ struct ggml_backend_cuda_context {
+         }
+     }
+ 
++    // q8_1 copy of the fused MoE tail's normed output, made by the tail's own kernel. It becomes
++    // mmvq_src1 only after the evaluation loop has run the invalidation for every node of the group,
++    // because that check would otherwise drop it for the group's own write of the same bytes. Declared
++    // after the pools for the same reason as mmvq_src1.
++    struct {
++        const void * data = nullptr;
++        size_t nbytes = 0;
++        int64_t ne[GGML_MAX_DIMS] = {};
++        size_t nb[GGML_MAX_DIMS] = {};
++        std::unique_ptr<ggml_cuda_pool_alloc<char>> q8_1;
++    } mmvq_src1_pending;
++
++    void mmvq_src1_commit_pending() {
++        if (mmvq_src1_pending.data == nullptr) {
++            return;
++        }
++        mmvq_src1_invalidate();
++        mmvq_src1.data   = mmvq_src1_pending.data;
++        mmvq_src1.nbytes = mmvq_src1_pending.nbytes;
++        std::copy(mmvq_src1_pending.ne, mmvq_src1_pending.ne + GGML_MAX_DIMS, mmvq_src1.ne);
++        std::copy(mmvq_src1_pending.nb, mmvq_src1_pending.nb + GGML_MAX_DIMS, mmvq_src1.nb);
++        mmvq_src1.q8_1 = std::move(mmvq_src1_pending.q8_1);
++        mmvq_src1_pending.data = nullptr;
++    }
++
+     // recurrent-state GET_ROWS that the evaluation loop did not run because the GATED_DELTA_NET reading
+     // them reads the cache row through the row ids itself. Filled while walking one graph, cleared
+     // before the next.
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 09b3f71..98390bc 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3574,6 +3574,95 @@ static int ggml_cuda_try_fuse_mm_reshape_add(ggml_backend_cuda_context * cuda_ct
+     return 0;
+ }
+ 
++// The MoE weighted reduction followed by ADD(shared expert), ADD(residual), RMS_NORM and MUL(norm
++// weight) of the next layer, at one token. With check_data the tensors' memory is known and
++// checked too; graph_optimize calls it without, to keep the inputs alive until the last node.
++struct ggml_cuda_moe_tail_match {
++    const ggml_tensor * shexp    = nullptr;
++    const ggml_tensor * resid    = nullptr;
++    ggml_tensor *       h        = nullptr;
++    const ggml_tensor * rms_norm = nullptr;
++    const ggml_tensor * mul_w    = nullptr;
++    ggml_tensor *       normed   = nullptr;
++    int                 node_count = 0;
++};
++
++static bool ggml_cuda_match_moe_tail(const ggml_cgraph * cgraph, int node_idx,
++        const ggml_cuda_moe_weighted_reduction_match & red, ggml_cuda_moe_tail_match & tail, bool check_data) {
++    const int k          = node_idx + red.node_count;
++    const int node_count = red.node_count + 4;
++    if (k + 4 > cgraph->n_nodes || node_count >= 32) {
++        return false;
++    }
++    const ggml_tensor * moe  = red.dst;
++    ggml_tensor *       add1 = cgraph->nodes[k];
++    ggml_tensor *       add2 = cgraph->nodes[k + 1];
++    ggml_tensor *       norm = cgraph->nodes[k + 2];
++    ggml_tensor *       mul  = cgraph->nodes[k + 3];
++
++    if (moe->ne[1] != 1 || !ggml_cuda_moe_tail_rms_norm_supported(moe->ne[0])) {
++        return false;
++    }
++    for (const ggml_tensor * t : { (const ggml_tensor *) add1, (const ggml_tensor *) add2,
++                                   (const ggml_tensor *) norm, (const ggml_tensor *) mul }) {
++        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || !ggml_are_same_shape(t, moe)) {
++            return false;
++        }
++    }
++    if (add1->op != GGML_OP_ADD || add2->op != GGML_OP_ADD || norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL) {
++        return false;
++    }
++    const ggml_tensor * shexp = ggml_cuda_other_src(add1, moe);
++    const ggml_tensor * resid = ggml_cuda_other_src(add2, add1);
++    const ggml_tensor * mul_w = ggml_cuda_other_src(mul, norm);
++    if (shexp == nullptr || resid == nullptr || mul_w == nullptr || norm->src[0] != add2) {
++        return false;
++    }
++    for (const ggml_tensor * t : { shexp, resid }) {
++        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || !ggml_are_same_shape(t, moe)) {
++            return false;
++        }
++    }
++    if (mul_w->type != GGML_TYPE_F32 || !ggml_is_contiguous(mul_w) || mul_w->ne[0] != moe->ne[0] ||
++            ggml_nrows(mul_w) != 1) {
++        return false;
++    }
++
++    ggml_op ops[32];
++    for (int j = 0; j < node_count; ++j) {
++        ops[j] = cgraph->nodes[node_idx + j]->op;
++    }
++    const int outputs[2] = { k + 1, k + 3 };
++    if (!ggml_can_fuse_subgraph(cgraph, node_idx, node_count, ops, outputs, 2)) {
++        return false;
++    }
++
++    if (check_data) {
++        // h is written in the first pass while other threads still read the inputs: an exact alias of an
++        // element-wise operand (in-place add) is safe, any other overlap is not. normed is written after
++        // the block-wide barrier, when every input has been read.
++        for (const ggml_tensor * t : { red.experts, red.weights, red.expert_scale, mul_w, (const ggml_tensor *) mul }) {
++            if (t != nullptr && ggml_cuda_bytes_overlap(add2, t)) {
++                return false;
++            }
++        }
++        for (const ggml_tensor * t : { shexp, resid }) {
++            if (ggml_cuda_bytes_overlap(add2, t) && t->data != add2->data) {
++                return false;
++            }
++        }
++    }
++
++    tail.shexp      = shexp;
++    tail.resid      = resid;
++    tail.h          = add2;
++    tail.rms_norm   = norm;
++    tail.mul_w      = mul_w;
++    tail.normed     = mul;
++    tail.node_count = node_count;
++    return true;
++}
++
+ // A GET_ROWS that copies one recurrent-state row out of its cache for one sequence and is read, through
+ // a RESHAPE, only by the first later node of type consumer_op that uses it. Returns that node's index or
+ // -1. What lies between the two is for the caller to check.
+@@ -3794,6 +3883,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     if (node->op == GGML_OP_MUL) {
+         ggml_cuda_moe_weighted_reduction_match match;
+         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
++            ggml_cuda_moe_tail_match tail;
++            if (cuda_ctx->curr_stream_no == 0 &&
++                    ggml_cuda_match_moe_tail(cgraph, i, match, tail, /*check_data=*/true)) {
++                ggml_cuda_op_moe_tail_rms_norm_q8_1(*cuda_ctx, match.experts, match.expert_scale, match.weights,
++                    tail.shexp, tail.resid, tail.h, tail.rms_norm, tail.mul_w, tail.normed);
++                return tail.node_count - 1;
++            }
+             const int output_idx = i + match.node_count - 1;
+             if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1)) {
+                 ggml_cuda_op_moe_weighted_reduction(
+@@ -4701,6 +4797,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 for (int j = 1; j <= nodes_to_skip; j++) {
+                     cuda_ctx->mmvq_src1_invalidate_if_written(cgraph->nodes[i + j]);
+                 }
++                cuda_ctx->mmvq_src1_commit_pending();
+ 
+                 if (nodes_to_skip != 0) {
+ #ifdef GGML_CUDA_DEBUG
+@@ -4912,6 +5009,15 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+                     params->add_alloc_dep(
+                         params->user_data, const_cast<ggml_tensor *>(match.expert_scale), match.dst);
+                 }
++                // the fused MoE tail reads every input of the group until the group's last node
++                ggml_cuda_moe_tail_match tail;
++                if (ggml_cuda_match_moe_tail(cgraph, i, match, tail, /*check_data=*/false)) {
++                    for (const ggml_tensor * t : { match.experts, match.weights, match.expert_scale, tail.shexp, tail.resid }) {
++                        if (t != nullptr) {
++                            params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(t), tail.normed);
++                        }
++                    }
++                }
+                 i += match.node_count - 1;
+             }
+ 
+diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
+index 5543307..c81b88d 100644
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -729,3 +729,105 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+ 
+     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+ }
++
++// The end of a MoE layer at one token, in one block: the router-weighted sum of the
++// expert outputs, + shared expert, + residual (the residual stream h), then the next layer's RMS norm
++// times its weight, and that result quantized to q8_1 for the matrix-vector products that read it.
++// Each step repeats the expressions of the kernels it replaces (moe_weighted_reduction_f32, the fused
++// add, rms_norm_f32<1024, true>, quantize_q8_1) with the same per-thread element order, the same
++// block reduction and the same 32-lane quantization groups, so every value is bit-identical to
++// running those kernels one after another.
++template <int block_size>
++static __global__ void moe_tail_rms_norm_mul_q8_1_f32(
++        const float * experts, const float * expert_scale, const float * weights, const int n_expert_used,
++        const float * shexp, const float * resid, float * h, const float * mul, float * dst, void * vy,
++        const int ncols, const float eps) {
++    const int tid = threadIdx.x;
++
++    float tmp = 0.0f;
++    for (int col = tid; col < ncols; col += block_size) {
++        const float first_scale = expert_scale != nullptr ? expert_scale[0] : 1.0f;
++        float       sum         = (experts[col] * first_scale) * weights[0];
++        for (int expert = 1; expert < n_expert_used; ++expert) {
++            const float scale = expert_scale != nullptr ? expert_scale[expert] : 1.0f;
++            sum += (experts[(int64_t) expert * ncols + col] * scale) * weights[expert];
++        }
++        float xi = sum;
++        xi = xi + shexp[col];
++        xi = xi + resid[col];
++        h[col] = xi;
++        tmp += xi * xi;
++    }
++
++    extern __shared__ float s_sum[];
++    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
++
++    const float mean  = tmp / ncols;
++    const float scale = rsqrtf(mean + eps);
++
++    block_q8_1 * y = (block_q8_1 *) vy;
++    for (int col = tid; col < ncols; col += block_size) {
++        const float xi = scale * h[col] * mul[col];
++        dst[col] = xi;
++
++        float amax = fabsf(xi);
++        float sum  = xi;
++        amax = warp_reduce_max<QK8_1>(amax);
++        sum  = warp_reduce_sum<QK8_1>(sum);
++
++        const float  d = amax / 127.0f;
++        const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
++
++        const int ib  = col / QK8_1;
++        const int iqs = col % QK8_1;
++        y[ib].qs[iqs] = q;
++        if (iqs == 0) {
++            y[ib].ds = make_half2(d, sum);
++        }
++    }
++}
++
++bool ggml_cuda_moe_tail_rms_norm_supported(const int64_t ncols) {
++    // one 1024-thread block, as rms_norm_f32 uses for rows of 1024 and more; every thread runs the
++    // same number of iterations so the quantization shuffles never diverge; no q8_1 padding blocks
++    return ncols >= 1024 && ncols % 1024 == 0 && ncols % MATRIX_ROW_PADDING == 0;
++}
++
++void ggml_cuda_op_moe_tail_rms_norm_q8_1(ggml_backend_cuda_context & ctx,
++                                         const ggml_tensor *         experts,
++                                         const ggml_tensor *         expert_scale,
++                                         const ggml_tensor *         weights,
++                                         const ggml_tensor *         shexp,
++                                         const ggml_tensor *         resid,
++                                         ggml_tensor *               h,
++                                         const ggml_tensor *         rms_norm,
++                                         const ggml_tensor *         mul_w,
++                                         ggml_tensor *               dst) {
++    const int64_t ncols = h->ne[0];
++    GGML_ASSERT(ggml_cuda_moe_tail_rms_norm_supported(ncols));
++    GGML_ASSERT(ggml_nrows(h) == 1 && ggml_nrows(dst) == 1);
++    GGML_ASSERT(ctx.curr_stream_no == 0);
++
++    float eps = 0.0f;
++    memcpy(&eps, rms_norm->op_params, sizeof(float));
++
++    // the kept q8_1 copy is replaced by this one when the group is committed; freeing it before the new
++    // allocation keeps pool frees in reverse allocation order, which the VMM pool requires
++    ctx.mmvq_src1_invalidate();
++    const size_t q8_1_size = ncols * sizeof(block_q8_1) / QK8_1;
++    auto & pending = ctx.mmvq_src1_pending;
++    pending.q8_1   = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), q8_1_size);
++
++    cudaStream_t stream = ctx.stream();
++    moe_tail_rms_norm_mul_q8_1_f32<1024><<<1, 1024, 32 * sizeof(float), stream>>>(
++        (const float *) experts->data, expert_scale ? (const float *) expert_scale->data : nullptr,
++        (const float *) weights->data, (int) experts->ne[1],
++        (const float *) shexp->data, (const float *) resid->data, (float *) h->data,
++        (const float *) mul_w->data, (float *) dst->data, pending.q8_1->get(), (int) ncols, eps);
++    CUDA_CHECK(cudaGetLastError());
++
++    pending.data   = dst->data;
++    pending.nbytes = ggml_nbytes(dst);
++    std::copy(dst->ne, dst->ne + GGML_MAX_DIMS, pending.ne);
++    std::copy(dst->nb, dst->nb + GGML_MAX_DIMS, pending.nb);
++}
+diff --git a/ggml/src/ggml-cuda/norm.cuh b/ggml/src/ggml-cuda/norm.cuh
+index 95618df..234ae82 100644
+--- a/ggml/src/ggml-cuda/norm.cuh
++++ b/ggml/src/ggml-cuda/norm.cuh
+@@ -18,3 +18,18 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
+ void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
++// (see ggml_cuda_try_fuse) MoE weighted reduction + shared expert + residual, then
++// RMS norm * weight, writing h, the normed row and its q8_1 copy (kept as the next mmvq input)
++bool ggml_cuda_moe_tail_rms_norm_supported(int64_t ncols);
++
++void ggml_cuda_op_moe_tail_rms_norm_q8_1(ggml_backend_cuda_context & ctx,
++                                         const ggml_tensor *         experts,
++                                         const ggml_tensor *         expert_scale,
++                                         const ggml_tensor *         weights,
++                                         const ggml_tensor *         shexp,
++                                         const ggml_tensor *         resid,
++                                         ggml_tensor *               h,
++                                         const ggml_tensor *         rms_norm,
++                                         const ggml_tensor *         mul_w,
++                                         ggml_tensor *               dst);

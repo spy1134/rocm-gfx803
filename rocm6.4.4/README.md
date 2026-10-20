@@ -538,6 +538,36 @@ measurements and a reproduction. In short:
   (llama-bench with every expert in RAM: 24.6 -> 25.6), identical outputs.
   Like 108, it is in `patches/ollama/llama-cpp-sched/`, because both the
   scheduler and the model graphs are compiled into the CPU build.
+- **113-116: fewer dispatches per generated token.** On gfx803 every GPU
+  dispatch costs about 4.3 us of command-processor time however small the
+  kernel, and a Qwen3.6 35B-A3B token issues about 1,425 of them. Four
+  fusions, each taken only where its inputs allow it and otherwise falling
+  back to the separate kernels, remove up to 300 per token on that model with
+  unchanged arithmetic. All four together, llama-bench with every expert in
+  RAM: 25.60 -> 27.51 tok/s (HIP graphs on, the default), 26.21 -> 27.93
+  with graphs off; greedy output byte-identical and perplexity equal in
+  every digit (KL divergence 0). Through Ollama (2,800-token prompt, beside
+  the text-to-speech server with the desktop up): generation 22.7 -> 24.2
+  tok/s, prompt speed unchanged, greedy output identical on four models.
+  - **113-mmv-fuse-add-through-reshape.patch**: the DeltaNet output and
+    alpha projections are followed by a reshape and an ADD; the
+    matrix-vector kernel now does the ADD, as it already did without the
+    reshape (60 dispatches per token).
+    Alone, HIP graphs off: 26.30 -> 26.54 tok/s (+0.9%).
+  - **114-gdn-state-from-cache-row.patch**: each DeltaNet layer copied its
+    2 MiB recurrent state out of the cache before using it; for one sequence
+    the kernel now reads the cache row directly (30 dispatches and 60 MiB
+    of copies per token).
+    Alone, HIP graphs off: 26.30 -> 26.93 tok/s (+2.4%).
+  - **115-ssm-conv-decode-step.patch**: the DeltaNet convolution at one
+    token (state copy, concat, state store, convolution) runs as one kernel
+    that reads and writes the cache itself (90 dispatches per token).
+    Alone, HIP graphs off: 26.30 -> 27.00 tok/s (+2.7%).
+  - **116-moe-tail-norm-q8_1.patch**: the end of each MoE layer (weighted
+    expert sum, shared expert and residual adds, the next layer's RMS norm
+    and its q8_1 quantize) runs as one kernel, whose q8_1 output becomes
+    111's kept input (120 dispatches per token). Needs 111.
+    Alone, HIP graphs off: 26.30 -> 26.70 tok/s (+1.5%).
 
 `patches/ollama/unapplied/` holds `109-sched-batched-host-copies.patch`, which is
 not built: with the scheduler patched and `HSA_ENABLE_SDMA=1`, MoE generation
@@ -574,9 +604,9 @@ GPU:
 The llama.cpp kernel patches 100-104 and 106 are gfx803-only by construction:
 each takes effect only for `GGML_CUDA_CC_GCN4` or `__gfx803__` and is sized from
 gfx803 register and bandwidth measurements. 105 changes q5_K's dot product for
-every GPU, with the same arithmetic. 107, 108, 112, 090 and the two Ollama
-patches fix problems that are not specific to any GPU (107, 108 and 112 were
-measured on gfx803 only).
+every GPU, with the same arithmetic. 107, 108, 111-116, 090 and the two Ollama
+patches fix problems that are not specific to any GPU (107, 108 and 111-116
+were measured on gfx803 only).
 Upstream llama.cpp master (checked 2026-10-03, b11382) still has the vec
 kernel 102 replaces on gfx803, unchanged; llama.cpp issue
 [#27796](https://github.com/ggml-org/llama.cpp/issues/27796) reports the same

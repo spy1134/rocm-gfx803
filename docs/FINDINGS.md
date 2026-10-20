@@ -114,6 +114,7 @@ run with wrong numbers, not a crash. "It runs" was never taken as evidence.
 | MoE generation: one GPU round trip per tensor handed to the CPU experts | Patch kept but not applied: no speedup in the image; with SDMA on it reset the GPU on kernel 6.18.55 | 9 | `patches/ollama/unapplied/` |
 | GPU resets: `ring sdma0 timeout` with SDMA copies on | Fixed in the image (trigger removed): a kernel waiting for scratch, the page-table update that maps it, and a user SDMA queue polling for a kernel behind it deadlock engine 0 once a second process tips page-table jobs onto that engine; CLR now waits for dependencies on the CPU (prompt speed unchanged). The engine's behaviour remains | 3 | `ROC_CPU_WAIT_FOR_SIGNAL=1` in Dockerfile-Ollama |
 | MoE generation: the GPU idles during the CPU experts, the shared expert waits for them | Faster (all GPUs) | 9 | `patches/ollama/llama-cpp-sched/112-*` |
+| MoE generation: ~1,425 GPU dispatches per token at ~4.3 us each | Faster (all GPUs) | 9 | `patches/ollama/llama-cpp/113-*` to `116-*` |
 | Ollama rejects argument-less tools | Fixed (all GPUs) | 9 | `patches/ollama/ollama/` |
 | llama.cpp reserves a vision projector's memory on the wrong device | Fixed (all GPUs) | 9 | `patches/ollama/llama-cpp-server/` |
 | Ollama keeps stale free-memory figures on slow-starting GPUs | Fixed (all GPUs) | 9 | `patches/ollama/ollama/` |
@@ -1137,6 +1138,25 @@ bullets are the original findings (patches 100-105); the rest build on them.
   scheduler's synchronous copies and changes only what they wait for (an
   event instead of the whole stream); no SDMA fault occurred in any run.
   `GGML_SCHED_EARLY_HOST_INPUTS=0` disables it.
+- **Every dispatch costs ~4.3 us on gfx803, and a MoE token issued ~1,425.**
+  The command processor needs ~2.65 us per kernel launch, plus 1.65 us for
+  the vector-L1 invalidate slot (section 4), however small the kernel; a
+  Qwen3.6 35B-A3B token launched ~1,425 kernels, ~1,064 of them on the
+  critical path, about 4.6 ms of a 39 ms token. Four fusions remove up to 300
+  of them: the DeltaNet output and alpha projections take their following
+  ADD into the matrix-vector kernel through the reshape between them
+  (`113-mmv-fuse-add-through-reshape.patch`), the DeltaNet recurrence reads
+  its 2 MiB state from the cache row instead of a copy (`114`), the one-token
+  convolution step and its state update run as one kernel (`115`), and the
+  end of each MoE layer (expert sum, shared-expert and residual adds, the
+  next RMS norm and its q8_1 quantize) runs as one kernel (`116`). Each is
+  taken only where its guards hold (one sequence, one token, no other writer
+  of the bytes it reads late) and falls back to the separate kernels
+  otherwise. llama-bench with every expert in RAM, tg128: 25.60 -> 27.51
+  tok/s; through Ollama 22.7 -> 24.2 tok/s with prompt speed unchanged.
+  Arithmetic is unchanged: greedy output byte-identical on four models, and
+  llama-perplexity at 1-token batches gives the same PPL in every digit with
+  KL divergence 0.
 
 Upstream llama.cpp has no equivalent of the third fix; issue
 [#27796](https://github.com/ggml-org/llama.cpp/issues/27796) reports the same

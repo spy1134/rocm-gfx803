@@ -25,6 +25,7 @@ without this project's patches.
 | Prompt processing, 512 tokens (Qwen3 8B, Q4_K_M, llama-bench on Ollama's llama.cpp) | 14 tokens/s | 223 tokens/s | 16x |
 | A coding agent's first request (12,000-token prompt) | 18 min | 71 s | 15x |
 | Prompt processing, MoE model with experts in system RAM, without and with expert prefetch (Qwen3.6 35B-A3B through Ollama, 3,100-token prompt) | 165 tokens/s | 196 tokens/s | 1.2x |
+| Text generation, MoE model with experts in system RAM, without and with the dispatch fusions (Qwen3.6 35B-A3B through Ollama) | 22.7 tokens/s | 24.2 tokens/s | 1.07x |
 | Text generation (Qwen3 8B, short context, llama-bench on Ollama's llama.cpp) | 27 tokens/s | 30.5 tokens/s | 1.1x |
 
 The largest gains come from replacing the code paths that were slowest on this
