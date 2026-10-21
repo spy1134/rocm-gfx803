@@ -91,7 +91,7 @@ run with wrong numbers, not a crash. "It runs" was never taken as evidence.
 | PyTorch nonzero, masked indexing, unique, large sorts fail to launch (rocPRIM symbol clash with rocSPARSE) | Fixed | 5 | `patches/pytorch/` |
 | PyTorch index_put accumulate drops sums (warp-size mismatch) | Fixed | 5 | `patches/pytorch/` |
 | PyTorch embedding backward wrong or faults (warp-size mismatch) | Fixed | 5 | `patches/pytorch/` |
-| A GPU-side assert resets the whole GPU instead of raising an error | Open (driver/trap handler) | 5 | none |
+| A GPU-side assert resets the whole GPU instead of raising an error | Fixed (host setting: compute-wave save and restore on, the driver default) | 3 | host: `amdgpu.cwsr_enable` |
 | torchvision's roi_align, roi_pool, deform_conv2d and nms had no GPU kernel (the wheel was built CPU-only) | Fixed (torchvision built with its GPU sources) | 5 | `Dockerfile` (`FORCE_CUDA=1`) |
 | PyTorch sparse `coalesce()` wrong for dense widths above 160 | Fixed | 5 | `patches/pytorch/gfx803-sparse-coalesce-block-width.patch` |
 | PyTorch softmax and log_softmax backward wrong for some large dimensions (shared memory sized for 32 lanes, launched 64 wide) | Fixed | 5 | `patches/pytorch/gfx803-logical-warp-smem.patch` |
@@ -457,6 +457,45 @@ comes on a Gemma 4 E2B load, usually the first. With
 `ROC_CPU_WAIT_FOR_SIGNAL=1` added to the container the same requests run
 clean.
 
+### A device-side trap resets the GPU when compute-wave save and restore is off
+
+A kernel that executes a trap should end only its own process: a failed
+`CUDA_KERNEL_ASSERT` in PyTorch (which ROCm builds as `abort()`) or a
+`__builtin_trap()` makes the HIP runtime report `HSA_STATUS_ERROR_EXCEPTION`
+and exit. With `amdgpu.cwsr_enable=0` the card is reset as well. The kernel logs
+`SQ instruction intr detected ... trap true` and the process exits. About ten
+seconds later come `qcm fence wait loop timeout expired`,
+`unsuccessful queues preemption`, `Failed to evict process queues`, a BACO
+reset and `VRAM is lost`, and every ROCm process on the card loses its work.
+
+ROCm's trap handler for gfx8 (ROCr `amd_trap_handler_v1.h`) signals the error
+to the runtime and then halts the wave (`s_sethalt 1`), so the wave never
+finishes. When the process exits, the driver has the hardware scheduler
+preempt its queues. A queue can be preempted only when its waves finish or are
+saved by compute-wave save and restore (CWSR). With CWSR off, the scheduler
+waits for the halted wave until the driver's 9-second preemption timeout runs
+out. gfx8 has no per-queue reset, so the driver's only recovery is to reset
+the whole GPU. With CWSR on, the halted wave is saved like any other, the queue
+is removed and the card keeps running.
+
+The same one-wave trap program, on the same kernel (6.18.57) and stock
+runtime, reset the card on its first run with `cwsr_enable=0`. With CWSR on,
+none of seven trap shapes reset it: one lane; every lane of 64 blocks; a trap
+while the rest of its workgroup waits at a barrier; a trap while the other
+blocks keep running for seconds; a trap while a second ROCm process keeps the
+card busy; every lane on the patched runtime; and an out-of-range PyTorch
+index in a process with rocBLAS loaded. Each ended with
+`HSA_STATUS_ERROR_EXCEPTION` in the process, no driver message after the trap
+line, and the other process finishing normally.
+
+CWSR is the driver's default. Leave it on:
+`/sys/module/amdgpu/parameters/cwsr_enable` should read 1. If it reads 0,
+remove `options amdgpu cwsr_enable=0` from `/etc/modprobe.d/` (or
+`amdgpu.cwsr_enable=0` from the kernel command line), rebuild the initramfs
+and reboot. To check, run a HIP kernel in which one lane calls
+`__builtin_trap()`. The process should report `HSA_STATUS_ERROR_EXCEPTION`,
+and `journalctl -k` should show no `qcm fence` line after the trap.
+
 ## 4. The HSA runtime: patched or stock
 
 The base image carries upstream's patched `libhsa-runtime64` (a "va-reuse-
@@ -647,8 +686,9 @@ whole wavefront and has lane 0 store its count, but numbers warps by
 `C10_WARP_SIZE`. On gfx803 lanes 32-63 form a warp whose count nobody
 writes, thread 0 sums uninitialized shared memory into the offsets, and the
 kernel's `CUDA_KERNEL_ASSERT(writeIndex < outputSliceSize)` executes a trap.
-A trapped wave on gfx803 never finishes, so the queue cannot be preempted and
-the driver resets the GPU instead of the process receiving an error. The scan
+With compute-wave save and restore turned off, that trap also resets the
+card instead of only ending the process (see
+[the trap section](#a-device-side-trap-resets-the-gpu-when-compute-wave-save-and-restore-is-off)). The scan
 as written gets 100 of 100 random blocks wrong on the card, and 0 with the
 hardware's warp width
 ([`tools/correctness-suite/pytorch/`](../tools/correctness-suite/pytorch/)

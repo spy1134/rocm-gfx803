@@ -128,10 +128,12 @@ gives each problem's symptom, cause, fix and how to reproduce the check.
   `GFX803_RUNTIME=patched` selects the patched one for comparison. The cause is
   not yet understood, and ComfyUI's occasional fault on the second image after a
   model switch may be the same bug.
-- A device-side assert on gfx803 does not raise an error. The GPU hangs and the
-  driver resets it, which clears VRAM for every program using the card. A
-  desktop usually survives; GPU programs must be restarted. The PyTorch bugs
-  that triggered this are fixed, but a new one would look the same.
+- Keep the driver's compute-wave save and restore on (`amdgpu.cwsr_enable`,
+  default 1; check `/sys/module/amdgpu/parameters/cwsr_enable`). With it off,
+  a device-side assert does not just end the program that hit it: the driver
+  cannot preempt the halted wave and resets the GPU, which clears VRAM for every
+  program using the card (see "A device-side trap resets the GPU" in
+  [`docs/FINDINGS.md`](docs/FINDINGS.md)).
 - Mining-edition cards often ship with memory clocked above its rating, which
   causes random faults and freezes. Check the memory clock first (see "Host
   VBIOS setting" in [`README-rocm10.md`](README-rocm10.md)).
