@@ -440,11 +440,6 @@ counting its memory in the margin left Qwen3.6 35B-A3B 1.6 GB of the card and
 15 tok/s; subtracting it gives 4.4 GB and 24.6 tok/s, with the card at 7.5 of
 8 GB and speech requests still working.
 
-The image runs AMD's stock HSA runtime; `GFX803_RUNTIME=patched
-./start-ollama.sh` loads the base image's patched one instead, which crashes
-llama-server with GPU page faults on long prompts. All measurements below were
-taken on the stock runtime.
-
 ### Patches
 
 `patches/ollama/llama-cpp/` holds llama.cpp patches. Ollama applies every
@@ -794,10 +789,7 @@ Qwen3 8B and Qwen2.5-Coder 7B.
   the source pages for the GPU as writable memory, the read-only file mapping
   refuses, and the copy falls back to a slower staged path, so the output is
   still correct. `use_mmap false` avoids both (section 9 of `docs/FINDINGS.md`).
-- Ollama is tested on the stock HSA runtime, the image's default. On the
-  patched runtime (`GFX803_RUNTIME=patched`) llama-server crashed with GPU page
-  faults during a 17k-token prompt, and that runtime reports about 860 MiB less
-  free VRAM. A long serving run under the hang watcher has not been done yet.
+- A long serving run under the hang watcher has not been done yet.
 - With Qwen Code, Qwen2.5-Coder 7B answers without calling tools, and Qwen3 8B
   calls them but misuses Qwen Code's tool-search bridge: it passes
   `read_file`'s arguments straight to `tool_call` without naming the tool.

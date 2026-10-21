@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # Polaris / gfx803 base image: MIGraphX + ONNX Runtime + PyTorch on ROCm 6.4.4,
-# with rocBLAS, rocSOLVER, rocSPARSE, MIOpen, the HSA runtime and the HIP runtime rebuilt for gfx803. User-facing docs
+# with rocBLAS, rocSOLVER, rocSPARSE, MIOpen and the HIP runtime rebuilt for gfx803. User-facing docs
 # (versions, building, caveats): README.md in this directory.
 #
 # Why ROCm 6.4.4 for gfx803 (RX 460/470/480/550/560/570/580/590):
@@ -17,16 +17,6 @@
 # ROCR patch set on 7.x. Everything here is version-pinned and built locally.
 #
 # What still has to be rebuilt from source, and why:
-#
-#   ROCR      -- libhsa-runtime64 (libhsakmt is statically linked into it).
-#                On gfx803, immediate recycling of freed GPU virtual addresses
-#                -- in both libhsakmt's fmm aperture free-list and the
-#                SimpleHeap fragment sub-allocator above it -- makes MIOpen's
-#                CK reduction kernels intermittently mis-read data (ORT
-#                ReductionOpTest.ReduceSum_apex_matrix_large). Rebuilt with
-#                patches/rocr/va-reuse-defer.sh, which defers freed-VAs on a
-#                length-bounded FIFO and defaults the fragment allocator to
-#                off. See KERNEL_BUGS.md and the patch header.
 #
 #   rocBLAS   -- dropped gfx803 from its default TARGET_LIST at ROCm 6.0, but
 #                the gfx803 Tensile logic (Logic/asm_full/r9nano/*.yaml) is
@@ -77,7 +67,6 @@ ARG MIOPEN_IMAGE=miopen-builder
 ARG MIGRAPHX_IMAGE=migraphx-builder
 ARG PYTORCH_IMAGE=pytorch-builder
 ARG ORT_IMAGE=ort-builder
-ARG ROCR_IMAGE=rocr-builder
 
 # Everything below is pinned to an immutable ref: a release tag, or a commit
 # where the project only offers a moving release branch. A clone layer's cache
@@ -145,56 +134,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git python3 python3-dev python3-venv python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-# ROCR-Runtime (libhsa-runtime64, with libhsakmt statically linked in)
-# rebuilt from source with patches/rocr/va-reuse-defer.patch: on gfx803,
-# immediate recycling of freed GPU virtual addresses (both in libhsakmt's
-# fmm aperture free-list and in the hsa-runtime SimpleHeap fragment
-# sub-allocator above it) makes MIOpen's CK reduction kernels intermittently
-# mis-read freshly written data -- ORT ReductionOpTest.ReduceSum_
-# apex_matrix_large. The patch defers freed-VAs on a length-bounded FIFO
-# and defaults the fragment allocator to off. See the patch file and
-# KERNEL_BUGS.md for the full investigation, and tools/reduce-harness/
-# for the repro harness. Only libhsa-runtime64 is rebuilt: the KFD-layer
-# allocator is statically linked into it, so clr/HIP does not need a rebuild.
-FROM python-base AS rocr-builder
-ARG ROCM_VERSION
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        cmake ninja-build build-essential pkg-config xxd \
-        libnuma-dev libdrm-dev libelf-dev \
-        rocm-llvm-dev \
-    && rm -rf /var/lib/apt/lists/*
-RUN git clone --branch "rocm-${ROCM_VERSION}" --depth 1 \
-        https://github.com/ROCm/ROCR-Runtime.git /rocr-src
-COPY patches/rocr/ /rocr-patches/
-RUN sh /rocr-patches/va-reuse-defer.sh /rocr-src
-RUN cmake -S /rocr-src -B /rocr-src/build -G Ninja \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_INSTALL_PREFIX=/opt/rocm \
-        -DCMAKE_PREFIX_PATH="/opt/rocm;/opt/rocm/llvm" \
-    && cmake --build /rocr-src/build -j"$(nproc)" \
-    && cmake --install /rocr-src/build \
-    && rm -rf /rocr-src/build
-
-# Indirection alias (BuildKit rejects a variable in COPY --from, so resolve the
-# ARG through a FROM with a static name first). Moved ahead of rocblas-builder/
-# miopen-builder (rather than sitting after them, where it originally was)
-# so both can build against the patched runtime from the start instead of
-# linking against the base image's stock one and having the patch spliced
-# into /opt/rocm/lib only at the final assembly step -- the two aren't
-# guaranteed equivalent just because today's specific patches (va-reuse-defer)
-# happen to touch only runtime scheduling logic, not the ABI. Nothing here
-# is ever run against anything but the final assembled /opt/rocm, so the
-# build environment should match it from the start, not assume a same-SONAME
-# swap-in is safe without ever actually building against it.
-FROM ${ROCR_IMAGE} AS rocr-export
-
 FROM python-base AS rocblas-builder
 
 ARG ROCM_VERSION
 ARG ROCM_ARCH=gfx803
 ARG BUILD_PARALLEL_LEVEL
-
-COPY --from=rocr-export /opt/rocm /opt/rocm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake ninja-build build-essential pkg-config gfortran ccache \
@@ -384,12 +328,6 @@ FROM python-base AS miopen-builder
 ARG ROCM_VERSION
 ARG ROCM_ARCH=gfx803
 ARG BUILD_PARALLEL_LEVEL
-
-# Same reasoning as rocblas-builder above: build against the patched runtime
-# from the start (rocr-export is defined earlier in this file, right after
-# rocr-builder) rather than linking against the base image's stock one and
-# relying on a same-SONAME splice-in at final to make it equivalent.
-COPY --from=rocr-export /opt/rocm /opt/rocm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake ninja-build build-essential pkg-config ccache \
@@ -1094,20 +1032,6 @@ COPY --from=migraphx-export /opt/rocm /opt/rocm
 # reaches the final image.
 COPY --from=miopen-export /opt/rocm/lib/libMIOpen.so.1.0.* /opt/rocm/lib/
 
-# Same reasoning for the patched ROCR (libhsa-runtime64 with the gfx803
-# VA-reuse defer, see the rocr-builder stage): copy only the libhsa-runtime64
-# files. `make install` in rocr-builder already repointed the
-# libhsa-runtime64.so.1 soname symlink at the new .so.1.15.0, and COPY
-# preserves that.
-#
-# rocblas-builder and miopen-builder both already build against rocr-export
-# from the start now, so this file should already match what's sitting in
-# /opt/rocm after the migraphx-export copy above -- this explicit copy is
-# kept anyway as the independently-controllable, authoritative source (final
-# takes its own ROCR_IMAGE/with-rocr-image input), not as the only place the
-# patch reaches this image.
-COPY --from=rocr-export /opt/rocm/lib/libhsa-runtime64.so* /opt/rocm/lib/
-
 # Rebuilt rocSOLVER (gfx803 code object). Only the library file: copying the
 # builder's /opt/rocm would revert the other rebuilt libraries to stock.
 COPY --from=rocsolver-export /librocsolver.so.0.4.* /opt/rocm/lib/
@@ -1127,8 +1051,9 @@ COPY --from=devlibs-export /ockl.bc /opt/rocm/amdgcn/bitcode/ockl.bc
 # libs are present on disk but unresolvable at runtime without this.
 RUN echo "/opt/rocm/lib" > /etc/ld.so.conf.d/rocm.conf && ldconfig
 
+# libdw1: rocprofv3's tool library links it, and the ROCm base image lacks it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libprotobuf-dev libopenblas0 libomp5 ffmpeg libsndfile1 locales \
+        libprotobuf-dev libopenblas0 libomp5 ffmpeg libsndfile1 locales libdw1 \
     && rm -rf /var/lib/apt/lists/*
 
 # ORT's StringNormalizer op constructs a std::locale by name (e.g.
@@ -1210,16 +1135,5 @@ COPY runtime/python/ /opt/rocm/lib/
 # GFX803_SGEMM_SHIM_DISABLE=1 at runtime passes every call to stock rocBLAS
 # for A/B testing. Last in the stage, so the build steps above run without it
 # and a shim change rebuilds only these two layers.
-#
-# AMD's stock HSA runtime (libhsa-runtime64.so.1.15.60404, still present from
-# the base image beside the patched .so.1.15.0) is preloaded ahead of the
-# patched one: on gfx803 the patched runtime's va-reuse-defer change makes
-# GPU writes fault ("Page not present", writes from TC) in workloads that free
-# and reallocate memory -- a synthetic GEGLU op test, wide GEMMs followed by a
-# large transposed copy, and a llama-server crash mid-prompt -- where the stock
-# runtime runs clean. The trade is the ORT ReduceSum race the patch exists for
-# (see the rocr-builder stage), which PyTorch, sd-scripts and llama.cpp do not
-# go through. The launchers' GFX803_RUNTIME=patched sets LD_PRELOAD to the shim
-# alone, so the patched runtime loads by its soname.
 COPY --from=sgemm-shim-builder /out/libgfx803_sgemm_shim_batched.so /opt/rocm/lib/
-ENV LD_PRELOAD=/opt/rocm/lib/libhsa-runtime64.so.1.15.60404:/opt/rocm/lib/libgfx803_sgemm_shim_batched.so
+ENV LD_PRELOAD=/opt/rocm/lib/libgfx803_sgemm_shim_batched.so

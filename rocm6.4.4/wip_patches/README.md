@@ -1,5 +1,11 @@
 # gfx803 VA-recycling fix — patch version history (2026-08-09)
 
+Status: the images do not build any of these patches. The reduce failures
+they target are the stale per-CU vector L1 across kernel dispatches, fixed in
+CLR (`patches/clr/`; `KERNEL_BUGS.md`, "FIXED (root cause): stale vector L1
+across kernel dispatches"), and the shipped v13 page-faults on gfx803 in
+workloads that free and reallocate GPU memory (`docs/FINDINGS.md` section 4).
+
 Context: `miopenReduceTensor` wrong-sums on gfx803 (Polaris) are caused by
 recycled GPU virtual addresses carrying stale memory-system state. All fix
 attempts live in ROCR-Runtime @ rocm-6.4.4 (`libhsakmt/src/fmm.c` +
@@ -146,8 +152,7 @@ defer-FIFO in upstream fmm.c).
 - Local quick-iteration build: `/tmp/opencode/Dockerfile.rocr644-ring16` →
   `docker build --no-cache` (plain builds have served a STALE patch from
   cache despite content change — always `--no-cache` or verify the lib hash).
-- CI/shipped wiring (v13 live): `Dockerfile` `rocr-builder` stage
-  applies `patches/rocr/va-reuse-defer.patch` (regenerated from v13). To
+- `patches/rocr/va-reuse-defer.patch` is regenerated from v13. To
   change the mechanism, update the wip patch, rebuild + re-validate both
   gates through `tools/reduce-harness/`, then regenerate the
   shippable patch from the validated build input (the diff body must stay

@@ -52,7 +52,7 @@ and the ROCm 6.4.4 images built from `rocm6.4.4/`. Other Polaris cards share
 the chip design and should behave alike; their clocks, memory and firmware
 differ, and none has been tested. Upstream's earlier findings (the rocBLAS
 Tensile bugs, MIOpen's grouped-convolution out-of-bounds read, the ROCr
-allocator fix and more) are in
+allocator patch, which this fork does not build (section 4), and more) are in
 [`rocm6.4.4/KERNEL_BUGS.md`](../rocm6.4.4/KERNEL_BUGS.md) and not repeated here.
 
 **Status legend.**
@@ -99,7 +99,7 @@ run with wrong numbers, not a crash. "It runs" was never taken as evidence.
 | MIGraphX fp16 matrix products accumulate in fp16 (error 0.7-1% instead of 0.02%) | Fixed | 5 | `patches/migraphx/rocblas-compute-fp32-gfx803.patch` |
 | ONNX Runtime TopK with sorted = 0 fails above K of about 7,800 | Fixed | 5 | `patches/onnxruntime/topk-safe-small-k-smem-bound.patch` |
 | No fused attention in PyTorch on gfx803 | ComfyUI node (inference; its GroupNorm and GEGLU are fp32 only) | 6 | `tools/ComfyUI-gfx803-attention/` |
-| Patched HSA runtime page faults | Open; images default to the stock runtime | 4 | `Dockerfile`, start scripts |
+| Upstream's patched HSA runtime (va-reuse-defer) page-faults on gfx803 | Not built: the images run AMD's stock runtime, and the bug it targeted is the stale vector L1 below | 4 | `patches/rocr/` |
 | Kernels read stale data from the per-CU vector L1 after a freed address is reused (silent wrong results in rocBLAS, rocSOLVER, torch.linalg) | Fixed (libamdhip64 rebuilt); decode costs about 2.6% | 4 | `patches/clr/` |
 | Device printf and assert() hang (hostcall's doorbell signal never changes) | Fixed (ockl.bc rebuilt) | 4 | `patches/device-libs/` |
 | No-return atomics on fine-grained host memory store their operand instead (user kernels) | Open (hardware; use the returned value) | 4 | none |
@@ -140,7 +140,7 @@ Paths in the table are relative to `rocm6.4.4/`.
 | dp4a | Integer dot-product instruction; gfx803 has none, so llama.cpp's int8 paths emulate it. |
 | KFD, BACO | The kernel's compute driver interface, and the GPU reset the driver falls back to when a queue cannot be preempted. |
 | SDMA | The GPU's DMA copy engines, which move data without occupying compute units. |
-| HSA runtime | `libhsa-runtime64`, ROCm's user-space runtime beneath HIP; this stack can preload AMD's stock build or a patched one (section 4). |
+| HSA runtime | `libhsa-runtime64`, ROCm's user-space runtime beneath HIP; the images run AMD's stock build (section 4). |
 
 **Speed, start to finish** (RX 590 8 GB; the front page's table):
 
@@ -499,31 +499,34 @@ and reboot. To check, run a HIP kernel in which one lane calls
 `__builtin_trap()`. The process should report `HSA_STATUS_ERROR_EXCEPTION`,
 and `journalctl -k` should show no `qcm fence` line after the trap.
 
-## 4. The HSA runtime: patched or stock
+## 4. The HSA runtime: AMD's stock build
 
-The base image carries upstream's patched `libhsa-runtime64` (a "va-reuse-
-defer" change to how freed GPU virtual addresses are reused; see
-`KERNEL_BUGS.md`). On this card it page-faults ("Page not present", writes
-from the texture cache) in workloads that free and reallocate GPU memory in
-particular patterns: a synthetic GEGLU op test, and wide GEMMs followed by a
-4.9M-element transposed copy, every run, where AMD's stock runtime passes. A
+The images run AMD's stock `libhsa-runtime64` (`.so.1.15.60404`) from the ROCm
+base image. Upstream's gfx803 tree patches it with a "va-reuse-defer" change
+to how freed GPU virtual addresses are reused (`patches/rocr/va-reuse-defer.patch`,
+investigation in `KERNEL_BUGS.md`), written for MIOpen's CK reduction kernels
+reading stale data when a freed address is reused at once (ONNX Runtime's
+`ReduceSum` test). The images do not build it, for two reasons.
+
+It page-faults on this card ("Page not present", writes from the texture
+cache) in workloads that free and reallocate GPU memory in particular
+patterns: a synthetic GEGLU op test (`gfx803_unet_check.py --only GEGLU`), and
+wide GEMMs followed by a 4.9M-element transposed copy, every run, where the
+stock runtime passes. Ollama's llama-server crashed on the same faults
+mid-prompt (a 17k-token Qwen Code request on Qwen3.5 9B: ten
+`VM fault ... write from 'TC*'` lines, then an interrupt ring overflow), and a
 storm of such faults in several processes overflowed the interrupt ring and
-froze the desktop until a reboot.
+froze the desktop until a reboot. The GEGLU test still faults with the CLR fix
+below in place, so the faults are the patch's own. ComfyUI faulted twice on
+the second generation after a model reload while it ran the patched runtime,
+which fits the same pattern but is not proven.
 
-Ollama's llama-server crashed on the same faults mid-prompt (a 17k-token Qwen
-Code request on Qwen3.5 9B: ten `VM fault ... write from 'TC*'` lines, then an
-interrupt ring overflow). ComfyUI has faulted twice on the second generation
-after a model reload, which fits the same pattern but is not proven.
+And the bug it was written for is the stale vector L1 described next: with
+CLR's cache invalidate, the MIOpen reduce programs pass on the stock runtime.
 
-The images therefore preload AMD's stock runtime, which the ROCm base image
-still carries as `libhsa-runtime64.so.1.15.60404` beside the patched
-`.so.1.15.0`. Ollama, SDXL and Qwen-Image generation, fp16 and training are all
-validated on it (one intermittent training fault is listed in section 10). `GFX803_RUNTIME=patched` (start scripts)
-and `gfx803-train --runtime patched` load the patched one for comparison. The
-cost is the bug the patch was written for: MIOpen's CK reduction kernels can
-read stale data when freed addresses are reused at once (ONNX Runtime's
-`ReduceSum` test), a path PyTorch, sd-scripts and llama.cpp do not take. What
-in the va-reuse-defer change faults on gfx803 is not investigated yet.
+Profilers work on the stock runtime: `rocprof --hip-trace --stats`,
+`rocprofv3 --kernel-trace --stats` and `torch.profiler` record kernels, with
+or without the SGEMM shim preloaded.
 
 ### A kernel can read stale data from the vector L1 across dispatches
 
@@ -612,8 +615,8 @@ strided-batched GEMMs of 1 to 16 cubed (batch 4), forced one at a time by
 index on buffers refilled before each call, returns the exact product in 300
 of 300 calls; with the packet off nearly all of them are wrong in most calls,
 including the assembly kernels that the small-shape rocBLAS patch steers away
-from, so its detour is not needed either. Both are still in the images. The
-faults of the patched HSA runtime have not been explained. The intermittent
+from, so its detour is not needed either; that rocBLAS patch is still in the
+images. The faults of the patched HSA runtime have not been explained. The intermittent
 training fault in section 10 has not recurred with the fix in 25 runs of the
 setup it occurred in; whether this bug caused it is still open.
 
@@ -1411,12 +1414,12 @@ a reproduction.
   fixed). Candidates: their persistent launch, or wrong cache/release fields in
   their converted code-object metadata on gfx8.
 - Why the patched HSA runtime's va-reuse-defer change page-faults on gfx803
-  (GEGLU op test, wide GEMMs then a transposed copy, llama-server mid-prompt),
-  and whether it causes ComfyUI's faults after a model reload. The images run
-  AMD's stock runtime until this is understood; the reproducers are
+  (GEGLU op test, wide GEMMs then a transposed copy, llama-server mid-prompt).
+  The images do not build it. The reproducers are
   `gfx803_unet_check.py --only GEGLU` and the wide-GEMM-then-transposed-copy
-  sequence described in section 4, on
-  `GFX803_RUNTIME=patched` with the desktop stopped (a fault storm can freeze it).
+  sequence described in section 4, run against a `libhsa-runtime64` built
+  from ROCR-Runtime `rocm-6.4.4` with `patches/rocr/va-reuse-defer.sh`, with
+  the desktop stopped (a fault storm can freeze it).
 - Whether PyTorch's group_norm computes wrong weight and bias gradients on
   gfx9 for a spatial size of 1 and more than 128 rows:
   `GammaBeta1dBackwardCUDAKernel2` reduces a 32-wide tile with shuffles over

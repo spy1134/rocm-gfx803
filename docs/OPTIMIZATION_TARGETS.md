@@ -865,9 +865,9 @@ session.
 
 | Figure | Where | Why it may have moved | How |
 | --- | --- | --- | --- |
-| Dense decode breakdown (Qwen3 8B 27.81 tok/s, LLM-5's table) | llama.cpp decode, LLM-5 | stale-L1 fix (+1.65 us per dispatch), patch 111 | rocprof on the patched runtime with the desktop stopped; llama-bench tg at 0 and 5k depth |
+| Dense decode breakdown (Qwen3 8B 27.81 tok/s, LLM-5's table) | llama.cpp decode, LLM-5 | stale-L1 fix (+1.65 us per dispatch), patch 111 | rocprof `--hip-trace`; llama-bench tg at 0 and 5k depth |
 | MoE generation breakdown (25.58 tok/s, LLM-8's tables) | LLM-8 | stale-L1 fix, patches 111 and 112 | `GGML_SCHEDTIME` split timer and rocprof, `-ncmoe 99` |
-| SD 1.5 and SDXL kernel breakdowns (GEMMs 202 ms and 2.23 s per step) | Where the time goes, BLAS-7 | two-wavefront TN tile, SD-9 | `torch.profiler` on the patched runtime |
+| SD 1.5 and SDXL kernel breakdowns (GEMMs 202 ms and 2.23 s per step) | Where the time goes, BLAS-7 | two-wavefront TN tile, SD-9 | `torch.profiler` |
 | SDXL end to end and VAE (83 and 99 s, 67 s of sampling) | SDXL inference, SD-12 | UNet step 3.36 -> 2.75 s | ComfyUI, 20 steps, both VAE precisions |
 | fp32 SD 1.5 image (35 -> 10.5 s; 644 and 526 ms per step) | front page, FINDINGS "Speed, start to finish" | SD-6 and SD-9 attention, stale-L1 fix | ComfyUI `--force-fp32`, warm images |
 | The memory bandwidth bound | card table, LLM-5 | LLM-5's estimates take the 222-229 GB/s of q8_0 and f16 matmuls as the bound; no read-only streaming kernel has measured it at sustained clocks | a read-only streaming kernel at sustained clocks |
@@ -1318,11 +1318,9 @@ matmul (4096x14336) goes from 233 to 224 us for one column and from 287 to
 
 ### Measuring
 
-- **Profilers record nothing on the images' default runtime.** The images
-  preload AMD's stock HSA runtime, and neither `rocprof` nor `torch.profiler`
-  sees any kernels with it. The patched runtime (`GFX803_RUNTIME=patched`)
-  works with profilers but page-faults in some workloads, and a fault storm
-  can freeze the desktop: profile on it only with the desktop stopped.
+- **Profilers.** `rocprof --hip-trace --stats`, `rocprofv3 --kernel-trace
+  --stats` and `torch.profiler` record kernels in the images, with the SGEMM
+  shim preloaded or not.
 - **Per-module timing without a profiler.** Register forward pre- and
   post-hooks on every leaf module (and on attention modules) that record a
   `torch.cuda.Event`; run one warm-up forward, then one timed forward, and sum

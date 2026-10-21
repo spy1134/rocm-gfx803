@@ -7,8 +7,8 @@
 #   gfx803-train --help
 #
 # What it does
-#   * Loads the SGEMM shim and chosen HSA runtime (--shim, --runtime), with
-#     diagnostic switches (--no-batched, --debug-kernels, --shim-verbose).
+#   * Loads the SGEMM shim (--shim), with diagnostic switches
+#     (--no-batched, --debug-kernels, --shim-verbose).
 #   * Resolves the base model and VAE by name from ComfyUI's model folders.
 #   * Names each run automatically: <dataset>_<model>_d<dim>_<date-time>.
 #   * Records every run under /workspace/runs/<name>/ (settings, status, log)
@@ -46,7 +46,6 @@ RUNS_DIR=$WORKSPACE/runs
 OUT_ROOT=$WORKSPACE/output
 NEW_SHIM=${NEW_SHIM:-/opt/rocm/lib/libgfx803_sgemm_shim_batched.so}
 ORIG_SHIM=${ORIG_SHIM:-/opt/rocm/lib/libgfx803_sgemm_shim.so}
-STOCK_HSA=${STOCK_HSA:-/opt/rocm/lib/libhsa-runtime64.so.1.15.60404}
 VRAM_WARN_MIB=${VRAM_WARN_MIB:-1024}
 
 # Training parameters (saved per run; a resumed run reuses its own values).
@@ -72,7 +71,6 @@ PRECISION=fp16
 EXTRA_ARGS=()
 
 # Diagnostics (taken from the command line every time, also when resuming).
-RUNTIME=stock
 SHIM=new
 NO_BATCHED=0
 DEBUG_KERNELS=0
@@ -149,11 +147,6 @@ Training
                            on an 8 GB card)
 
 GPU stack and diagnostics
-      --runtime stock|patched
-                           stock: AMD's libhsa-runtime64 ($STOCK_HSA) [default]
-                           patched: the image's patched one +
-                           HSA_DISABLE_FRAGMENT_ALLOCATOR=0; page-faults in
-                           some workloads, for comparison only
       --shim new|original|none|PATH
                            new: the image's batched shim (correct attention) [default]
                            original: the older shim (wrong attention gradients)
@@ -504,13 +497,6 @@ setup_gpu_env() {  # fills GPU_ENV; applied only to the GPU commands, not this s
              -u GFX803_VRAM_RESERVE -u GFX803_VRAM_CAP
              GFX803_VRAM_RESERVE="$VRAM_RESERVE" GFX803_VRAM_CAP="$VRAM_CAP")
     local preload=() shim_path=""
-    case "$RUNTIME" in
-        patched) GPU_ENV+=(HSA_DISABLE_FRAGMENT_ALLOCATOR=0) ;;
-        stock)
-            [ -f "$STOCK_HSA" ] || die "stock libhsa-runtime64 not found: $STOCK_HSA"
-            preload+=("$STOCK_HSA") ;;
-        *) die "--runtime must be stock or patched" ;;
-    esac
     case "$SHIM" in
         new) shim_path=$NEW_SHIM ;;
         original) shim_path=$ORIG_SHIM ;;
@@ -650,7 +636,6 @@ while [ $# -gt 0 ]; do
         --fresh-latents) FRESH_LATENTS=1; shift ;;
         --no-checkpointing) NO_CHECKPOINTING=1; shift ;;
         --precision) PRECISION=$2; PRECISION_CLI=$2; shift 2 ;;
-        --runtime) RUNTIME=$2; DIAG_ARGS+=("$1" "$2"); shift 2 ;;
         --shim) SHIM=$2; DIAG_ARGS+=("$1" "$2"); shift 2 ;;
         --no-batched) NO_BATCHED=1; DIAG_ARGS+=("$1"); shift ;;
         --debug-kernels) DEBUG_KERNELS=1; DIAG_ARGS+=("$1"); shift ;;
@@ -854,7 +839,7 @@ else
 fi
 CMD+=("${RESUME_FLAGS[@]}" "${EXTRA_ARGS[@]}")
 
-SUMMARY="run=$RUN_NAME steps=$SEG_OFFSET->$STEPS runtime=$RUNTIME shim=$SHIM no_batched=$NO_BATCHED text_encoder=$([ "$TRAIN_TE" = 1 ] && echo "trained@$TE_LR" || echo frozen) vram_reserve=$VRAM_RESERVE vram_cap=${VRAM_CAP:-<from reserve>} LD_PRELOAD=${PRELOAD_STR:-<none>}"
+SUMMARY="run=$RUN_NAME steps=$SEG_OFFSET->$STEPS shim=$SHIM no_batched=$NO_BATCHED text_encoder=$([ "$TRAIN_TE" = 1 ] && echo "trained@$TE_LR" || echo frozen) vram_reserve=$VRAM_RESERVE vram_cap=${VRAM_CAP:-<from reserve>} LD_PRELOAD=${PRELOAD_STR:-<none>}"
 
 if [ "$DRY_RUN" = 1 ]; then
     log "Dry run: $SUMMARY"
@@ -872,7 +857,7 @@ if [ "$PREFLIGHT" = 1 ]; then preflight_gpu 2>&1 | tee -a "$LOG_FILE"; [ "${PIPE
 if [ "$RESUMING" = 0 ]; then prepare_latents | tee -a "$LOG_FILE"; else check_latents | tee -a "$LOG_FILE"; fi
 
 status_set "$RUN_NAME" STATE=running PID=$$ HOST="$(hostname)" STARTED="$(date +%s)" \
-    SEGMENT="$SEG_OFFSET-$SEG_STEPS" RUNTIME="$RUNTIME" SHIM="$SHIM"
+    SEGMENT="$SEG_OFFSET-$SEG_STEPS" SHIM="$SHIM"
 
 TPID=""
 stop_training() {  # stop the whole training process group

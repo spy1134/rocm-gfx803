@@ -41,12 +41,14 @@ codeobj/*.hsaco                    prebuilt gfx803 code objects (one per method/
 README.md
 ```
 
-The bug this reproduces is **fixed at the runtime level** by
-`patches/rocr/va-reuse-defer.patch` (see `KERNEL_BUGS.md`,
-"FIXED (runtime) -- 2026-08-09"). With the patched libhsa the 52-shape sweep
-is 0/52; against stock libhsa it is ~6-10/52. Keep using this harness to
-re-validate whenever the ROCR/MIOpen layer is touched (including the ROCm 7
-port).
+The bug this reproduces is the stale per-CU vector L1 across kernel
+dispatches (`KERNEL_BUGS.md`, "FIXED (root cause): stale vector L1 across
+kernel dispatches"), fixed in CLR by `patches/clr/`. On AMD's stock libhsa,
+which the images run, the 52-shape sweep is 0/52 with that fix and 10-12/52
+with it off (`CLR_GFX8_TC_INVALIDATE=0`). Upstream's runtime patch
+`patches/rocr/va-reuse-defer.patch` also brings the sweep to 0/52, but it
+page-faults on gfx803 and the images do not build it. Keep using this harness
+to re-validate whenever the CLR, ROCR or MIOpen layer is touched.
 
 ## Pre-requisites
 

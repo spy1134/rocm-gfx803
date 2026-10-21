@@ -123,11 +123,6 @@ gives each problem's symptom, cause, fix and how to reproduce the check.
 
 ## Known issues
 
-- The patched `libhsa-runtime64` from upstream page-faults in some workloads
-  (it crashed Ollama mid-prompt), so the images preload AMD's stock runtime.
-  `GFX803_RUNTIME=patched` selects the patched one for comparison. The cause is
-  not yet understood, and ComfyUI's occasional fault on the second image after a
-  model switch may be the same bug.
 - Keep the driver's compute-wave save and restore on (`amdgpu.cwsr_enable`,
   default 1; check `/sys/module/amdgpu/parameters/cwsr_enable`). With it off,
   a device-side assert does not just end the program that hit it: the driver

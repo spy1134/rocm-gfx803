@@ -11,8 +11,7 @@ Run inside the container, with ComfyUI idle, and on the host the tools in
 tools/gpu-hang-capture/ (gpu_monitor.sh, and sudo bash gpu_hang_watch.sh to
 capture the stuck queue if it hangs):
 
-  HSA_DISABLE_FRAGMENT_ALLOCATOR=0 \
-    python -u /opt/gfx803-training/gfx803_attn_stress.py --minutes 30
+  python -u /opt/gfx803-training/gfx803_attn_stress.py --minutes 30
 
 Progress is printed every --report iterations; the last line printed before a
 hang shows how far it got.

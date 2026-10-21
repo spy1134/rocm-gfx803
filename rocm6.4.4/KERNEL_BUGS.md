@@ -24,7 +24,7 @@ next one.
 | MultiHeadAttention "MHA basic" mode rejected on ROCm | ORT's own `GemmSoftmaxGemmPermuteGenericPipeline` (contrib op C++, not rocBLAS/MIOpen) -- the only path available once Composable Kernel is compiled out | `Could not find viable op` for any plain 3-tensor MultiHeadAttention call with query sequence_length > 1 (an ordinary shape, not an edge case); rocBLAS is never even reached | Fixed in ORT source: [`patches/onnxruntime/mha-basic-mode-no-viable-op.sh`](patches/onnxruntime/mha-basic-mode-no-viable-op.sh) adds the missing Q/K/V transpose (via ORT's own existing `LaunchTransQkv` utility) before the GEMMs that need it. 12 -> 3 failures, no regressions. |
 | Generic TopK RadixTopK tie-break nondeterminism | ORT's own generic TopK kernel (`topk_impl.cuh`, contrib op / core op C++, not rocBLAS/MIOpen) -- hipified verbatim from CUDA, no ROCm-specific source | Picks a different winner among exactly-tied candidates from run to run on bit-identical input (hipCUB `BlockScan`/`BlockReduce`-based tie allocation). Surfaced as `BeamSearchTest.GptBeamSearchFp32_DisableFastTopK` decoding a different token sequence each run, ~50% of isolated runs | Fixed in ORT source: [`patches/onnxruntime/topk-radix-tiebreak-nondeterministic.sh`](patches/onnxruntime/topk-radix-tiebreak-nondeterministic.sh) replaces the affected dispatch path with a self-contained, hipCUB-free kernel on ROCm only. 18 isolated runs: 17 passed (was ~50%). Not gfx803-specific in principle. |
 | Stale per-CU vector L1 across dispatches | Every kernel on gfx803 that reads a page a copy kernel just refilled, seen as wrong rocBLAS/rocSOLVER results after `hipFree` then `hipMalloc` | Silent wrong numbers, bit-identical per run | Fixed: [`patches/clr/`](patches/clr/clr-gfx8-tc-invalidate-6.4.4.patch), see the last section |
-| MIOpen `miopenReduceTensor` dynamic-reduction intermittent wrong sums | Root cause: below MIOpen. The HIP allocator's **device-address recycling** (hipFree->hipMalloc returning the same input VA) interacts with gfx803's GPU memory-system state (stale cache/TLB coherence) so the **specific CK reduction kernels mis-read freshly-written input** at the reused address. Proven via the committed `tools/reduce-harness/` (real CK kernels, plain hipModule + hipMalloc/hipFree reuse, no MIOpen host code: reuse=10/52, fresh-distinct-input=0/52, dominated by the INPUT buffer). Rock-solid: seq5-via-API reuse=7/52 vs fresh=0/52; observer effect ruled out (copy to a *recycled* internal buffer = 21/52). | **Fixed (runtime):** [`patches/rocr/va-reuse-defer.patch`](patches/rocr/va-reuse-defer.patch), wired into `Dockerfile`'s `rocr-builder` stage. See "FIXED (runtime): ROCR va-reuse-defer patch" below for the mechanism, and `wip_patches/README.md` for the full version history (the shipped patch is the v13 "park fully alive, busy-flush teardown" mechanism, not the earlier v4 lineage). Prior eviction workarounds (always-fresh ~70x slow; LRU-bound 91% not 100%) are NOT shippable and were superseded by this fix. |
+| MIOpen `miopenReduceTensor` dynamic-reduction intermittent wrong sums | Root cause: below MIOpen. The HIP allocator's **device-address recycling** (hipFree->hipMalloc returning the same input VA) interacts with gfx803's GPU memory-system state (stale cache/TLB coherence) so the **specific CK reduction kernels mis-read freshly-written input** at the reused address. Proven via the committed `tools/reduce-harness/` (real CK kernels, plain hipModule + hipMalloc/hipFree reuse, no MIOpen host code: reuse=10/52, fresh-distinct-input=0/52, dominated by the INPUT buffer). Rock-solid: seq5-via-API reuse=7/52 vs fresh=0/52; observer effect ruled out (copy to a *recycled* internal buffer = 21/52). | **Not built by the images.** The cause is the stale per-CU vector L1 (see "FIXED (root cause): stale vector L1 across kernel dispatches" below and `docs/FINDINGS.md` section 4), fixed in CLR (`patches/clr/`); with it the reduce programs pass on AMD's stock runtime. The runtime patch written for it, [`patches/rocr/va-reuse-defer.patch`](patches/rocr/va-reuse-defer.patch) ("FIXED (runtime): ROCR va-reuse-defer patch" below, version history in `wip_patches/README.md`), page-faults on gfx803 in workloads that free and reallocate GPU memory. |
 
 ## How we found the pervasive GEMM bug
 
@@ -1087,10 +1087,15 @@ small-ring version.
 
 ## FIXED (runtime): ROCR va-reuse-defer patch, both gates green
 
-The runtime fix called for above is implemented and validated:
-`patches/rocr/va-reuse-defer.patch` (applied by the sibling `.sh`,
-wired into `Dockerfile` as the `rocr-builder` stage and into CI as the
-`rocr` component). It patches **ROCR-Runtime @ rocm-6.4.4** only -- libhsakmt
+The images do not build this patch. On gfx803 it page-faults in workloads that
+free and reallocate GPU memory (a GEGLU op test, llama-server mid-prompt), and
+the reduce failures it was written for are the stale vector L1 described in
+"FIXED (root cause): stale vector L1 across kernel dispatches" below, fixed in
+CLR. The rest of this section describes the patch and how it was validated.
+
+The runtime fix called for above is implemented and validated against both
+gates: `patches/rocr/va-reuse-defer.patch` (applied by the sibling `.sh`). It
+patches **ROCR-Runtime @ rocm-6.4.4** only -- libhsakmt
 is statically linked into libhsa-runtime64, so no clr/HIP rebuild is needed.
 
 The shipped mechanism is v13 ("park fully alive, busy-flush teardown") --
@@ -1242,8 +1247,11 @@ clean in both. So the ReduceSum failures and the wrong results of small fp32 GEM
 this bug. The "cross-workgroup race" given as the cause of the small-shape row is not
 supported: the same shapes in the same image pass once the cache is invalidated.
 
-Not yet tested: whether the va-reuse-defer runtime patch and the small-shape rocBLAS
-patch can be dropped (the measurements above ran with both rocBLAS patches in the image
-and the stock runtime), the ORT TopK tie-break patch, the faults of the patched
-runtime, and the intermittent training fault (six 300-step runs with the fix were
-clean). The SGEMM shim stays for its speed regardless.
+The va-reuse-defer runtime patch is not needed: every measurement above ran on the
+stock runtime, and the images do not build it (it page-faults on gfx803;
+`docs/FINDINGS.md` section 4). The small-shape rocBLAS patch's detour is not needed
+either: with the fix, every rocBLAS solution for fp32 strided-batched GEMMs of 1 to 16
+cubed, forced one at a time, returns the exact product (same section); that patch is
+still in the images. Not yet tested: the ORT TopK tie-break patch, and whether this bug
+caused the intermittent training fault (25 300-step runs with the fix were clean). The
+SGEMM shim stays for its speed regardless.

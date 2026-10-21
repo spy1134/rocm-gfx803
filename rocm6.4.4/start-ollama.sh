@@ -12,10 +12,6 @@
 #
 # OLLAMA_DATA   models and Ollama's key (default: ollama/ next to this script)
 # OLLAMA_PORT   host port (default 11434)
-# GFX803_RUNTIME=patched  load the base image's patched HSA runtime instead of
-#               AMD's stock one (the default); its va-reuse-defer change faults
-#               ("Page not present") in some workloads that free and reallocate
-#               GPU memory, llama-server among them, so it is for comparison only
 # OLLAMA_KV_CACHE_TYPE  default q8_0; f16 for full precision
 # OLLAMA_KEEP_ALIVE  default -1 (a loaded model stays loaded until it is
 #               unloaded with `ollama stop MODEL`); Ollama's
