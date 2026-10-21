@@ -633,6 +633,28 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-clr-ccache \
 FROM scratch AS clr-export
 COPY --from=clr-builder /clr-out/ /
 
+# ockl.bc rebuilt from ROCm-Device-Libs with the gfx8 signal-atomic patch. gfx803 executes a no-return atomic on
+# fine-grained host memory as a plain store of its operand, so ockl's signal updates never change a signal's
+# value, and device printf and assert() hang in hostcall. Only ockl.bc leaves this stage.
+FROM python-base AS devlibs-builder
+
+ARG ROCM_VERSION
+
+RUN apt-get update && apt-get install -y --no-install-recommends cmake ninja-build rocm-llvm-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --filter=blob:none --no-checkout --depth 1 --branch "rocm-${ROCM_VERSION}" \
+        https://github.com/ROCm/llvm-project.git /llvm-src \
+    && git -C /llvm-src sparse-checkout set amd/device-libs \
+    && git -C /llvm-src checkout
+
+COPY patches/device-libs/ /devlibs-patches/
+RUN sh /devlibs-patches/build-device-libs.sh prepare \
+    && sh /devlibs-patches/build-device-libs.sh build
+
+FROM scratch AS devlibs-export
+COPY --from=devlibs-builder /devlibs-out/ /
+
 FROM python-base AS migraphx-builder
 
 ARG ROCM_VERSION
@@ -1096,6 +1118,10 @@ COPY --from=rocsparse-export /librocsparse.so.1.0.* /opt/rocm/lib/
 # libamdhip64 with the gfx8 cache-maintenance patch; same reasoning as rocSOLVER above. Only the library file:
 # libhiprtc and the other HIP libraries from the same tree stay as in the base image.
 COPY --from=clr-export /libamdhip64.so.6.* /opt/rocm/lib/
+
+# ockl.bc with the gfx8 signal-atomic patch: HIP code compiled in this image links it, so device printf and
+# assert() reach the host. Libraries built in the stages above keep the copy they were linked with.
+COPY --from=devlibs-export /ockl.bc /opt/rocm/amdgcn/bitcode/ockl.bc
 
 # rocm/dev-ubuntu-* doesn't register /opt/rocm/lib with the dynamic linker, so
 # libs are present on disk but unresolvable at runtime without this.

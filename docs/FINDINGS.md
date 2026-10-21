@@ -101,6 +101,9 @@ run with wrong numbers, not a crash. "It runs" was never taken as evidence.
 | No fused attention in PyTorch on gfx803 | ComfyUI node (inference; its GroupNorm and GEGLU are fp32 only) | 6 | `tools/ComfyUI-gfx803-attention/` |
 | Patched HSA runtime page faults | Open; images default to the stock runtime | 4 | `Dockerfile`, start scripts |
 | Kernels read stale data from the per-CU vector L1 after a freed address is reused (silent wrong results in rocBLAS, rocSOLVER, torch.linalg) | Fixed (libamdhip64 rebuilt); decode costs about 2.6% | 4 | `patches/clr/` |
+| Device printf and assert() hang (hostcall's doorbell signal never changes) | Fixed (ockl.bc rebuilt) | 4 | `patches/device-libs/` |
+| No-return atomics on fine-grained host memory store their operand instead (user kernels) | Open (hardware; use the returned value) | 4 | none |
+| A failed assert() in a non-inlined function faults at the trap (queue pointer read from address 0xc8) | Open (compiler) | 4 | none |
 | rocSOLVER and rocSPARSE ship no gfx803 code, so their kernels silently never run | Fixed (rebuilt for gfx803) | 4 | `patches/rocsolver/`, `patches/rocsparse/` |
 | VRAM exhaustion freezes the desktop | Mitigated (VRAM cap) | 7 | `training/gfx803-train.sh` |
 | llama.cpp prompt processing 10x slow | Fixed | 9 | `patches/ollama/llama-cpp/100-*` |
@@ -611,9 +614,82 @@ of 300 calls; with the packet off nearly all of them are wrong in most calls,
 including the assembly kernels that the small-shape rocBLAS patch steers away
 from, so its detour is not needed either. Both are still in the images. The
 faults of the patched HSA runtime have not been explained. The intermittent
-training fault in section 10 has not recurred with the fix, but only six of
-the clean runs used the setup it occurred in, so whether this bug caused it is
-still open.
+training fault in section 10 has not recurred with the fix in 25 runs of the
+setup it occurred in; whether this bug caused it is still open.
+
+### Device printf and assert() hang: no-return atomics on host memory
+
+A HIP kernel that calls `printf`, or an `assert()` that fails (it prints its
+message the same way before trapping), never finishes on gfx803. Nothing is
+printed, `hipDeviceSynchronize` never returns, the GPU stays 100% busy, and
+killing the process is the only way out. PyTorch is not affected because its
+ROCm build turns `CUDA_KERNEL_ASSERT` into `abort()`, which traps without
+printing.
+
+The cause is how atomics on host memory execute. On this RX 590 (Ryzen 7
+2700X host, PCIe atomics enabled), a system-scope atomic read-modify-write on
+fine-grained host memory runs as a plain store of its operand when the
+instruction does not return the old value (`flat_atomic_add_x2` without
+`glc`). Whether other Polaris hosts or newer GPUs behave the same is not
+tested; the patch below changes code generation for gfx8 only. One such atomic applied to a
+`hipHostMallocCoherent` word holding 1 gives these results:
+
+| Operation | Correct result | Result on gfx803 |
+| --- | --- | --- |
+| add 5 | 6 | 5 |
+| sub 1 | 0 | 1 |
+| or 2 | 3 | 2 |
+| and 3 | 1 | 3 |
+| xor 3 | 2 | 3 |
+
+A later GPU read sees the same values, so nothing is held back in L2. The
+returning add and swap are correct. Plain `atomicAdd()` with its result unused
+gives the same wrong value on `hipHostMalloc`'s default allocation, which is
+fine-grained too. A no-return add is correct on `hipHostMallocNonCoherent`,
+`hipMallocManaged`, fine-grained device memory (`hipExtMallocWithFlags`) and
+`hipMalloc`.
+
+HSA signals live in fine-grained host memory, and ockl's
+`__ockl_hsa_signal_add` and its siblings discard the old value, so the compiler
+picks the no-return instructions. Device printf goes through hostcall: the wave
+pushes a packet onto a stack in host memory and rings a doorbell signal with
+`__ockl_hsa_signal_add(doorbell, 1)`. The doorbell starts at 1, and 1 + 1 is
+stored as 1. CLR's listener thread waits for the doorbell's value to change, so
+it never looks at the packet. Read from the process while it hangs, the
+hostcall buffer shows the packet on the ready stack with its ready bit set and
+the doorbell still at its initial value.
+
+[`ockl-gfx8-signal-returning-atomics-6.4.4.patch`](../rocm6.4.4/patches/device-libs/ockl-gfx8-signal-returning-atomics-6.4.4.patch)
+makes ockl's signal updates keep the old value on ISA versions below 9, which
+selects the returning instruction. A Dockerfile stage builds `ockl.bc` from
+the device-libs source at the commit the image's compiler was built from and
+installs it in the final image. Built the same way without the patch, it
+reproduces AMD's shipped `ockl.bc` byte for byte. With the patched bitcode,
+printf from 1 and 64 lanes prints every line and returns `hipSuccess`, and a
+failed `assert()` prints `Device-side assertion ... failed` and ends the
+process. Only code compiled with hipcc or clang in the final image links the new
+bitcode. Libraries built in the earlier stages keep the copy they were linked
+with, and kernels compiled at run time through hiprtc (comgr, which MIOpen also
+uses) link the copy embedded in `libamd_comgr`, which is unchanged.
+
+Two problems remain:
+
+- A user kernel that applies a no-return atomic to fine-grained host memory
+  (including `atomicAdd()` on memory from a plain `hipHostMalloc`) still gets
+  the wrong value. Use the returned value, or keep such counters in
+  device memory. A compiler change would fix it everywhere; this image does not
+  rebuild the compiler.
+- A failed `assert()` ends with `Memory access fault ... on address (nil)`
+  instead of a clean trap report. On gfx8 the trap handler expects the queue
+  pointer in `s[0:1]` at `s_trap`. A trap inside a function that is not
+  inlined (`__assert_fail`) loads it from address 0xc8, the implicit-argument
+  offset with no base, while a trap in the kernel body loads it from the
+  kernel arguments. This is a compiler bug, not fixed here. The process still
+  ends with the assertion message printed.
+
+To check, build a kernel in which one lane calls `printf("x\n")` and
+synchronize. Without the patched `ockl.bc` the program hangs; with it the line
+prints and the call returns.
 
 ### rocSOLVER and rocSPARSE had no gfx803 code
 
@@ -1377,11 +1453,13 @@ a reproduction.
   upper half, or at a mapping that is briefly absent, and not at a plain
   out-of-bounds index. The kernel is not identified. Sections 2 and 4 describe
   the known sources of faults of this kind on this card; the stale vector L1 of
-  section 4 would produce a stale upper half. With that fix, six 300-step runs
-  in the setup the faults occurred in completed without a fault, which at the
-  old rate of 2 in 16 happens about 45% of the time and so says little. About
-  23 clean runs in that setup would put its rate below 1 in 8 with 95%
-  confidence; its 7.2-7.9 GB peak needs a low-VRAM desktop or none. The
+  section 4 would produce a stale upper half. With that fix, 25 300-step runs
+  in the setup the faults occurred in completed without a fault (six
+  earlier, and nineteen with no desktop on kernel 6.18.57: sixteen with
+  compute-wave save and restore on and three with it off). At the old rate of 2
+  in 16, 25 clean runs in a row happen about 4% of the time, so the fault is
+  either gone or several times rarer. The faulting runs were on an older
+  kernel (6.18.55), so the clean runs do not single out the fix as the cure. The
   default setup has changed since: `gfx803-train` now runs the fused attention
   kernels, and in it fourteen 300-step and two 1200-step runs (fp32 and fp16)
   completed without a fault. Those runs do not execute PyTorch's attention

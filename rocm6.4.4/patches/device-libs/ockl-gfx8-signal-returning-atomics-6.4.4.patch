@@ -1,0 +1,105 @@
+ROCm-Device-Libs (ockl), ROCm 6.4.4: on gfx8, device-side updates of an HSA
+signal never change its value, so device printf, assert() messages and every
+other hostcall service hang forever.
+
+WHY
+---
+gfx803 executes a system-scope atomic read-modify-write on fine-grained host
+memory as a plain store of its operand when the instruction does not return
+the old value (flat_atomic_add_x2 without glc). Measured on an RX 590 with a
+kernel that applies one no-return atomic to a hipHostMallocCoherent word
+holding 1: add 5 leaves 5, or 2 leaves 2, and 3 leaves 3, xor 3 leaves 3, sub
+1 leaves 1. A later GPU read sees the same values, so nothing is left in L2.
+The returning add is correct, swap is correct, and a no-return add is
+correct on coarse-grained host memory and on device memory.
+
+HSA signals live in fine-grained host memory, and ockl's
+__ockl_hsa_signal_{add,sub,and,or,xor} discard the old value, so the compiler
+selects the no-return instructions. Hostcall rings its doorbell with
+__ockl_hsa_signal_add(doorbell, 1): the value 1 (SIGNAL_INIT) is written back
+as 1. CLR's hostcall listener waits for the value to change, so it never wakes.
+The wave has already pushed its packet (ready_stack is non-zero, the packet's
+control word has its ready bit set) and waits for the reply forever, the host
+thread waits in hipDeviceSynchronize, and the GPU stays 100% busy.
+
+Keeping the old value selects the returning instruction, which the hardware
+executes atomically. The empty asm statement consumes the result only on
+ISA versions below 9, so other targets compile as before.
+
+To reproduce, build a kernel in which one lane calls printf("x\n") and
+synchronize: without the patch the program never returns, with it the line
+prints and hipDeviceSynchronize returns hipSuccess (1 and 64 printing lanes).
+A failed assert() prints "Device-side assertion `...' failed." and the process
+exits with the trap instead of hanging.
+
+The same hardware behaviour also affects user kernels that apply a no-return
+atomic to fine-grained host memory. That needs a compiler change, and this
+patch does not cover it.
+
+diff --git a/amd/device-libs/ockl/src/hsaqs.cl b/amd/device-libs/ockl/src/hsaqs.cl
+index f98ef33..b3d97a4 100644
+--- a/amd/device-libs/ockl/src/hsaqs.cl
++++ b/amd/device-libs/ockl/src/hsaqs.cl
+@@ -17,6 +17,17 @@
+ #define AL(T,P,O,S) __opencl_atomic_load(P,O,S)
+ #define AS(P,V,O,S) __opencl_atomic_store(P,V,O,S)
+ #define AF(T,K,P,V,O,S) __opencl_atomic_fetch_##K(P,V,O,S)
++
++// gfx8 executes a system-scope atomic read-modify-write on fine-grained host
++// memory as a plain store of its operand when the instruction does not return
++// the old value (1 + 1 is written as 1). Signals live in such memory, so an
++// update whose result is unused would never change the value the host waits
++// on. Keeping the result selects the returning instruction, which is atomic.
++#define AF_SIGNAL(T,K,P,V,O,S) do { \
++    T r_ = AF(T,K,P,V,O,S); \
++    if (__oclc_ISA_version < 9000) \
++        __asm__ volatile("" :: "v"(r_)); \
++} while (0)
+ #define AX(T,P,V,O,S) __opencl_atomic_exchange(P,V,O,S)
+ #define AC(P,E,V,O,R,S) __opencl_atomic_compare_exchange_strong(P,E,V,O,R,S)
+ 
+@@ -91,7 +102,7 @@ ATTR void
+ OCKL_MANGLE_T(hsa_signal,add)(hsa_signal_t sig, long value, __ockl_memory_order mem_order)
+ {
+     __global amd_signal_t *s = (__global amd_signal_t *)sig.handle;
+-    AF(long, add, (__global atomic_long *)&s->value, value, mem_order, memory_scope_all_svm_devices);
++    AF_SIGNAL(long, add, (__global atomic_long *)&s->value, value, mem_order, memory_scope_all_svm_devices);
+     update_mbox(s);
+ }
+ 
+@@ -99,7 +110,7 @@ ATTR void
+ OCKL_MANGLE_T(hsa_signal,and)(hsa_signal_t sig, long value, __ockl_memory_order mem_order)
+ {
+     __global amd_signal_t *s = (__global amd_signal_t *)sig.handle;
+-    AF(long, and, (__global atomic_long *)&s->value, value, mem_order, memory_scope_all_svm_devices);
++    AF_SIGNAL(long, and, (__global atomic_long *)&s->value, value, mem_order, memory_scope_all_svm_devices);
+     update_mbox(s);
+ }
+ 
+@@ -107,7 +118,7 @@ ATTR void
+ OCKL_MANGLE_T(hsa_signal,or)(hsa_signal_t sig, long value, __ockl_memory_order mem_order)
+ {
+     __global amd_signal_t *s = (__global amd_signal_t *)sig.handle;
+-    AF(long, or, (__global atomic_long *)&s->value, value, mem_order, memory_scope_all_svm_devices);
++    AF_SIGNAL(long, or, (__global atomic_long *)&s->value, value, mem_order, memory_scope_all_svm_devices);
+     update_mbox(s);
+ }
+ 
+@@ -115,7 +126,7 @@ ATTR void
+ OCKL_MANGLE_T(hsa_signal,xor)(hsa_signal_t sig, long value, __ockl_memory_order mem_order)
+ {
+     __global amd_signal_t *s = (__global amd_signal_t *)sig.handle;
+-    AF(long, xor, (__global atomic_long *)&s->value, value, mem_order, memory_scope_all_svm_devices);
++    AF_SIGNAL(long, xor, (__global atomic_long *)&s->value, value, mem_order, memory_scope_all_svm_devices);
+     update_mbox(s);
+ }
+ 
+@@ -132,7 +143,7 @@ ATTR void
+ OCKL_MANGLE_T(hsa_signal,subtract)(hsa_signal_t sig, long value, __ockl_memory_order mem_order)
+ {
+     __global amd_signal_t *s = (__global amd_signal_t *)sig.handle;
+-    AF(long, sub, (__global atomic_long *)&s->value, value, mem_order, memory_scope_all_svm_devices);
++    AF_SIGNAL(long, sub, (__global atomic_long *)&s->value, value, mem_order, memory_scope_all_svm_devices);
+     update_mbox(s);
+ }
+ 

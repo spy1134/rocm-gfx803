@@ -134,6 +134,11 @@ gives each problem's symptom, cause, fix and how to reproduce the check.
   cannot preempt the halted wave and resets the GPU, which clears VRAM for every
   program using the card (see "A device-side trap resets the GPU" in
   [`docs/FINDINGS.md`](docs/FINDINGS.md)).
+- An atomic on fine-grained host memory (a plain `hipHostMalloc`, or
+  `hipHostMallocCoherent`) whose result a kernel does not use stores its
+  operand instead of updating the value: `atomicAdd()` of 5 to 1 leaves 5. Use the returned value or keep such counters in
+  device memory. The image's patched `ockl.bc` does this for HSA signals, which
+  is what makes device `printf` and `assert()` messages work.
 - Mining-edition cards often ship with memory clocked above its rating, which
   causes random faults and freezes. Check the memory clock first (see "Host
   VBIOS setting" in [`README-rocm10.md`](README-rocm10.md)).

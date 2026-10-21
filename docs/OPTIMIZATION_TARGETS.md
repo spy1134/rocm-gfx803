@@ -872,7 +872,7 @@ session.
 | fp32 SD 1.5 image (35 -> 10.5 s; 644 and 526 ms per step) | front page, FINDINGS "Speed, start to finish" | SD-6 and SD-9 attention, stale-L1 fix | ComfyUI `--force-fp32`, warm images |
 | The memory bandwidth bound | card table, LLM-5 | LLM-5's estimates take the 222-229 GB/s of q8_0 and f16 matmuls as the bound; no read-only streaming kernel has measured it at sustained clocks | a read-only streaming kernel at sustained clocks |
 | `test-backend-ops`, full suite | Verifying a change | stale-L1 fix (FINDINGS section 4 has `SOLVE_TRI` passing with it), patches 108-112 | the full suite in the current Ollama image against the CPU backend |
-| The intermittent training fault | FINDINGS section 10 | stale-L1 fix: six clean 300-step runs in the setup it occurred in (fp32, PyTorch's attention); the default setup's 16 clean runs use the fused attention instead | about 23 clean runs in the original setup put its rate below 1 in 8 with 95% confidence; peak 7.2-7.9 GB |
+| The intermittent training fault | FINDINGS section 10 | stale-L1 fix: 25 clean 300-step runs in the setup it occurred in (fp32, PyTorch's attention), against an old rate of 2 in 16; the default setup's 16 clean runs use the fused attention instead | the kernel also changed (6.18.55 to 6.18.57), so a run on the old kernel without the fix would be needed to credit either |
 | Kernel TFLOPS in BLAS-1 to BLAS-6 and BLAS-7's ablations | Done, BLAS-7 | short timings at the boost clock (10-20% high) | re-time only where a decision depends on the absolute value |
 
 ## Done
