@@ -171,7 +171,7 @@ Open targets in recommended order, then the done ones.
 
 | Target | Area | Expected gain | Status |
 | --- | --- | --- | --- |
-| LLM-6 | MoE prompts: expert copies, MUL_MAT_ID, dense parts | copies overlap compute since patch 108 (pp2048 295 -> 367 tok/s, against 376 with no copies at all); DeltaNet recurrence (patch 117: pp2048 361 -> 455 tok/s); expert matmuls, 62% of GPU time after 117, as a grouped fp32 GEMM (patch 118: pp2048 450 -> 547, pp512 234 -> 275); expert reduction (patch 119: +2.6%); a third prefetch slot (patch 126: pp2048 565 -> 599, pp512 282 -> 331). The copies run at the link limit (13.3 GB/s, 18.2 GiB per 2048-token batch) and with three slots they are hidden: skipping them altogether (timing-only build) gives 630 against 593 tok/s, so a prompt batch is bound by GPU compute, three quarters of it the dense fp32 GEMMs (gfx803 SGEMM) and the expert GEMMs. 4096-token batches add 4% on 4096- and 8192-token prompts with three slots (8% with two), too little for an Ollama batch-size patch and a compute buffer about 1 GiB larger | Open: dense and expert GEMM efficiency |
+| LLM-6 | MoE prompts: expert copies, MUL_MAT_ID, dense parts | copies overlap compute since patch 108 (pp2048 295 -> 367 tok/s, against 376 with no copies at all); DeltaNet recurrence (patch 117: pp2048 361 -> 455 tok/s); expert matmuls, 62% of GPU time after 117, as a grouped fp32 GEMM (patch 118: pp2048 450 -> 547, pp512 234 -> 275); expert reduction (patch 119: +2.6%); a third prefetch slot (patch 126: pp2048 565 -> 599, pp512 282 -> 331). The copies run at the link limit (13.3 GB/s, 18.2 GiB per 2048-token batch) and with three slots they are hidden: skipping them altogether (timing-only build) gives 630 against 593 tok/s, so a prompt batch is bound by GPU compute, three quarters of it the dense fp32 GEMMs (gfx803 SGEMM) and the expert GEMMs. The fp32 two-wavefront tile (BLAS-7) and padded output rows for 8192-row matmuls (patch 127) take the dense GEMMs from about 4.0 to 4.6-5.3 TFLOPS: pp2048 about 599 -> 615; through Ollama (2,800-token prompt, a 2048- and a 752-token batch) 516 -> 519. 4096-token batches add 4% on 4096- and 8192-token prompts with three slots (8% with two), too little for an Ollama batch-size patch and a compute buffer about 1 GiB larger | Open: dense and expert GEMM efficiency |
 | RT-1 | Cost of the vector-L1 invalidate before every dispatch | 1.65 us per dispatch: ~2.4 ms of an MoE token (~6%), 2.3-2.7% of dense decode, ~2.4 ms of an SD 1.5 step. The cost is the extra ring slot, not the cache work: an empty-kernel dispatch costs 4.27-4.30 us with the shipped packet, with only the L1 bit, with poll interval 1, and with the L1 action moved onto the slot's RELEASE_MEM (no ACQUIRE_MEM), against 2.65 us without the slot | Measured, no cheaper packet; only fewer slots would help, and skipping the invalidate between kernels is not provably correct |
 | LLM-5 | Dense decode above the bandwidth bound | per 36 ms token: K-quant kernels ~2.9 ms, flash-attention decode ~2.6 ms at 5k depth, F16 `attn_v` ~1 ms, launches ~1 ms by fusion; the same kernels make up MoE generation's GPU part | Open, measured before the stale-L1 fix and patch 111 |
 | LLM-8 | MoE generation with experts in system RAM | Qwen3.6 35B-A3B, 39 ms per token before patches 113-116 (25.6 tok/s, llama-bench with a cold page cache): CPU experts ~16.7 ms, GPU kernels ~12 ms, ~1,425 dispatches at ~4.3 us each (~6 ms), hand-offs ~3 ms; 113-116 remove up to 300 dispatches per token (25.60 -> 27.51 tok/s), 120-125 another 320 (+0.9%, +2.0%, +0.7%); CPU experts run at ~91% of practical DDR4 bandwidth (36.5 GB/s): strict thread pinning lost 21%, the AVX2 repacked layout gained nothing; 6-8 expert layers resident in VRAM give +9% (llama.cpp's fit does this by itself when the VRAM is free) | Open: RMS norm + multi-section rope fusion (did not fire) |
@@ -180,7 +180,7 @@ Open targets in recommended order, then the done ones.
 | SD-12 | SDXL VAE decode at 1024 px | 12-25 s of an 83-99 s image, by VAE precision | Open, measured end to end |
 | SD-2 | Winograd F(4x4, 3x3) in the gfx803 HIP solver | estimate ~25 ms (7%) of an fp16 SD 1.5 step, more at SDXL; precision and small latents unknown | Open, estimate |
 | TRAIN-3 | Where a training step goes | unmeasured; fp16 NT GEMMs still run on the older tiles | Open, profile first |
-| BLAS-7 | Shim GEMM efficiency at SD 1.5 / SDXL shapes | fp16 dispatch fixes, fp16 widening, a one-wavefront tile for batched NN and a two-wavefront TN tile took the SD 1.5 step 415 -> 355 ms, SDXL 3.34 -> 2.84 s; left: a faster main tile, a 64x64 two-wavefront tile for few-tile TN calls | Open, measured |
+| BLAS-7 | Shim GEMM efficiency at SD 1.5 / SDXL shapes | fp16 dispatch fixes, fp16 widening, a one-wavefront tile for batched NN and a two-wavefront TN tile took the SD 1.5 step 415 -> 355 ms, SDXL 3.34 -> 2.84 s; the two-wavefront tile also takes fp32 TN (8-23% faster at llama.cpp's prompt shapes and SD's fp32 linears); left: a faster main tile, a 64x64 two-wavefront tile for few-tile TN calls | Open, measured |
 | SD-9 | SDXL attention | P now moves between lanes inside the multiply-adds (DPP): SDXL step attention 0.50 -> 0.42 s (step 2.84 -> 2.75 s), SD 1.5 91 -> 79 ms (step 355 -> 342 ms); self-attention at ~4 TFLOPS against ~5.4 for its instruction mix | Open, measured |
 | LLM-10 | Image prompts | a 1080p image (~2000 tokens) 56 s, against ~15 s for 2000 text tokens (Qwen3.5 9B) | Open, unmeasured |
 | SD-7 | Fused Winograd F(2x2, 3x3) | fp16 SD at most ~9 ms per step (2%); fp32 and training unmeasured | Open, low |
@@ -638,6 +638,25 @@ in short timings at the boost clock 5120x8192x640 13.9 -> 10.1 ms and
 the tile forced on every call it supports, and on 25 more with K a multiple
 of 16 but not 32, padded leading dimensions, offsets and batches. fp16 UNet
 step: SDXL 2.98 -> 2.84 s, SD 1.5 359 -> 355 ms.
+
+The same tile takes fp32 TN calls under the same rule. At fp32 a 16-deep
+slice holds 24 VGPRs of next-slice values and spills 52 bytes per lane
+(8192x2048x2048 at 2.1 TFLOPS), so fp32 slices are 8 deep: the same 32
+bytes per row as fp16, float4 loads, 124 VGPRs, no scratch. Best of three
+alternating runs against the 64x64 tile, random data: llama.cpp's prompt
+GEMMs (rows padded by 16 floats) 4096x2048x2048 8.62 -> 7.61 ms,
+2048x2048x4096 8.04 -> 7.42, 2048x2048x512 1.03 -> 0.93; SD's fp32 linears
+10240x512x1280 3.21 -> 2.62, 5120x2048x640 3.01 -> 2.57, 2560x8192x320 3.21
+-> 2.87, 10240x2048x1280 13.70 -> 11.86. Outputs whose columns lie a
+multiple of 32 KiB apart stay on the 64x64 tile: a store instruction of the
+two-wavefront tile covers 8 columns, all then in one DRAM channel, and
+8192x2048x2048 took 19.0 ms against 17.6 (14.0 ms with the stores removed,
+the same as at 8064 and 8320 rows; 14.7 ms with the columns 16 floats
+further apart, which llama.cpp patch 127 arranges). Bit-identical to the
+previous shim on the 478 cases and 16 more at llama.cpp's shapes, with the
+rule and with the tile forced on every call it supports. Qwen3.6 35B-A3B
+pp2048 (llama-bench, experts in RAM): 584 / 574 -> 603 / 592 tok/s with the
+desktop busy, and with patch 127 on top 602 / 602 -> 616 / 615.
 
 SDXL's 1280-wide linears have too few 64x128 tiles for the rule (320 for
 1280x2048) and stay on the 64x64 tile, at 4.1-4.6 TFLOPS sustained:

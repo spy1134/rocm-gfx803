@@ -878,7 +878,13 @@ SDXL UNets in fp16 match fp32 to about 1e-3.
   the two wavefronts share 16-deep slices instead (SDXL TN 10240x2048x1280
   12.4 -> 10.2 ms at the sustained clock; 5120x8192x640 13.9 -> 10.1 ms in
   a short timing at the boost clock). Bit-identical; fp16 UNet
-  step SDXL 2.98 -> 2.84 s, SD 1.5 359 -> 355 ms.
+  step SDXL 2.98 -> 2.84 s, SD 1.5 359 -> 355 ms. It takes fp32 TN calls
+  too, with 8-deep slices (the same 32 bytes per row; 16-deep fp32 slices
+  spill), 8-23% faster than the 64x64 tile on llama.cpp's prompt GEMMs and
+  SD's fp32 linears. Its stores of an output whose columns lie a multiple
+  of 32 KiB apart all hit one DRAM channel (8192x2048x2048 19.0 ms against
+  17.6 on the 64x64 tile), so such fp32 calls keep the 64x64 tile, and
+  llama.cpp patch 127 gives its 8192-row outputs padded columns (14.7 ms).
 - The node's fused attention runs one wave per SIMD, so every instruction
   besides its multiply-adds costs it time, and fetching the softmax
   probabilities from other lanes with `ds_bpermute` (128 per 32-key tile)

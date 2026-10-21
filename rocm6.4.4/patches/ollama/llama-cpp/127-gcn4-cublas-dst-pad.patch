@@ -1,0 +1,71 @@
+llama.cpp (as fetched by Ollama v0.35.1, llama.cpp b11232, applied after
+126): on gfx803, a prompt matmul whose output rows are a multiple of 32 KiB
+apart writes into padded rows first.
+gfx803-specific: engages only where patch 106 dequantizes into padded rows
+(GCN4).
+
+WHY
+---
+Patch 106 runs quantized prompt matmuls as fp32 GEMMs on the base image's
+gfx803 SGEMM and pads the weight and activation rows by 16 floats, because
+row strides that are multiples of 8 KiB put every row of a GEMM tile in one
+DRAM channel. The output keeps its natural stride, the matmul's ne0. With
+ne0 = 8192 (a Qwen3.6 35B-A3B DeltaNet input projection, 40 calls per
+2048-token batch) the columns of C lie 32 KiB apart, and the SGEMM's stores
+then all land in one channel: on an RX 590, 8192 x 2048 x 2048 TN takes
+17.6 ms with the 64x64 tile and 19.0 ms with the two-wavefront tile, against
+14.7 ms with the two-wavefront tile when the columns are 16 floats further
+apart. The same GEMM with its stores removed takes 14.0 ms at 8064, 8192
+and 8320 rows alike, so the loss is in the stores alone.
+
+WHAT
+----
+In ggml_cuda_mul_mat_cublas_impl, when patch 106's padded dequantization is
+in use, the call is a single fp32 GEMM with more than one column, and ne0
+floats are a multiple of 32 KiB, the GEMM writes into a pool buffer with
+rows of ne0 + 16 floats and cudaMemcpy2DAsync moves the result to dst
+(0.65 ms for 8192 x 2048). The values are the same; only where the GEMM
+stores them changes. Strides of 8 and 16 KiB (2048 and 4096 rows) gained
+nothing measurable from the padding and keep the direct store.
+
+Measured on an RX 590 (Qwen3.6 35B-A3B Q4_K_M, every expert in system RAM,
+llama-bench -ncmoe 99, 2048-token batches, HSA_ENABLE_SDMA=1
+ROC_CPU_WAIT_FOR_SIGNAL=1, with the base image's two-wavefront fp32 tile,
+two alternating rounds): pp2048 602.5 / 602.0 -> 615.8 / 615.3 tok/s
+(+2.2%). llama-perplexity at 2048-token batches gives per-chunk values
+equal to those of the build without the patch. Through Ollama (2,800-token
+prompt, one 2048-token batch and one of 752, together with the base
+image's fp32 two-wavefront tile, two rounds): prompts 516.8 / 515.8 ->
+518.8 / 518.5 tok/s, generation unchanged, greedy output identical on
+Qwen3.6 35B-A3B and Qwen3 8B. The 752-token batch gains nothing: the
+two-wavefront tile takes only column counts that are multiples of 128,
+and a batch that short spends most of its time on the expert copies.
+
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1567,7 +1567,24 @@
+     // Theoretically cublasGemmStridedBatchedEx would always work, even for a single matrix.
+     // However, for some old NVIDIA and AMD GPUs the strided/Ex GEMM is much slower,
+     //     probably because the internal kernel selection logic is suboptimal.
+-    if (compute_type == GGML_TYPE_F32 && ne12 == 1 && ne13 == 1) {
++    // On gfx803 the SGEMM's stores of an output whose columns lie a multiple
++    // of 32 KiB apart (8192 rows) all land in one DRAM channel: 8192 x 2048 x
++    // 2048 takes 19.0 ms that way and 14.7 ms with columns 16 floats further
++    // apart. The product goes to padded columns and a 2D copy (0.65 ms) moves
++    // it to dst.
++    if (compute_type == GGML_TYPE_F32 && ne12 == 1 && ne13 == 1 && gcn4_to_fp32_ld != nullptr && ne11 > 1 &&
++            (ne0*sizeof(float)) % 32768 == 0) {
++        const int64_t ldd = ne0 + 16;
++        ggml_cuda_pool_alloc<float> gcn4_dst_pad(ctx.pool(), ldd*ne11);
++        CUBLAS_CHECK(
++            cublasSgemm(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
++                    ne01, ne11, ne10,
++                    (const float *) alpha, (const float *) src0_ptr, s01,
++                                           (const float *) src1_ptr, s11,
++                    (const float *) beta,  gcn4_dst_pad.get(), ldd));
++        CUDA_CHECK(cudaMemcpy2DAsync(dst_ptr, ne0*sizeof(float), gcn4_dst_pad.get(), ldd*sizeof(float), ne0*sizeof(float), ne11,
++            cudaMemcpyDeviceToDevice, main_stream));
++    } else if (compute_type == GGML_TYPE_F32 && ne12 == 1 && ne13 == 1) {
+         CUBLAS_CHECK(
+             cublasSgemm(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
+                     ne01, ne11, ne10,

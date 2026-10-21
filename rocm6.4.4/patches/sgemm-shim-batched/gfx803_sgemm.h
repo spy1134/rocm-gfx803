@@ -53,7 +53,8 @@
 // (or 8x4) block per thread, and no barrier; it takes the fp16 batched calls
 // that gfx803_w_applies picks from the 64x64 tiles.
 // gfx803_w2_kernel computes a 64x128 tile with two wavefronts sharing the A
-// piece; it takes the fp16 TN calls (nn.Linear) that gfx803_w2_applies picks.
+// piece; it takes the TN calls (nn.Linear, llama.cpp's prompt matmuls) that
+// gfx803_w2_applies picks.
 // gfx803_sgemm_small_n_kernel takes GEMMs with at most 8 columns of C and
 // op(A) = T, a token-by-token decode step's nn.Linear, as a GEMV; it sums in
 // a different order than the tiles (see the comment there).
@@ -1700,8 +1701,8 @@ gfx803_w_kernel(int GW, int M, int N, int K, float alpha,
                                                    row0, col0, pz, As, Bs);
 }
 
-// Two wavefronts per tile: gfx803_w2_kernel computes a 64x128 tile of an fp16
-// TN product (both operands contiguous in K), each wavefront a 64x64 half with
+// Two wavefronts per tile: gfx803_w2_kernel computes a 64x128 tile of a TN
+// product (both operands contiguous in K), each wavefront a 64x64 half with
 // the 8x8-per-thread layout of gfx803_w_tile, the two sharing the A piece.
 //
 // Why: gfx803_w_kernel fetches 8-deep K pieces, 16 bytes of each 64-byte
@@ -1712,7 +1713,9 @@ gfx803_w_kernel(int GW, int M, int N, int K, float alpha,
 // slice while the current one is multiplied. One LDS buffer (12 KiB) leaves
 // room for four workgroups per CU, two wavefronts per SIMD. The barriers
 // drain the outstanding loads, which by then have had a whole slice (1024
-// multiply-adds per lane) to arrive.
+// multiply-adds per lane) to arrive. fp32 slices are 8 deep, the same 32
+// bytes per row: 16-deep fp32 slices hold 24 VGPRs of next-slice values,
+// spill 52 bytes per lane and ran 8192x2048x2048 at 2.1 TFLOPS.
 //
 // Each output accumulates its K products one at a time in increasing k, as in
 // the other tiles, and pz adds the +0 those would have padded, so results are
@@ -1725,9 +1728,9 @@ gfx803_w2_kernel(int M, int N, int K, float alpha,
                  const E* __restrict__ A, int lda, int64_t strideA,
                  const E* __restrict__ B, int ldb, int64_t strideB,
                  float beta, E* __restrict__ C, int ldc, int64_t strideC, int pz) {
-    static_assert(sizeof(E) == 2, "fp16 operands");
-    constexpr int KH = GFX803_W2_KH;
-    typedef E vec __attribute__((ext_vector_type(8)));
+    constexpr int KH = sizeof(E) == 2 ? GFX803_W2_KH : GFX803_W2_KH / 2;
+    constexpr int VE = KH / 2;
+    typedef E vec __attribute__((ext_vector_type(VE)));
     __shared__ float As[KH][64];
     __shared__ float Bs[KH][128];
     const int64_t bz = (int64_t)blockIdx.z;
@@ -1736,7 +1739,7 @@ gfx803_w2_kernel(int M, int N, int K, float alpha,
     C += bz * strideC;
     const int gx = M / 64;
     const int row0 = (blockIdx.x % gx) * 64, col0 = (blockIdx.x / gx) * 128;
-    const int t = threadIdx.x, r = t >> 1, kq = (t & 1) * 8;
+    const int t = threadIdx.x, r = t >> 1, kq = (t & 1) * VE;
     const E* pa = A + (size_t)(row0 + r) * lda + kq;
     const E* pb0 = B + (size_t)(col0 + r) * ldb + kq;
     const E* pb1 = B + (size_t)(col0 + 64 + r) * ldb + kq;
@@ -1753,7 +1756,7 @@ gfx803_w2_kernel(int M, int N, int K, float alpha,
     };
     auto store = [&]() {
         #pragma unroll
-        for (int e = 0; e < 8; e++) {
+        for (int e = 0; e < VE; e++) {
             As[kq + e][r] = static_cast<float>(ra[e]);
             Bs[kq + e][r] = static_cast<float>(rb0[e]);
             Bs[kq + e][64 + r] = static_cast<float>(rb1[e]);
@@ -1836,19 +1839,28 @@ inline long gfx803_sgemm_cus() {
     return cus;
 }
 
-// The calls gfx803_w2_kernel takes: fp16 TN with whole 64x128 tiles, K a
+// The calls gfx803_w2_kernel takes: TN with whole 64x128 tiles, K a
 // multiple of 16, and at least three rounds of tiles over the CUs' four
 // workgroup slots each. On an RX 590 it ran SDXL's large linears 18% faster
-// at the sustained clock (TN 10240x2048x1280: 12.4 -> 10.2 ms)
-// and calls with fewer tiles up to 64% slower: a 64x128 tile is twice the
-// work of the 64x64 tiles it replaces, so a call with few of them leaves
-// CUs idle in its last round. GFX803_SGEMM_W2 overrides the rule for timing:
-// 0 = never, 1 = every call whose shape it supports.
-inline bool gfx803_w2_applies(int M, int N, int K, int batch, bool transA, bool transB, size_t elem) {
+// at the sustained clock (TN 10240x2048x1280: 12.4 -> 10.2 ms), fp32 TN
+// 8-23% faster than the 64x64 tile (llama.cpp's 4096x2048x2048 8.6 -> 7.6
+// ms), and calls with fewer tiles up to 64% slower: a 64x128 tile is twice
+// the work of the 64x64 tiles it replaces, so a call with few of them leaves
+// CUs idle in its last round. fp32 outputs whose columns lie a multiple of
+// 32 KiB apart stay on the 64x64 tile: a store instruction of this tile
+// covers 8 columns, all of them then in the same DRAM channel, and
+// 8192x2048x2048 took 19.0 ms against 17.6 (14.7 with the columns 16 floats
+// further apart). GFX803_SGEMM_W2 overrides the rule for timing: 0 = never,
+// 1 = every call whose shape it supports.
+inline bool gfx803_w2_applies(int M, int N, int K, int batch, bool transA, bool transB, int ldc, size_t elem) {
     static const long mode = gfx803_sgemm_env_long("GFX803_SGEMM_W2", -1);
-    if (mode == 0 || elem != 2 || !transA || transB || M % 64 != 0 || N % 128 != 0 || K % GFX803_W2_KH != 0)
+    if (mode == 0 || !transA || transB || M % 64 != 0 || N % 128 != 0 || K % GFX803_W2_KH != 0)
         return false;
-    return mode == 1 || (long)(M / 64) * (N / 128) * batch >= 3 * 4 * gfx803_sgemm_cus();
+    if (mode == 1)
+        return true;
+    if (elem == 4 && (int64_t)ldc * 4 % 32768 == 0)
+        return false;
+    return (long)(M / 64) * (N / 128) * batch >= 3 * 4 * gfx803_sgemm_cus();
 }
 
 // Tile width for gfx803_w_kernel: 64x64 tiles unless 64x32 tiles fill the
@@ -2013,8 +2025,8 @@ inline hipError_t gfx803_gemm_strided_batched(int M, int N, int K,
         return hipSuccess;
     }
     const int tile = gfx803_sgemm_pick_tile(M, N, K, batch_count, sizeof(T) == 2);
-    if constexpr (sizeof(T) == 2) {
-        if (gfx803_w2_applies(M, N, K, batch_count, transA, transB, sizeof(T)) &&
+    {
+        if (gfx803_w2_applies(M, N, K, batch_count, transA, transB, ldc, sizeof(T)) &&
             (int64_t)(M / 64) * (N / 128) <= 0x7fffffff) {
             const int kt_old = gfx803_sgemm_g_applies<T>(tile, M, K, lda, transA, ldb, transB) ? 32 : GFX803_SGEMM_BIG_K;
             (void)hipGetLastError();

@@ -555,6 +555,17 @@ measurements and a reproduction. In short:
   Where llama.cpp's fit keeps some experts in VRAM, the extra slot moves
   about 290 MiB of them back to RAM, so those run on the CPU and the greedy
   text can differ from a 2-slot run at a near-tie.
+- **127-gcn4-cublas-dst-pad.patch**: 106 pads the weight and activation rows
+  of a prompt matmul, but the output kept its natural stride, and with 8192
+  rows (Qwen3.6's DeltaNet input projection) the output's columns lie 32 KiB
+  apart, which puts all of the SGEMM's stores in one DRAM channel
+  (8192 x 2048 x 2048: 19.0 ms, 14.7 ms with padded columns). Such outputs
+  now go to padded rows and a 2D copy moves them to the tensor. With the base
+  image's fp32 two-wavefront tile: pp2048 602 -> 616 tok/s (+2.2%),
+  perplexity equal at every chunk. Through Ollama, where a 2,800-token
+  prompt runs as a 2048- and a 752-token batch and only the first gains,
+  the tile and this patch together give 516 -> 519 tok/s; greedy output
+  identical. gfx803 only (where 106 pads).
 - **113-116: fewer dispatches per generated token.** On gfx803 every GPU
   dispatch costs about 4.3 us of command-processor time however small the
   kernel, and a Qwen3.6 35B-A3B token issues about 1,425 of them. Four
@@ -681,7 +692,7 @@ GPU:
   now twice the first discovery's duration, between 3 and 30 s; GPUs that start
   quickly keep 3 s.
 
-The llama.cpp kernel patches 100-104, 106 and 118 are gfx803-only by
+The llama.cpp kernel patches 100-104, 106, 118 and 127 are gfx803-only by
 construction: each takes effect only for `GGML_CUDA_CC_GCN4` or `__gfx803__` and
 is sized from gfx803 register and bandwidth measurements. 105 changes q5_K's dot
 product for every GPU, with the same arithmetic. 107, 108, 111-117, 119-126, 090

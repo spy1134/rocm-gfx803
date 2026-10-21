@@ -154,6 +154,9 @@ RUN CC=/opt/rocm/llvm/bin/clang CXX=/opt/rocm/llvm/bin/clang++ \
     && { grep -qF ggml_cuda_op_sigmoid_mul_strided \
              build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/unary.cu \
          || { echo "125-attn-gate-strided.patch was not applied" >&2; exit 1; }; } \
+    && { grep -qF gcn4_dst_pad \
+             build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/ggml-cuda.cu \
+         || { echo "127-gcn4-cublas-dst-pad.patch was not applied" >&2; exit 1; }; } \
     && { grep -q ggml_backend_sched_prefetch_split \
              build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-backend.cpp \
          || { echo "108-moe-expert-prefetch.patch was not applied" >&2; exit 1; }; } \
