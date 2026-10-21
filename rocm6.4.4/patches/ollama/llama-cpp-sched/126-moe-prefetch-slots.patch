@@ -54,7 +54,10 @@ Q4_K_M, -ncmoe 99, HSA_ENABLE_SDMA=1, ROC_CPU_WAIT_FOR_SIGNAL=1, tok/s):
 Host time per 2048-token batch: the scheduler thread's wait for the
 slot's previous compute fell from 2024 to 1797 ms, the copy record stayed
 at 1468 ms (the copies' own duration), and no compute had to wait for its
-copy. Results are unchanged: llama-perplexity with 2 and 3 slots (512-token
+copy. With three slots the copies are hidden: the same batch with the
+expert copies skipped (a timing-only build that computes on whatever the
+slots hold) runs at 630 tok/s against 593, so the rest of the batch time
+is GPU compute. Results are unchanged: llama-perplexity with 2 and 3 slots (512-token
 batches, 8 chunks) gives the same perplexity at every chunk. 0 GPU faults.
 
 Through Ollama (2,800-token prompt, two rounds, all experts placed by
