@@ -171,7 +171,7 @@ Open targets in recommended order, then the done ones.
 
 | Target | Area | Expected gain | Status |
 | --- | --- | --- | --- |
-| LLM-6 | MoE prompts: expert copies, MUL_MAT_ID, dense parts | copies overlap compute since patch 108 (pp2048 295 -> 367 tok/s, against 376 with no copies at all); DeltaNet recurrence (patch 117: pp2048 361 -> 455 tok/s); expert matmuls, 62% of GPU time after 117, as a grouped fp32 GEMM (patch 118: pp2048 450 -> 547, pp512 234 -> 275); expert reduction (patch 119: +2.6%); a third prefetch slot (patch 126: pp2048 565 -> 599, pp512 282 -> 331). The copies run at the link limit (13.3 GB/s, 18.2 GiB per 2048-token batch) and with three slots they are hidden: skipping them altogether (timing-only build) gives 630 against 593 tok/s, so a prompt batch is bound by GPU compute, three quarters of it the dense fp32 GEMMs (gfx803 SGEMM) and the expert GEMMs. The fp32 two-wavefront tile (BLAS-7) and padded output rows for 8192-row matmuls (patch 127) take the dense GEMMs from about 4.0 to 4.6-5.3 TFLOPS: pp2048 about 599 -> 615; through Ollama (2,800-token prompt, a 2048- and a 752-token batch) 516 -> 519. 4096-token batches add 4% on 4096- and 8192-token prompts with three slots (8% with two), too little for an Ollama batch-size patch and a compute buffer about 1 GiB larger | Open: dense and expert GEMM efficiency |
+| LLM-6 | MoE prompts: expert copies, MUL_MAT_ID, dense parts | copies overlap compute since patch 108 (pp2048 295 -> 367 tok/s, against 376 with no copies at all); DeltaNet recurrence (patch 117: pp2048 361 -> 455 tok/s); expert matmuls, 62% of GPU time after 117, as a grouped fp32 GEMM (patch 118: pp2048 450 -> 547, pp512 234 -> 275); expert reduction (patch 119: +2.6%); a third prefetch slot (patch 126: pp2048 565 -> 599, pp512 282 -> 331). The copies run at the link limit (13.3 GB/s, 18.2 GiB per 2048-token batch) and with three slots they are hidden: skipping them altogether (timing-only build) gives 630 against 593 tok/s, so a prompt batch is bound by GPU compute, three quarters of it the dense fp32 GEMMs (gfx803 SGEMM) and the expert GEMMs. The fp32 two-wavefront tile (BLAS-7) and padded output rows for 8192-row matmuls (patch 127) take the dense GEMMs from about 4.0 to 4.6-5.3 TFLOPS: pp2048 about 599 -> 615; through Ollama (2,800-token prompt, a 2048- and a 752-token batch) 516 -> 519. 4096-token batches add 4% on 4096- and 8192-token prompts with three slots (8% with two), too little for an Ollama batch-size patch and a compute buffer about 1 GiB larger | Open: dense GEMM efficiency; the expert GEMM is bound by its staging (options below) |
 | RT-1 | Cost of the vector-L1 invalidate before every dispatch | 1.65 us per dispatch: ~2.4 ms of an MoE token (~6%), 2.3-2.7% of dense decode, ~2.4 ms of an SD 1.5 step. The cost is the extra ring slot, not the cache work: an empty-kernel dispatch costs 4.27-4.30 us with the shipped packet, with only the L1 bit, with poll interval 1, and with the L1 action moved onto the slot's RELEASE_MEM (no ACQUIRE_MEM), against 2.65 us without the slot | Measured, no cheaper packet; only fewer slots would help, and skipping the invalidate between kernels is not provably correct |
 | LLM-5 | Dense decode above the bandwidth bound | per 36 ms token: K-quant kernels ~2.9 ms, flash-attention decode ~2.6 ms at 5k depth, F16 `attn_v` ~1 ms, launches ~1 ms by fusion; the same kernels make up MoE generation's GPU part | Open, measured before the stale-L1 fix and patch 111 |
 | LLM-8 | MoE generation with experts in system RAM | Qwen3.6 35B-A3B, 39 ms per token before patches 113-116 (25.6 tok/s, llama-bench with a cold page cache): CPU experts ~16.7 ms, GPU kernels ~12 ms, ~1,425 dispatches at ~4.3 us each (~6 ms), hand-offs ~3 ms; 113-116 remove up to 300 dispatches per token (25.60 -> 27.51 tok/s), 120-125 another 320 (+0.9%, +2.0%, +0.7%); CPU experts run at ~91% of practical DDR4 bandwidth (36.5 GB/s): strict thread pinning lost 21%, the AVX2 repacked layout gained nothing; 6-8 expert layers resident in VRAM give +9% (llama.cpp's fit does this by itself when the VRAM is free) | Open: RMS norm + multi-section rope fusion (did not fire) |
@@ -250,9 +250,8 @@ expert matmuls are now the largest part by far.
   -> 275 (+17%). Closer to CPU logits than mmq (mean KLD 0.0097 against
   0.0107), because the activations are not quantized to 8 bits. Patch 119
   makes the expert reduction load all eight rows first (4.04 -> 1.17 ms per
-  call, +2.6%, bit-identical). With kernel time per batch now ~2.2 s, the
-  per-layer expert copies over PCIe (~1.5-2.5 s per 2048-token batch) are the
-  next limit.
+  call, +2.6%, bit-identical). The per-layer expert copies over PCIe that
+  this exposed are hidden by patches 108 and 126 (three prefetch slots).
 - Done: patch 108 copies the next MoE layer's experts into a second device
   slot on a second stream while the current layer computes, with
   `HSA_ENABLE_SDMA=1` so the copy runs on the DMA engine (FINDINGS section
@@ -267,6 +266,20 @@ expert matmuls are now the largest part by far.
   That path synchronizes with the host to sort tokens by expert and then runs
   a dequantization and a GEMM per expert, 256 of each per layer; patch 118's
   grouped kernel avoids both.
+- Other tilings of patch 118's expert GEMM: measured, not a lever. Replayed
+  on the routing of a real 2048-token batch (about 400 tiles of 64 tokens per
+  call, 63% filled; half the experts get 16 tokens or fewer, the busiest
+  about 1,000), patch 118 runs gate/up at about 3.9 TFLOPS and down at 3.2
+  (Q6_K) to 4.1 (Q4_K). Per call, an 8x8-per-lane two-wave tile, the gfx803
+  SGEMM's two-wave pattern, activations as scalar (SGPR) operands, two LDS
+  buffers with one barrier per stage, weights shared across a lane quad
+  through DPP (half the LDS reads, bit-identical) and three workgroups per CU
+  all ran at 0.5-1.04x of it. Without its multiply-adds, or with half its
+  LDS reads, the kernel takes the same time; without the dequantization
+  (-23% gate, -32% Q6_K down) or the next stage's global loads (-25%) it does
+  not. A stage is bound by its staging chain (global load latency,
+  dequantization, LDS write, barrier), which two workgroups per CU hide only
+  in part; a third costs more in cache pressure than it hides.
 - MUL_MAT_ID tile choice for gfx803: measured, not a lever. Forcing every
   tile width from 8 to 64 for the expert matmuls (dev-only override) left
   pp2048 within noise: 171-176 tok/s at 1024-token batches for every width,
