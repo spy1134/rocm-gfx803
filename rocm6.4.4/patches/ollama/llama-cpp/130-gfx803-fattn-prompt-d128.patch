@@ -1,0 +1,565 @@
+llama.cpp (as fetched by Ollama v0.35.1, llama.cpp b11232, applied after
+129): a gfx803 flash-attention kernel for prompt-sized batches at head sizes
+96 and 128.
+gfx803-specific: engages only for cc == GGML_CUDA_CC_GCN4 (host) and GCN4
+(device code). launch_fattn() gains a parameter whose default keeps every
+other kernel's behaviour.
+
+WHY
+---
+Prompt attention grows with the square of the prompt. At head size 128 the
+tile kernel runs it at 2.0-2.5 TFLOPS where it serves the query heads of one
+K/V head together, and at 0.9 where the GQA ratio is odd and it cannot
+(patch 128's one-head tiles). Qwen2.5-Coder 7B has 28 query heads over 4 K/V
+heads: a 13,316-token prompt spends 42.6 of its 97.3 s of GPU time in
+flash_attn_tile<128, 128, 16, 1>. At head size 96 the grouped tiles are
+10-20x slower still.
+
+Patch 129's kernel reaches 3.5 TFLOPS but keeps 128 query rows of Q in
+shared memory as fp32: 128 x 132 x 4 bytes = 67.6 KB at head size 128, more
+than the 64 KiB of a CU before the K/V tile.
+
+WHAT
+----
+fattn-gcn4-prompt.cuh adds flash_attn_gcn4_prompt_qreg<D, R> for D = 96 and
+128, patch 129's layout with Q in registers:
+
+  - The eight lanes of a 16-lane row that share a set of query rows hold
+    those rows' Q split into eight d-slices. Q*K^T runs in eight steps: at
+    step s a lane takes slice (ty+s)%8 from the lane 2s further along
+    through the DPP row rotation of the multiply-add, as P*V already does for
+    the softmax weights, and reads the matching slice of its keys from
+    shared memory. Reading Q costs no instruction, and only K and V occupy
+    shared memory (33 KB at head size 128).
+  - Each lane owns R query rows and 4 keys of its wave's score tile: blocks of
+    64 (R = 2, 197 VGPRs) or 96 query rows (R = 3, 242 VGPRs), no spills. A
+    96-row block takes about a fifth less time per row but pads a batch
+    further; the host picks the one with fewer query rows per CU over whole
+    waves of blocks, within 2.9% of the faster one on geometric mean over the
+    sweep below. 128-row blocks spill.
+
+launch_fattn() splits a head's keys over several blocks (parallel_blocks)
+whenever that fills the last wave of blocks better. For this kernel the
+partial results and flash_attn_combine_results cost more than that tail:
+4 K/V heads, GQA 4, 2048 queries over 512 keys take 2.8 ms with one block per
+output tile and 9.4 ms with two, and 512 queries over 512 keys 0.73 against
+0.94-1.10 ms. Its new split_kv_for_tail parameter (default true) lets a
+kernel ask for a split only where one block per output tile would leave more
+than a quarter of the dispatched block slots idle, the threshold llama.cpp
+already uses to choose stream-k. Why the partial-result stores of this kernel
+are that slow is not known: wider stores, a split-major layout, half as many
+writers and writing into the output tensor itself left it unchanged, and
+with the writes removed the split costs only the combine kernel.
+
+The kernel takes a batch from 24 query rows where the tile kernel would serve
+one query head per K/V head; otherwise from 64 query rows at head size 128
+and from 8 at head size 96. Conditions as in patch 129: no ALiBi, no logit
+softcap, no sinks, equal K and V head sizes, 16-byte aligned Q rows, any K/V
+type the tile kernel takes.
+
+Measured on an RX 590, test-backend-ops perf, f16 K/V, mask, 4 K/V heads,
+GQA 1/2/4/7/8, 64-2048 queries, 512-16384 keys (180 shapes): geometric mean
+0.485x the time of the shipped kernels. At model shapes, ms per call:
+
+                                   keys   queries   before   after    TFLOPS
+    Qwen3 8B (8 K/V heads, GQA 4)   4096    512      13.8     10.5   2.5 -> 3.3
+                                   16384    512      67.5     41.2   2.0 -> 3.3
+                                   16384   2048     261.8    142.1   2.1 -> 3.9
+    Coder 7B (4 K/V heads, GQA 7)   4096    512      34.2      8.7   0.9 -> 3.5
+                                   16384    512     137.3     34.5   0.9 -> 3.5
+                                   16384   2048     549.2    126.8   0.9 -> 3.8
+
+Result on an RX 590, llama-server, 16k context, q8_0 KV cache, prompt time:
+
+    Qwen2.5-Coder 7B Q4_K_M, 13,316 tokens   97.4 -> 65.8 s
+                              4,625 tokens   24.4 -> 20.3 s
+    Qwen3 8B Q4_K_M,         13,299 tokens   78.3 -> 74.6 s
+                              4,608 tokens   22.3 -> 21.7 s
+
+Through Ollama (same prompts, the image's defaults): Coder 7B 90.3 -> 56.5 s,
+Qwen3 8B 78.0 -> 73.0 s for the 13k-token prompt.
+
+rocprof: Coder 7B's attention 42.6 -> 10.7 s, Qwen3 8B's 21.1 -> 17.1 s
+(512-token batches over 32 heads leave part of the last wave of blocks idle,
+so there the kernel runs at about 3.0 TFLOPS). Generation and the greedy
+answers are unchanged.
+
+Verified on an RX 590: test-backend-ops test -b ROCm0 -o FLASH_ATTN_EXT
+passes all 3982 cases against the CPU backend, plus 938 added cases at head
+sizes 96 and 128 (GQA 1, 2, 3, 4, 7, 8, two sequences, 32-512 queries around
+the 64- and 96-row block edges, 113 / 512 / 1000 keys, with and without a
+mask, and q8_0 K/V at 4096 and 8192 keys) and patch 129's 1212. On the cases
+the new kernel serves the error against the CPU is at parity with the tile
+kernel (geometric mean 1.025x). To reproduce, build llama.cpp b11232 with
+GGML_HIP=ON and AMDGPU_TARGETS=gfx803, then run with and without the patch:
+
+    test-backend-ops test -b ROCm0 -o FLASH_ATTN_EXT
+    llama-server -m <Qwen2.5-Coder 7B Q4_K_M> -c 16384 -ngl 99 -fa on
+        -ctk q8_0 -ctv q8_0
+        (send a 13,000-token prompt; the response's timings give the
+        prompt time)
+
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index 6d1ce52..4ed4b0b 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -976,7 +976,7 @@ template <int DV, int ncols1, int ncols2>
+ void launch_fattn(
+     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
+     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
+-    const int warp_size = WARP_SIZE
++    const int warp_size = WARP_SIZE, const bool split_kv_for_tail = true
+ ) {
+     constexpr int ncols = ncols1 * ncols2;
+ 
+@@ -1185,7 +1185,12 @@ void launch_fattn(
+         const int blocks_per_wave = nsm * max_blocks_per_sm;
+         int nwaves_best = 0;
+         int efficiency_percent_best = 0;
+-        for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
++        // Without split_kv_for_tail the K/V range is split only when one block per output tile would
++        // leave more than a quarter of the block slots of its waves idle: for such kernels the partial
++        // results and their combination cost more than that tail.
++        const int nwaves_unsplit = (ntiles_dst + blocks_per_wave - 1) / blocks_per_wave;
++        const bool split_kv = split_kv_for_tail || 100*ntiles_dst < 75*nwaves_unsplit*blocks_per_wave;
++        for (int parallel_blocks_test = parallel_blocks; split_kv && parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
+             const int nblocks_total = ntiles_dst * parallel_blocks_test;
+             const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
+             const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
+diff --git a/ggml/src/ggml-cuda/fattn-gcn4-prompt.cuh b/ggml/src/ggml-cuda/fattn-gcn4-prompt.cuh
+index 5655f62..b8e1e85 100644
+--- a/ggml/src/ggml-cuda/fattn-gcn4-prompt.cuh
++++ b/ggml/src/ggml-cuda/fattn-gcn4-prompt.cuh
+@@ -404,6 +404,387 @@ static __global__ void flash_attn_gcn4_prompt(
+ #endif // defined(FLASH_ATTN_AVAILABLE) && defined(GCN4)
+ }
+ 
++// Head sizes 96 and 128, where 128 query rows of Q no longer fit in shared memory beside the K/V
++// tile. At head size 128 the tile kernel reaches 2.0-2.5 TFLOPS on prompt batches, and 0.9 where
++// the GQA ratio is odd and it cannot serve query heads together; this kernel reaches 3.4-3.8.
++//
++// Q stays in registers: the eight lanes of a 16-lane row that share a set of query rows (same
++// l%2) hold those rows' Q split into eight d-slices, lane ty holding slice ty. Q*K^T runs in
++// eight steps like P*V: at step s a lane takes slice (ty+s)%8 from the lane 2s further along
++// through the DPP row rotation of the multiply-add, and reads the matching slice of its keys from
++// shared memory. Each lane owns R rows and 4 keys of the wave's 8R x 32 score tile.
++template <int D, int R>
++__launch_bounds__(fattn_gcn4_prompt_nwarps*fattn_gcn4_prompt_warp_size, 1)
++static __global__ void flash_attn_gcn4_prompt_qreg(
++        const char * Q_ptr,
++        const char * K_ptr,
++        const char * V_ptr,
++        const char * mask_ptr,
++        const char * sinks_ptr,
++        const int  * KV_max_ptr,
++        float      * dst_ptr,
++        float2     * dst_meta_ptr,
++        const float scale,
++        const float max_bias,
++        const float m0,
++        const float m1,
++        const uint32_t n_head_log2,
++        const float logit_softcap,
++        const int32_t ne00, const uint3   ne01, const int32_t ne02, const int32_t ne03,
++                            const int32_t nb01, const int32_t nb02, const int32_t nb03,
++        const int32_t ne10, const int32_t ne11, const int32_t ne12, const int32_t ne13,
++                            const int32_t nb11, const int32_t nb12, const int64_t nb13,
++                            const int32_t nb21, const int32_t nb22, const int64_t nb23,
++                            const int32_t ne31, const int32_t ne32, const int32_t ne33,
++                            const int32_t nb31, const int32_t nb32, const int64_t nb33) {
++    ggml_cuda_pdl_lc();
++#if defined(FLASH_ATTN_AVAILABLE) && defined(GCN4)
++    constexpr int nthreads = fattn_gcn4_prompt_nwarps*fattn_gcn4_prompt_warp_size;
++    constexpr int NG       = 8;
++    constexpr int WR       = NG*R;      // query rows per wave
++    constexpr int BR       = fattn_gcn4_prompt_nwarps*WR;
++    constexpr int BC       = fattn_gcn4_prompt_keys;
++    constexpr int C        = BC/NG;
++    constexpr int DS       = D/NG;
++    constexpr int E        = DS/4;      // float4 fragments per d-slice
++    constexpr int D4       = D/4;
++    constexpr int QS       = D + 4;
++    constexpr int KV_VEC   = BC*D4;
++    constexpr int KV_PER_THREAD = (KV_VEC + nthreads - 1)/nthreads;
++    constexpr float MASKED = -1e30f;
++    constexpr float LOG2E  = 1.4426950408889634f;
++
++    static_assert(DS % 4 == 0, "d-slices are read as float4");
++    static_assert(((QS/4) & 1) == 1, "the row stride in 16-byte units must be odd");
++    static_assert(2*BC*QS*4 <= 65536, "shared memory exceeds the 64 KiB of a CU");
++
++    __shared__ __attribute__((aligned(16))) float s_K[BC*QS];
++    __shared__ __attribute__((aligned(16))) float s_V[BC*QS];
++
++    const int lane = threadIdx.x;
++    const int wave = threadIdx.y;
++    const int tid  = wave*fattn_gcn4_prompt_warp_size + lane;
++    const int tx   = 2*(lane >> 4) + (lane & 1);
++    const int ty   = (lane >> 1) & (NG - 1);
++
++    const int N        = ne01.z;
++    const int sequence = blockIdx.z / ne02;
++    const int head     = blockIdx.z - sequence*ne02;
++    const int head_KV  = head / (ne02/ne12);
++    const int q0       = blockIdx.x*BR;
++
++    const char * Q = Q_ptr + int64_t(nb03)*sequence + int64_t(nb02)*head;
++    const char * K = K_ptr + nb13*sequence + int64_t(nb12)*head_KV;
++    const char * V = V_ptr + nb23*sequence + int64_t(nb22)*head_KV;
++    const bool use_mask = mask_ptr != nullptr;
++    const char * maskc = use_mask ? mask_ptr + nb33*(sequence % ne33) : nullptr;
++
++    ggml_cuda_pdl_sync();
++
++    const float scale_log2 = scale*LOG2E;
++    float q[R][DS];
++#pragma unroll
++    for (int i = 0; i < R; ++i) {
++        const int row = q0 + wave*WR + tx + NG*i;
++#pragma unroll
++        for (int e = 0; e < E; ++e) {
++            float4 val = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++            if (row < N) {
++                val = *(const float4 *) (Q + int64_t(row)*nb01 + (ty*DS + 4*e)*4);
++            }
++            q[i][4*e + 0] = val.x*scale_log2;
++            q[i][4*e + 1] = val.y*scale_log2;
++            q[i][4*e + 2] = val.z*scale_log2;
++            q[i][4*e + 3] = val.w*scale_log2;
++        }
++    }
++
++    typedef _Float16 half4_t __attribute__((ext_vector_type(4)));
++    half4_t k_reg[KV_PER_THREAD];
++    half4_t v_reg[KV_PER_THREAD];
++
++    auto load_tile = [&](const int kt) {
++        const int k0 = kt*BC;
++#pragma unroll
++        for (int u = 0; u < KV_PER_THREAD; ++u) {
++            const int v = tid + u*nthreads;
++            k_reg[u] = half4_t{0, 0, 0, 0};
++            v_reg[u] = half4_t{0, 0, 0, 0};
++            if (v < KV_VEC) {
++                const int r  = v / D4;
++                const int d4 = v - r*D4;
++                if (k0 + r < ne11) {
++                    k_reg[u] = *(const half4_t *) (K + int64_t(k0 + r)*nb11 + d4*8);
++                    v_reg[u] = *(const half4_t *) (V + int64_t(k0 + r)*nb21 + d4*8);
++                }
++            }
++        }
++    };
++    auto store_tile = [&]() {
++#pragma unroll
++        for (int u = 0; u < KV_PER_THREAD; ++u) {
++            const int v = tid + u*nthreads;
++            if (v < KV_VEC) {
++                const int r  = v / D4;
++                const int d4 = v - r*D4;
++                *(float4 *) &s_K[r*QS + d4*4] = make_float4(k_reg[u].x, k_reg[u].y, k_reg[u].z, k_reg[u].w);
++                *(float4 *) &s_V[r*QS + d4*4] = make_float4(v_reg[u].x, v_reg[u].y, v_reg[u].z, v_reg[u].w);
++            }
++        }
++    };
++
++    float m_run[R];
++    float l_run[R];
++    float acc[R][DS];
++#pragma unroll
++    for (int i = 0; i < R; ++i) {
++        m_run[i] = MASKED;
++        l_run[i] = 0.0f;
++#pragma unroll
++        for (int k = 0; k < DS; ++k) {
++            acc[i][k] = 0.0f;
++        }
++    }
++
++    const half * mask_row[R];
++#pragma unroll
++    for (int i = 0; i < R; ++i) {
++        const int row = min(q0 + wave*WR + tx + NG*i, ne31 - 1);
++        mask_row[i] = use_mask ? (const half *) (maskc + int64_t(row)*nb31) : nullptr;
++    }
++    const int k_end     = KV_max_ptr ? min(KV_max_ptr[sequence*gridDim.x + blockIdx.x], ne11) : ne11;
++    const int num_tiles = (k_end + BC - 1) / BC;
++
++    if (int(blockIdx.y) < num_tiles) {
++        load_tile(blockIdx.y);
++    }
++    for (int kt = blockIdx.y; kt < num_tiles; kt += gridDim.y) {
++        store_tile();
++        __syncthreads();
++        if (kt + int(gridDim.y) < num_tiles) {
++            load_tile(kt + gridDim.y);
++        }
++
++        float S[R][C];
++#pragma unroll
++        for (int i = 0; i < R; ++i) {
++#pragma unroll
++            for (int j = 0; j < C; ++j) {
++                S[i][j] = 0.0f;
++            }
++        }
++
++        const int k0 = kt*BC;
++        half mask_val[R][C];
++        if (use_mask) {
++#pragma unroll
++            for (int i = 0; i < R; ++i) {
++#pragma unroll
++                for (int j = 0; j < C; ++j) {
++                    mask_val[i][j] = mask_row[i][min(k0 + ty + NG*j, ne11 - 1)];
++                }
++            }
++        }
++
++        // Fragment n = E*s + e is float4 e of the d-slice that step s works on; fragment n+1 is in
++        // flight while n is consumed, across step boundaries too.
++        float4 ka[C], kb[C];
++        auto load_k = [&](const int n, float4 (&k)[C]) {
++            const int s = n / E;
++            const int e = n - s*E;
++            const float * k_src = &s_K[ty*QS + ((ty + s) & (NG - 1))*DS + 4*e];
++#pragma unroll
++            for (int j = 0; j < C; ++j) {
++                k[j] = *(const float4 *) &k_src[NG*j*QS];
++            }
++        };
++        auto qk_step = [&](auto s_tag) {
++            constexpr int ST = decltype(s_tag)::value;
++            auto fma_qk = [&](const int e, const float4 (&k)[C]) {
++#pragma unroll
++                for (int j = 0; j < C; ++j) {
++#pragma unroll
++                    for (int i = 0; i < R; ++i) {
++                        fattn_gcn4_mac_row_rot2<ST>(S[i][j], q[i][4*e + 0], k[j].x);
++                        fattn_gcn4_mac_row_rot2<ST>(S[i][j], q[i][4*e + 1], k[j].y);
++                        fattn_gcn4_mac_row_rot2<ST>(S[i][j], q[i][4*e + 2], k[j].z);
++                        fattn_gcn4_mac_row_rot2<ST>(S[i][j], q[i][4*e + 3], k[j].w);
++                    }
++                }
++            };
++#pragma unroll
++            for (int e = 0; e < E; ++e) {
++                const int n = ST*E + e;
++                if ((n & 1) == 0) {
++                    if (n + 1 < NG*E) {
++                        load_k(n + 1, kb);
++                    }
++                    FATTN_GCN4_SCHED_BARRIER();
++                    fma_qk(e, ka);
++                } else {
++                    if (n + 1 < NG*E) {
++                        load_k(n + 1, ka);
++                    }
++                    FATTN_GCN4_SCHED_BARRIER();
++                    fma_qk(e, kb);
++                }
++            }
++        };
++        load_k(0, ka);
++        qk_step(std::integral_constant<int, 0>{});
++        qk_step(std::integral_constant<int, 1>{});
++        qk_step(std::integral_constant<int, 2>{});
++        qk_step(std::integral_constant<int, 3>{});
++        qk_step(std::integral_constant<int, 4>{});
++        qk_step(std::integral_constant<int, 5>{});
++        qk_step(std::integral_constant<int, 6>{});
++        qk_step(std::integral_constant<int, 7>{});
++
++#pragma unroll
++        for (int i = 0; i < R; ++i) {
++            float m_tile = MASKED;
++#pragma unroll
++            for (int j = 0; j < C; ++j) {
++                const int k = k0 + ty + NG*j;
++                if (k >= ne11) {
++                    S[i][j] = -INFINITY;
++                } else if (use_mask) {
++                    S[i][j] += LOG2E*__half2float(mask_val[i][j]);
++                }
++                m_tile = fmaxf(m_tile, S[i][j]);
++            }
++            m_tile = fmaxf(m_tile, fattn_gcn4_lane_xor2(m_tile));
++            m_tile = fmaxf(m_tile, fattn_gcn4_lane_xor<4>(m_tile));
++            m_tile = fmaxf(m_tile, fattn_gcn4_lane_xor<8>(m_tile));
++
++            const float m_new = fmaxf(m_run[i], m_tile);
++            const float alpha = exp2f(m_run[i] - m_new);
++            float p_sum = 0.0f;
++#pragma unroll
++            for (int j = 0; j < C; ++j) {
++                S[i][j] = exp2f(S[i][j] - m_new);
++                p_sum += S[i][j];
++            }
++            p_sum += fattn_gcn4_lane_xor2(p_sum);
++            p_sum += fattn_gcn4_lane_xor<4>(p_sum);
++            p_sum += fattn_gcn4_lane_xor<8>(p_sum);
++
++            l_run[i] = l_run[i]*alpha + p_sum;
++            m_run[i] = m_new;
++#pragma unroll
++            for (int k = 0; k < DS; ++k) {
++                acc[i][k] *= alpha;
++            }
++        }
++
++        float4 va[E], vb[E];
++        auto load_v = [&](const int n, float4 (&v)[E]) {
++            const float * v_row = &s_V[(((ty + (n >> 2)) & (NG - 1)) + NG*(n & 3))*QS + ty*DS];
++#pragma unroll
++            for (int e = 0; e < E; ++e) {
++                v[e] = *(const float4 *) &v_row[4*e];
++            }
++        };
++        auto pv_step = [&](auto s_tag) {
++            constexpr int ST = decltype(s_tag)::value;
++            auto fma_pv = [&](const int j, const float4 (&v)[E]) {
++#pragma unroll
++                for (int e = 0; e < E; ++e) {
++#pragma unroll
++                    for (int i = 0; i < R; ++i) {
++                        fattn_gcn4_mac_row_rot2<ST>(acc[i][4*e + 0], S[i][j], v[e].x);
++                        fattn_gcn4_mac_row_rot2<ST>(acc[i][4*e + 1], S[i][j], v[e].y);
++                        fattn_gcn4_mac_row_rot2<ST>(acc[i][4*e + 2], S[i][j], v[e].z);
++                        fattn_gcn4_mac_row_rot2<ST>(acc[i][4*e + 3], S[i][j], v[e].w);
++                    }
++                }
++            };
++#pragma unroll
++            for (int j = 0; j < 4; j += 2) {
++                const int n = 4*ST + j;
++                load_v(n + 1, vb);
++                FATTN_GCN4_SCHED_BARRIER();
++                fma_pv(j, va);
++                if (n + 2 < BC) {
++                    load_v(n + 2, va);
++                }
++                FATTN_GCN4_SCHED_BARRIER();
++                fma_pv(j + 1, vb);
++            }
++        };
++        load_v(0, va);
++        pv_step(std::integral_constant<int, 0>{});
++        asm volatile("s_nop 1");
++        pv_step(std::integral_constant<int, 1>{});
++        pv_step(std::integral_constant<int, 2>{});
++        pv_step(std::integral_constant<int, 3>{});
++        pv_step(std::integral_constant<int, 4>{});
++        pv_step(std::integral_constant<int, 5>{});
++        pv_step(std::integral_constant<int, 6>{});
++        pv_step(std::integral_constant<int, 7>{});
++        __syncthreads();
++    }
++
++#pragma unroll
++    for (int i = 0; i < R; ++i) {
++        const int q_row = q0 + wave*WR + tx + NG*i;
++        if (q_row >= N) {
++            continue;
++        }
++        const int j_dst = ((sequence*N + q_row)*ne02 + head)*gridDim.y + blockIdx.y;
++        float4 * dst_row = (float4 *) (dst_ptr + int64_t(j_dst)*D + ty*DS);
++        const float inv_l = gridDim.y > 1 ? 1.0f : l_run[i] > 0.0f ? 1.0f/l_run[i] : 0.0f;
++#pragma unroll
++        for (int e = 0; e < E; ++e) {
++            dst_row[e] = make_float4(acc[i][4*e + 0]*inv_l, acc[i][4*e + 1]*inv_l, acc[i][4*e + 2]*inv_l, acc[i][4*e + 3]*inv_l);
++        }
++        if (gridDim.y > 1 && ty == 0) {
++            dst_meta_ptr[j_dst] = make_float2(m_run[i]/LOG2E, l_run[i]);
++        }
++    }
++#else
++    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
++        max_bias, m0, m1, n_head_log2, logit_softcap,
++        ne00, ne01, ne02, ne03,
++              nb01, nb02, nb03,
++        ne10, ne11, ne12, ne13,
++              nb11, nb12, nb13,
++              nb21, nb22, nb23,
++              ne31, ne32, ne33,
++              nb31, nb32, nb33);
++    NO_DEVICE_CODE;
++#endif // defined(FLASH_ATTN_AVAILABLE) && defined(GCN4)
++}
++
++template <int D, int R>
++static void ggml_cuda_flash_attn_ext_gcn4_prompt_qreg_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    launch_fattn<D, fattn_gcn4_prompt_nwarps*8*R, 1>(ctx, dst, flash_attn_gcn4_prompt_qreg<D, R>, fattn_gcn4_prompt_nwarps, 0,
++        fattn_gcn4_prompt_keys, true, true, false, false, fattn_gcn4_prompt_warp_size, false);
++}
++
++// A 96-row block (R = 3) takes about a fifth less time per query row than a 64-row block (R = 2),
++// but pads the batch further and leaves a different tail on the last wave of blocks. The estimate
++// counts query rows per CU over whole waves, or over the blocks alone where launch_fattn splits the
++// K/V range to fill the GPU. On an RX 590 the pick is within 2.3% of the faster block size on
++// geometric mean over batches of 64-2048 queries, 512-16384 keys and GQA ratios 1-8.
++template <int D>
++static void ggml_cuda_flash_attn_ext_gcn4_prompt_qreg(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * Q = dst->src[0];
++    const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
++
++    auto rows_per_cu = [&](const int rows, const float row_cost) {
++        const int64_t blocks = (Q->ne[1] + rows - 1)/rows * Q->ne[2]*Q->ne[3];
++        const int64_t waves  = (blocks + nsm - 1)/nsm;
++        const float   slots  = 100*blocks >= 75*waves*nsm ? float(waves) : float(blocks)/nsm;
++        return slots*rows*row_cost;
++    };
++    if (rows_per_cu(96, 0.8f) < rows_per_cu(64, 1.0f)) {
++        ggml_cuda_flash_attn_ext_gcn4_prompt_qreg_case<D, 3>(ctx, dst);
++    } else {
++        ggml_cuda_flash_attn_ext_gcn4_prompt_qreg_case<D, 2>(ctx, dst);
++    }
++}
++
+ template <int D>
+ static void ggml_cuda_flash_attn_ext_gcn4_prompt_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     launch_fattn<D, fattn_gcn4_prompt_rows, 1>(ctx, dst, flash_attn_gcn4_prompt<D>, fattn_gcn4_prompt_nwarps, 0,
+@@ -427,9 +808,11 @@ static bool ggml_cuda_flash_attn_ext_gcn4_prompt(ggml_backend_cuda_context & ctx
+     memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+ 
+-    // Where the tile kernel serves the query heads of one K/V head together, it is faster than
+-    // this kernel, which pads every head to 128 query rows, up to about 48 rows per head served
+-    // (RX 590, head sizes 40-80, GQA ratios 1-4).
++    // The kernels above pad a batch to whole blocks of query rows, so for small batches the tile
++    // kernel is faster, above all where it serves the query heads of one K/V head together.
++    // Crossovers on an RX 590 (8 or 4 K/V heads, 1024-16384 keys): head sizes 40-80 at about 48
++    // query rows per head the tile kernel serves; 96 and 128 at 24 query rows where it serves one
++    // head, else at 64 for 128 and at 8 for 96, whose grouped tiles are 10-20x slower.
+     const int gqa_ratio = Q->ne[2] / K->ne[2];
+     int tile_heads = 1;
+     if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0) {
+@@ -437,7 +820,11 @@ static bool ggml_cuda_flash_attn_ext_gcn4_prompt(ggml_backend_cuda_context & ctx
+             tile_heads *= 2;
+         }
+     }
+-    if (Q->ne[1] < 48*tile_heads || max_bias != 0.0f || logit_softcap != 0.0f || sinks || K->ne[0] != V->ne[0]) {
++    int min_rows = 48*tile_heads;
++    if (K->ne[0] >= 96) {
++        min_rows = tile_heads == 1 ? 24 : K->ne[0] == 96 ? 8 : 64;
++    }
++    if (Q->ne[1] < min_rows || max_bias != 0.0f || logit_softcap != 0.0f || sinks || K->ne[0] != V->ne[0]) {
+         return false;
+     }
+     // Q rows are read as float4.
+@@ -446,10 +833,12 @@ static bool ggml_cuda_flash_attn_ext_gcn4_prompt(ggml_backend_cuda_context & ctx
+     }
+ 
+     switch (K->ne[0]) {
+-        case 40: ggml_cuda_flash_attn_ext_gcn4_prompt_case<40>(ctx, dst); return true;
+-        case 64: ggml_cuda_flash_attn_ext_gcn4_prompt_case<64>(ctx, dst); return true;
+-        case 72: ggml_cuda_flash_attn_ext_gcn4_prompt_case<72>(ctx, dst); return true;
+-        case 80: ggml_cuda_flash_attn_ext_gcn4_prompt_case<80>(ctx, dst); return true;
++        case  40: ggml_cuda_flash_attn_ext_gcn4_prompt_case<40>(ctx, dst);  return true;
++        case  64: ggml_cuda_flash_attn_ext_gcn4_prompt_case<64>(ctx, dst);  return true;
++        case  72: ggml_cuda_flash_attn_ext_gcn4_prompt_case<72>(ctx, dst);  return true;
++        case  80: ggml_cuda_flash_attn_ext_gcn4_prompt_case<80>(ctx, dst);  return true;
++        case  96: ggml_cuda_flash_attn_ext_gcn4_prompt_qreg<96>(ctx, dst);  return true;
++        case 128: ggml_cuda_flash_attn_ext_gcn4_prompt_qreg<128>(ctx, dst); return true;
+         default: return false;
+     }
+ }

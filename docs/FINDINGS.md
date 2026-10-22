@@ -1185,6 +1185,27 @@ bullets are the original findings (patches 100-105); the rest build on them.
   attention at 3.5 TFLOPS: 254 -> 88 ms per call, the image 18.6 -> 14.2 s,
   and Qwen3.6 35B-A3B through Ollama 14.0 -> 9.6 s. Loading the mask values
   inside the softmax spilled 200-590 VGPRs; loaded ahead of Q*K^T they fit.
+- **Long prompts at head size 128 spent up to 44% of their time in attention**
+  (Qwen2.5-Coder 7B, 13,316 tokens: 42.6 of 97.3 s). The tile kernel runs
+  prompt attention at 2.0-2.5 TFLOPS where it serves the query heads of one
+  K/V head together, and at 0.9 where the GQA ratio is odd (Coder 7B: 7), so
+  it cannot. Patch 129's kernel does not fit there: 128 query rows of Q in
+  fp32 take 67.6 KB of shared memory alone. Patch 130 keeps Q in registers
+  instead, split over the eight lanes that share a set of query rows, and Q*K^T
+  takes each lane's slice through the same DPP rotation that P*V uses for the
+  softmax weights, so reading Q costs no instruction; blocks of 64 or 96 query
+  rows, picked per batch. Prompt attention runs at 3.4-3.8 TFLOPS: Coder 7B's
+  13k-token prompt 97.4 -> 65.8 s (attention 42.6 -> 10.7 s; through Ollama
+  90.3 -> 56.5 s), Qwen3 8B's 78.3
+  -> 74.6 s (attention 21.1 -> 17.1 s; at 512-token batches its 32 heads leave
+  part of the last wave of blocks idle). At head size 96 the tile kernel's grouped tiles are 10-20x
+  slower still. llama.cpp splits a head's keys over several blocks to fill the
+  last wave; for this kernel the partial results and their combination cost
+  more than that tail (a 2048-query batch over 512 keys: 2.8 ms unsplit, 9.4
+  ms split), so it splits only when one block per output tile would leave over
+  a quarter of the GPU idle. Why the partial-result stores are that slow is
+  not understood: wider stores, another layout and half the writers changed
+  nothing.
 - **Generation with an 8-bit KV cache slowed with context** (27.9 tok/s empty,
   20.9 at 8k). The vec kernel that generates with a quantized cache needs 229
   VGPRs on gfx803, so one wave runs per SIMD and its memory latency goes
