@@ -28,6 +28,12 @@
 #   CLR       -- libamdhip64. The command processor of gfx803 does not invalidate the per-CU
 #                vector L1 between dispatches, so patches/clr/ adds a cache-invalidate packet
 #                before every kernel dispatch.
+#   clang, libamd_comgr
+#             -- on gfx8 the shipped compiler reads a non-inlined function's
+#                implicit kernel arguments from address 0 and leaves M0 unset
+#                for generic-pointer accesses to LDS; patches/llvm/. PyTorch is
+#                built with the patched clang, and the image's hipcc and
+#                run-time compilation (hipRTC, MIOpen) use it.
 #   MIGraphX  -- prebuilt for gfx900+ only.
 #   PyTorch   -- no gfx803 wheel has ever been published.
 #   ORT       -- built against the MIGraphX above.
@@ -593,6 +599,38 @@ RUN sh /devlibs-patches/build-device-libs.sh prepare \
 FROM scratch AS devlibs-export
 COPY --from=devlibs-builder /devlibs-out/ /
 
+# clang-19 and libamd_comgr from ROCm/llvm-project with the gfx8 code generation fixes (patches/llvm/). On gfx8 the
+# shipped compiler loads the queue pointer and the aperture bases of a non-inlined function from address 0, so
+# PyTorch's mixed fp16/fp32 elementwise kernels fault in their last partial block and a failed assert() faults at its
+# trap, and it leaves M0 unset for generic-pointer accesses that land in LDS, which drops the stores. libamd_comgr
+# embeds its own copy of the compiler, so hipRTC (PyTorch's jiterator, MIGraphX) and MIOpen compile their run-time
+# kernels with the same defect; it also embeds the device libraries, so it is built from the tree that carries the
+# ockl signal patch. Only these two files leave the stage.
+FROM python-base AS llvm-builder
+
+ARG ROCM_VERSION
+ARG BUILD_PARALLEL_LEVEL
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake ninja-build build-essential ccache zlib1g-dev libzstd-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --filter=blob:none --no-checkout --depth 1 --branch "rocm-${ROCM_VERSION}" \
+        https://github.com/ROCm/llvm-project.git /llvm-src \
+    && git -C /llvm-src sparse-checkout set llvm clang lld cmake third-party amd/device-libs amd/comgr \
+    && git -C /llvm-src checkout
+
+COPY patches/device-libs/ /devlibs-patches/
+COPY patches/llvm/ /llvm-patches/
+RUN sh /llvm-patches/build-llvm.sh prepare
+# The build tree is a cache mount so that a patch edit recompiles the touched files and relinks, not the whole compiler.
+RUN --mount=type=cache,target=/root/.ccache,id=gfx803-llvm-ccache \
+    --mount=type=cache,target=/llvm-build,id=gfx803-llvm-build \
+    sh /llvm-patches/build-llvm.sh build
+
+FROM scratch AS llvm-export
+COPY --from=llvm-builder /llvm-out/ /
+
 FROM python-base AS migraphx-builder
 
 ARG ROCM_VERSION
@@ -834,6 +872,11 @@ RUN sh /pytorch-patches/gfx803-int8-gemm-rocblas.sh /pytorch \
 # setup.py does not hipify CUDA sources itself; build_amd.py has to run first
 # or CMake fails looking for .hip sources that don't exist yet.
 RUN python3 tools/amd_build/build_amd.py
+
+# The compiler with the callee implicit-argument fix: the remainder block of the mixed fp16/fp32 elementwise kernels
+# runs a non-inlined helper that reads the private aperture base from address 0xc0. After the hipify step so that a
+# compiler change reruns only the build below. torchvision and torchaudio are built with it too.
+COPY --from=llvm-export /clang-19 /opt/rocm/lib/llvm/bin/clang-19
 
 # USE_FLASH_ATTENTION/USE_MEM_EFF_ATTENTION: default on for ROCm and pull in
 # aotriton, which has no gfx803 support whatsoever (and configures its own
@@ -1127,6 +1170,15 @@ ENV PATH="$VIRTUAL_ENV/bin:${PATH}"
 # loaded into every Python process through sitecustomize; PYTHONPATH above puts
 # /opt/rocm/lib on the path. Each module's header says what it works around.
 COPY runtime/python/ /opt/rocm/lib/
+
+# clang-19 and libamd_comgr with the gfx8 code generation fixes: hipcc in images built on this one, and every kernel
+# that hipRTC, MIOpen and MIGraphX compile at run time. The libraries built in the stages above keep the compiler they
+# were built with. Late in the stage, with the shim, so a compiler change rebuilds only these layers. The check
+# compiles through the installed libamd_comgr and needs no GPU.
+COPY --from=llvm-export /clang-19 /opt/rocm/lib/llvm/bin/clang-19
+COPY --from=llvm-export /libamd_comgr.so.3.0.60404 /opt/rocm/lib/
+COPY patches/llvm/check-comgr.sh /tmp/check-comgr.sh
+RUN sh /tmp/check-comgr.sh && rm /tmp/check-comgr.sh
 
 # rocBLAS/Tensile's fp32 GEMMs return wrong results on gfx803 (see
 # patches/sgemm-shim-batched/gfx803_sgemm.h); the shim runs the standard-algo

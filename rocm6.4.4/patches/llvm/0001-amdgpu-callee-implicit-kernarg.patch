@@ -1,0 +1,100 @@
+AMDGPU: callees read implicit kernel arguments through the implicit-argument pointer
+
+Generic (all pre-gfx9 targets with code object v5 or later; gfx803 is where it
+was found and tested).
+
+Verified on an RX 590 (gfx803) with clang built from ROCm llvm-project
+rocm-6.4.4 (d366fa84) with this patch and 0002: the probes below, and
+PyTorch rebuilt with it (24 of 24 mixed fp16/fp32 ops at three sizes
+correct, against 24 faults with the shipped compiler; SDXL UNet output
+bit-identical, same step time).
+
+WHY
+---
+On gfx6-gfx8 a few values that gfx9 and newer read from hardware come from
+the kernel's implicit arguments: the queue pointer the trap handler expects
+in s[0:1] at s_trap, and the private and shared aperture bases needed to turn
+a stack or LDS address into a generic pointer. loadImplicitKernelArgument
+computes their address with lowerKernArgParameterPtr, which in a function
+that is not a kernel has no kernel-argument pointer and returns the bare
+offset. The callee then loads the queue pointer from address 0xc8 and the
+apertures from 0xc0 and 0xc4:
+
+  s_mov_b64 s[6:7], 0xc8
+  s_load_dwordx2 s[0:1], s[6:7], 0x0
+  s_trap 2
+
+The kernel already passes the implicit-argument pointer to such a callee (in
+s[8:9]; AMDGPUAttributor keeps it live for trap and llvm.amdgcn.implicitarg.ptr
+users), and the llvm.amdgcn.implicitarg.ptr intrinsic already reads it there
+in non-entry functions; only this lowering ignores it.
+
+What breaks without the patch, on gfx803 with ROCm 6.4.4:
+- A failed assert() (__assert_fail is not inlined) prints its message and
+  then ends with "Memory access fault ... on address (nil)" instead of the
+  trap report.
+- PyTorch's mixed fp16/fp32 binary elementwise ops (torch.maximum, atan2,
+  mse_loss, gelu_backward, ...) fault whenever the element count is not a
+  multiple of 16384: the last, partial block runs a non-inlined
+  elementwise_kernel_helper whose prologue makes a generic pointer to its
+  stack from the private base read at 0xc0.
+- Any non-inlined function that casts a stack or LDS address to a generic
+  pointer faults.
+
+To reproduce: a __attribute__((noinline)) device function that calls
+__builtin_trap(), or that passes the address of a local array to another
+non-inlined function; its assembly shows a scalar load from a constant base
+(0xc0, 0xc4 or 0xc8) instead of from s[8:9].
+
+WHAT
+----
+In loadImplicitKernelArgument, a non-entry function takes the base from its
+IMPLICIT_ARG_PTR input and subtracts the FIRST_IMPLICIT offset (the offset
+getImplicitParameterOffset adds is relative to the start of the kernel
+arguments; a callee's explicit argument size is 0). Kernels are unchanged.
+The GlobalISel path (AMDGPULegalizerInfo) has the same flaw and is not
+changed here; HIP selects with SelectionDAG.
+
+Measured with the patched clang (RX 590, stock HSA runtime):
+- the callee emits `s_load_dwordx2 s[0:1], s[8:9], 0xc8` and
+  `s_load_dword s4, s[8:9], 0xc4`; an unpatched build of the same source
+  emits the null-base loads above;
+- a non-inlined stack-pointer cast passes (it faults built with the shipped
+  compiler and with the unpatched build);
+- a failed assert() ends with HSA_STATUS_ERROR_EXCEPTION and no VM fault.
+LDS casts in callees also need the M0 patch that follows this one.
+
+diff --git a/llvm/lib/Target/AMDGPU/SIISelLowering.cpp b/llvm/lib/Target/AMDGPU/SIISelLowering.cpp
+index a9c99751a..7069e1840 100644
+--- a/llvm/lib/Target/AMDGPU/SIISelLowering.cpp
++++ b/llvm/lib/Target/AMDGPU/SIISelLowering.cpp
+@@ -6884,8 +6884,28 @@ SDValue SITargetLowering::lowerTrapEndpgm(
+ SDValue SITargetLowering::loadImplicitKernelArgument(SelectionDAG &DAG, MVT VT,
+     const SDLoc &DL, Align Alignment, ImplicitParameter Param) const {
+   MachineFunction &MF = DAG.getMachineFunction();
++  const SIMachineFunctionInfo *Info = MF.getInfo<SIMachineFunctionInfo>();
+   uint64_t Offset = getImplicitParameterOffset(MF, Param);
+-  SDValue Ptr = lowerKernArgParameterPtr(DAG, DL, DAG.getEntryNode(), Offset);
++  SDValue Ptr;
++  if (Info->isEntryFunction()) {
++    Ptr = lowerKernArgParameterPtr(DAG, DL, DAG.getEntryNode(), Offset);
++  } else {
++    // A callee has no kernarg segment pointer; lowerKernArgParameterPtr would
++    // return the bare offset, i.e. a load from a null base. The implicit
++    // arguments are reached through the incoming implicitarg_ptr, which
++    // AMDGPUAttributor keeps live for functions that trap or cast LDS/scratch
++    // to flat under code object v5.
++    MVT PtrVT = getPointerTy(DAG.getDataLayout(), AMDGPUAS::CONSTANT_ADDRESS);
++    SDValue ImplicitArgPtr = getPreloadedValue(
++        DAG, *Info, PtrVT, AMDGPUFunctionArgInfo::IMPLICIT_ARG_PTR);
++    // getImplicitParameterOffset is relative to the kernarg segment start;
++    // the callee's explicit kernarg size is 0, so FIRST_IMPLICIT is the
++    // bias that separates the two bases.
++    Ptr = DAG.getObjectPtrOffset(
++        DL, ImplicitArgPtr,
++        TypeSize::getFixed(Offset -
++                           getImplicitParameterOffset(MF, FIRST_IMPLICIT)));
++  }
+   MachinePointerInfo PtrInfo(AMDGPUAS::CONSTANT_ADDRESS);
+   return DAG.getLoad(VT, DL, DAG.getEntryNode(), Ptr, PtrInfo, Alignment,
+                      MachineMemOperand::MODereferenceable |

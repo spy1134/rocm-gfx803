@@ -103,8 +103,8 @@ run with wrong numbers, not a crash. "It runs" was never taken as evidence.
 | Kernels read stale data from the per-CU vector L1 after a freed address is reused (silent wrong results in rocBLAS, rocSOLVER, torch.linalg) | Fixed (libamdhip64 rebuilt); decode costs about 2.6% | 4 | `patches/clr/` |
 | Device printf and assert() hang (hostcall's doorbell signal never changes) | Fixed (ockl.bc rebuilt) | 4 | `patches/device-libs/` |
 | No-return atomics on fine-grained host memory store their operand instead (user kernels) | Open (hardware; use the returned value) | 4 | none |
-| Non-inlined device functions read implicit kernel arguments from address 0: PyTorch's mixed fp16/fp32 binary ops crash, assert() faults at its trap | Open (compiler); fix drafted and verified in a scratch compiler, not in the images | 4 | none |
-| Flat (generic-pointer) accesses to LDS are dropped when M0 is not set (gfx8) | Open (compiler) | 4 | none |
+| Non-inlined device functions read implicit kernel arguments from address 0: PyTorch's mixed fp16/fp32 binary ops crash, assert() faults at its trap | Fixed (clang and libamd_comgr rebuilt, PyTorch rebuilt with them) | 4 | `patches/llvm/` |
+| Flat (generic-pointer) accesses to LDS are dropped when M0 is not set (gfx8) | Fixed (same compiler) | 4 | `patches/llvm/` |
 | rocSOLVER and rocSPARSE ship no gfx803 code, so their kernels silently never run | Fixed (rebuilt for gfx803) | 4 | `patches/rocsolver/`, `patches/rocsparse/` |
 | VRAM exhaustion freezes the desktop | Mitigated (VRAM cap) | 7 | `training/gfx803-train.sh` |
 | llama.cpp prompt processing 10x slow | Fixed | 9 | `patches/ollama/llama-cpp/100-*` |
@@ -671,21 +671,18 @@ installs it in the final image. Built the same way without the patch, it
 reproduces AMD's shipped `ockl.bc` byte for byte. With the patched bitcode,
 printf from 1 and 64 lanes prints every line and returns `hipSuccess`, and a
 failed `assert()` prints `Device-side assertion ... failed` and ends the
-process. Only code compiled with hipcc or clang in the final image links the new
-bitcode. Libraries built in the earlier stages keep the copy they were linked
-with, and kernels compiled at run time through hiprtc (comgr, which MIOpen also
-uses) link the copy embedded in `libamd_comgr`, which is unchanged.
+process. Code compiled with hipcc or clang in the final image links the new
+bitcode, and so do kernels compiled at run time through hiprtc and MIOpen:
+`libamd_comgr` embeds its own copy, and the image's `libamd_comgr` is built
+from a tree carrying the same patch (next section). Libraries built in the
+earlier stages keep the copy they were linked with.
 
-Two problems remain:
-
-- A user kernel that applies a no-return atomic to fine-grained host memory
-  (including `atomicAdd()` on memory from a plain `hipHostMalloc`) still gets
-  the wrong value. Use the returned value, or keep such counters in
-  device memory. A compiler change would fix it everywhere; this image does not
-  rebuild the compiler.
-- A failed `assert()` ends with `Memory access fault ... on address (nil)`
-  instead of a clean trap report, after the assertion message is printed: a
-  compiler bug, described in the next section.
+One problem remains: a user kernel that applies a no-return atomic to
+fine-grained host memory (including `atomicAdd()` on memory from a plain
+`hipHostMalloc`) still gets the wrong value. Use the returned value, or keep
+such counters in device memory. A compiler change that selects the returning
+atomic for user code on gfx8 would fix it everywhere; the image's compiler
+patches do not include one.
 
 To check, build a kernel in which one lane calls `printf("x\n")` and
 synchronize. Without the patched `ockl.bc` the program hangs; with it the line
@@ -693,7 +690,7 @@ prints and the call returns.
 
 ### Non-inlined device functions read implicit kernel arguments from address 0
 
-Symptom: in the shipped PyTorch, a binary elementwise op on an fp16 and an
+Symptom: with AMD's compiler, a PyTorch binary elementwise op on an fp16 and an
 fp32 tensor (`torch.maximum`, `atan2`, `fmod`, `hypot`, `logaddexp`,
 `mse_loss`, `sigmoid_backward`, `gelu_backward` and others) ends the process
 with `Memory access fault ... on address (nil)` whenever the element count is
@@ -719,14 +716,20 @@ object in the images finds this load in 155 functions of `libtorch_hip.so`
 paths only in llama.cpp, and nowhere in rocBLAS, rocSOLVER, rocSPARSE,
 MIOpen's cached kernels, MIGraphX, ONNX Runtime or the SGEMM shim.
 
-Fix: in a callee, take the implicit-argument pointer the kernel passes. A
-ROCm 6.4.4 clang built with that change emits
-`s_load_dwordx2 s[0:1], s[8:9], 0xc8` where the shipped one emits a load from
-a null base; on the card the non-inlined stack-pointer probe passes (it
-faults with the shipped and with an unpatched build of the same source), and
-a failed `assert()` ends with a clean `HSA_STATUS_ERROR_EXCEPTION`. The
-images do not carry it yet: it needs the compiler, `libamd_comgr` (which
-embeds its own copy for run-time compilation) and PyTorch rebuilt with it.
+Fix (`patches/llvm/0001-*`): in a callee, take the implicit-argument pointer
+the kernel passes. The image builds `clang-19` and `libamd_comgr` (which
+embeds its own copy of the compiler for hipRTC and MIOpen's run-time
+kernels) from ROCm llvm-project `rocm-6.4.4` with the patch, builds PyTorch
+with that `clang-19`, and ships both. The callee then emits
+`s_load_dwordx2 s[0:1], s[8:9], 0xc8` where AMD's compiler loads from a null
+base. On the card: the 8 mixed-dtype ops above at 1000, 1052672 and 1048577
+elements are correct in 24 of 24 runs (24 faults before), a non-inlined
+stack-pointer cast passes, a failed `assert()` ends with
+`HSA_STATUS_ERROR_EXCEPTION`, and the SDXL UNet output is bit-identical at
+the same step time. The libraries built before PyTorch keep AMD's compiler;
+none of their code objects has the null-base load. A failed device-side
+assert now reaches `s_trap`, which with compute-wave save and restore off
+resets the GPU (section 3).
 
 A second gfx8 bug sits behind the first for LDS: a flat (generic-pointer)
 access that lands in LDS is bounds-checked against M0, and LLVM sets M0 only
@@ -734,13 +737,16 @@ for direct LDS instructions. A kernel that reaches LDS only through a
 generic pointer, as a non-inlined function returning a pointer into a
 `__shared__` array makes it, runs with M0 unset: its stores are dropped and
 its loads return 0, with no error. With the first fix alone such a callee
-stops faulting and starts returning zeros; setting M0 to -1 at kernel entry
-makes it correct. No shipped code object reads the LDS aperture from a
-callee.
+stops faulting and starts returning zeros. `patches/llvm/0002-*` selects
+`s_mov_b32 m0, -1` for every generic access on gfx6-gfx8, as for direct LDS
+accesses, and records the M0 use on the instruction so that later passes
+keep the initialisation in front of it; the probe then reads back every
+value. In one PyTorch source file it adds four `s_mov_b32` instructions to
+7,484 flat accesses.
 
 To check: `torch.maximum(torch.randn(1000, device="cuda").half(),
-torch.randn(1000, device="cuda"))` faults with the shipped images; with an
-element count of 1048576 it does not.
+torch.randn(1000, device="cuda"))` returns the elementwise maximum; with
+AMD's compiler it faults (with 1048576 elements it does not).
 
 ### rocSOLVER and rocSPARSE had no gfx803 code
 

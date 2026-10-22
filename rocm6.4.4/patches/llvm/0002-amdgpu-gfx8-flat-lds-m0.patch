@@ -1,0 +1,91 @@
+AMDGPU: FLAT accesses on GFX6-GFX8 initialise and use M0
+
+Generic (gfx6-gfx8; gfx803 is where it was found and tested).
+
+Verified on an RX 590 (gfx803) with clang built from ROCm llvm-project
+rocm-6.4.4 (d366fa84) with this patch on top of
+0001-amdgpu-callee-implicit-kernarg.patch.
+
+WHY
+---
+On gfx6-gfx8 a FLAT load, store or atomic whose address falls in the LDS
+aperture is range-checked against M0, like a DS instruction (AMDGPUUsage:
+"Flat access to LDS requires hardware aperture setup and M0 (GFX7-GFX8)
+register setup"). LLVM initialises M0 (s_mov_b32 m0, -1) only for accesses
+whose address space is LOCAL or REGION, and the FLAT instructions do not
+read M0, so an access through a generic pointer that points into LDS runs
+with whatever M0 holds. With M0 below the address the access is dropped:
+stores are lost and loads return 0, with no fault.
+
+It shows when the pointer is not resolved to an LDS address at compile
+time, for example a non-inlined function returning a pointer into a
+__shared__ array:
+
+  __attribute__((noinline)) __device__ int *lds_slot(int i) {
+      __shared__ int a[64]; return a + i; }
+  ... *lds_slot(t) = v; __syncthreads(); x = *lds_slot(63 - t);
+
+On gfx803 every value read back is 0; with `s_mov_b32 m0, -1` at kernel
+entry, or with the function inlined (DS instructions), it is correct.
+
+WHAT
+----
+- glueCopyToM0LDSInit glues M0 = -1 to FLAT-address-space loads, stores and
+  atomics on targets where ldsRequiresM0Init() holds, as it does for LOCAL.
+- SIFixSGPRCopies adds an implicit use of M0 to those FLAT instructions
+  before it merges M0 initialisations. Without the use the glued init is a
+  dead definition, and the merge and later passes move it past the access
+  or drop it (the first store after a call above stayed unguarded).
+Global and constant accesses, which gfx8 also emits as flat_*, carry
+address space 1 or 4 in their memory operand and are not touched. GlobalISel
+is not changed; HIP selects with SelectionDAG.
+
+Measured with the patched clang (RX 590): the probe above passes 64 of 64
+values (every value reads 0 without this patch), with `s_mov_b32 m0, -1`
+emitted before the generic store.
+
+diff --git a/llvm/lib/Target/AMDGPU/AMDGPUISelDAGToDAG.cpp b/llvm/lib/Target/AMDGPU/AMDGPUISelDAGToDAG.cpp
+index b84682cd5..da7155ea1 100644
+--- a/llvm/lib/Target/AMDGPU/AMDGPUISelDAGToDAG.cpp
++++ b/llvm/lib/Target/AMDGPU/AMDGPUISelDAGToDAG.cpp
+@@ -413,6 +413,11 @@ SDNode *AMDGPUDAGToDAGISel::glueCopyToM0LDSInit(SDNode *N) const {
+   if (AS == AMDGPUAS::LOCAL_ADDRESS) {
+     if (Subtarget->ldsRequiresM0Init())
+       return glueCopyToM0(N, CurDAG->getTargetConstant(-1, SDLoc(N), MVT::i32));
++  } else if (AS == AMDGPUAS::FLAT_ADDRESS) {
++    // A generic pointer can hit the LDS aperture, and gfx6-8 range-check that
++    // access against M0 as well; an uninitialised M0 drops the access.
++    if (Subtarget->ldsRequiresM0Init())
++      return glueCopyToM0(N, CurDAG->getTargetConstant(-1, SDLoc(N), MVT::i32));
+   } else if (AS == AMDGPUAS::REGION_ADDRESS) {
+     MachineFunction &MF = CurDAG->getMachineFunction();
+     unsigned Value = MF.getInfo<SIMachineFunctionInfo>()->getGDSSize();
+diff --git a/llvm/lib/Target/AMDGPU/SIFixSGPRCopies.cpp b/llvm/lib/Target/AMDGPU/SIFixSGPRCopies.cpp
+index 65d76baac..d3677e5d2 100644
+--- a/llvm/lib/Target/AMDGPU/SIFixSGPRCopies.cpp
++++ b/llvm/lib/Target/AMDGPU/SIFixSGPRCopies.cpp
+@@ -774,6 +774,24 @@ bool SIFixSGPRCopies::runOnMachineFunction(MachineFunction &MF) {
+   for (auto MI : PHINodes) {
+     processPHINode(*MI);
+   }
++  // On targets that range-check LDS accesses against M0, a FLAT access can
++  // reach LDS through the aperture, and selection glued an M0 init to it. The
++  // instruction itself does not read M0, which leaves that init dead: the
++  // merge below and later passes may then move it past the access or drop it.
++  if (ST.ldsRequiresM0Init()) {
++    for (MachineBasicBlock &MBB : MF) {
++      for (MachineInstr &MI : MBB) {
++        if (!TII->isFLAT(MI) || TII->isFLATGlobal(MI) || TII->isFLATScratch(MI) ||
++            MI.memoperands_empty() || MI.readsRegister(AMDGPU::M0, TRI))
++          continue;
++        if (llvm::any_of(MI.memoperands(), [](const MachineMemOperand *MMO) {
++              return MMO->getAddrSpace() == AMDGPUAS::FLAT_ADDRESS;
++            }))
++          MI.addOperand(MachineOperand::CreateReg(AMDGPU::M0, /*isDef=*/false,
++                                                  /*isImp=*/true));
++      }
++    }
++  }
+   if (MF.getTarget().getOptLevel() > CodeGenOptLevel::None && EnableM0Merge)
+     hoistAndMergeSGPRInits(AMDGPU::M0, *MRI, TRI, *MDT, TII);
+ 
