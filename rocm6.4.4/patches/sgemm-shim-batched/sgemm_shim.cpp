@@ -67,12 +67,25 @@
 //   GFX803_SGEMM_WAVE_GW=N          -- tile group width for gfx803_w_kernel
 //   GFX803_SGEMM_WAVE_KC2=1         -- fp16 one-wavefront tiles fetch two K
 //                                      rows per load
-//   GFX803_SGEMM_W2=0|1             -- two-wavefront TN tile (gfx803_w2_kernel)
+//   GFX803_SGEMM_W2=0|1|2           -- two-wavefront TN tile (gfx803_w2_kernel)
 //                                      for 0: no call, 1: every call whose
-//                                      shape it supports; unset:
-//                                      gfx803_w2_applies's rule. Outputs are
-//                                      bit-identical either way; for
-//                                      benchmarking
+//                                      shape it supports (64x128, or 64x64
+//                                      when N is not a multiple of 128), 2:
+//                                      the 64x64 tile on every call it
+//                                      supports; unset: gfx803_w2_pick_bn's
+//                                      rule. Outputs are bit-identical
+//                                      either way; for benchmarking
+//   GFX803_SGEMM_W2_BN64_MIN=N      -- smallest 64x64 tile count the
+//                                      two-wavefront 64x64 tile takes (0:
+//                                      never; default 12 * CUs)
+//   GFX803_SGEMM_PAD=0|1|2          -- TN operands whose rows lie a multiple
+//                                      of 1 KiB apart are copied with padded
+//                                      rows first (gfx803_pad_wanted): 0 = no
+//                                      copy, 2 = every such call, unset/1 =
+//                                      the rule. Outputs are bit-identical
+//                                      either way; for benchmarking
+//   GFX803_SGEMM_PAD_MAX_MB=N       -- largest per-stream copy buffer the
+//                                      padded copy may allocate (default 512)
 #define ROCBLAS_BETA_FEATURES_API
 #include <rocblas/rocblas.h>
 #include <hip/hip_runtime.h>

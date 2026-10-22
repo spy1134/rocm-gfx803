@@ -52,9 +52,9 @@
 // gfx803_w_kernel computes a 64x64 (or 64x32) tile with one wavefront, an 8x8
 // (or 8x4) block per thread, and no barrier; it takes the fp16 batched calls
 // that gfx803_w_applies picks from the 64x64 tiles.
-// gfx803_w2_kernel computes a 64x128 tile with two wavefronts sharing the A
-// piece; it takes the TN calls (nn.Linear, llama.cpp's prompt matmuls) that
-// gfx803_w2_applies picks.
+// gfx803_w2_kernel computes a 64x128 (or 64x64) tile with two wavefronts
+// sharing the A piece; it takes the TN calls (nn.Linear, llama.cpp's prompt
+// matmuls) that gfx803_w2_pick_bn picks.
 // gfx803_sgemm_small_n_kernel takes GEMMs with at most 8 columns of C and
 // op(A) = T, a token-by-token decode step's nn.Linear, as a GEMV; it sums in
 // a different order than the tiles (see the comment there).
@@ -90,6 +90,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <map>
+#include <mutex>
+#include <utility>
 #include <type_traits>
 
 #define GFX803_SGEMM_TILE 16
@@ -1722,64 +1725,70 @@ gfx803_w_kernel(int GW, int M, int N, int K, float alpha,
 // bit-identical.
 #define GFX803_W2_KH 16
 
-template <typename E>
-__global__ void __launch_bounds__(128) __attribute__((amdgpu_waves_per_eu(2)))
+template <typename E, int BN = 128>
+__global__ void __launch_bounds__(128) __attribute__((amdgpu_waves_per_eu(BN == 128 ? 2 : 3)))
 gfx803_w2_kernel(int M, int N, int K, float alpha,
                  const E* __restrict__ A, int lda, int64_t strideA,
                  const E* __restrict__ B, int ldb, int64_t strideB,
                  float beta, E* __restrict__ C, int ldc, int64_t strideC, int pz) {
     constexpr int KH = sizeof(E) == 2 ? GFX803_W2_KH : GFX803_W2_KH / 2;
     constexpr int VE = KH / 2;
+    constexpr int WN = BN / 2, PNW = WN / 8;
+    static_assert(BN == 64 || BN == 128, "two wavefronts split the tile's columns");
     typedef E vec __attribute__((ext_vector_type(VE)));
     __shared__ float As[KH][64];
-    __shared__ float Bs[KH][128];
+    __shared__ float Bs[KH][BN];
     const int64_t bz = (int64_t)blockIdx.z;
     A += bz * strideA;
     B += bz * strideB;
     C += bz * strideC;
     const int gx = M / 64;
-    const int row0 = (blockIdx.x % gx) * 64, col0 = (blockIdx.x / gx) * 128;
+    const int row0 = (blockIdx.x % gx) * 64, col0 = (blockIdx.x / gx) * BN;
     const int t = threadIdx.x, r = t >> 1, kq = (t & 1) * VE;
     const E* pa = A + (size_t)(row0 + r) * lda + kq;
     const E* pb0 = B + (size_t)(col0 + r) * ldb + kq;
-    const E* pb1 = B + (size_t)(col0 + 64 + r) * ldb + kq;
-    const int w = t >> 6, lane = t & 63, tx = lane & 7, ty = lane >> 3, cb = 64 * w;
+    const E* pb1 = BN == 128 ? B + (size_t)(col0 + 64 + r) * ldb + kq : nullptr;
+    const int w = t >> 6, lane = t & 63, tx = lane & 7, ty = lane >> 3, cb = WN * w;
 
     vec ra, rb0, rb1;
     auto load = [&]() {
         ra = *reinterpret_cast<const vec*>(pa);
         rb0 = *reinterpret_cast<const vec*>(pb0);
-        rb1 = *reinterpret_cast<const vec*>(pb1);
+        if constexpr (BN == 128) {
+            rb1 = *reinterpret_cast<const vec*>(pb1);
+            pb1 += KH;
+        }
         pa += KH;
         pb0 += KH;
-        pb1 += KH;
     };
     auto store = [&]() {
         #pragma unroll
         for (int e = 0; e < VE; e++) {
             As[kq + e][r] = static_cast<float>(ra[e]);
             Bs[kq + e][r] = static_cast<float>(rb0[e]);
-            Bs[kq + e][64 + r] = static_cast<float>(rb1[e]);
+            if constexpr (BN == 128) Bs[kq + e][64 + r] = static_cast<float>(rb1[e]);
         }
     };
 
-    float acc[8][8];
+    float acc[8][PNW];
     #pragma unroll
     for (int i = 0; i < 8; i++)
         #pragma unroll
-        for (int j = 0; j < 8; j++) acc[i][j] = 0.0f;
+        for (int j = 0; j < PNW; j++) acc[i][j] = 0.0f;
 
     auto compute = [&]() {
-        float a[2][8], b[2][8];
+        float a[2][8], b[2][PNW];
         auto read = [&](int s, int k) {
             const float4 x0 = *reinterpret_cast<const float4*>(&As[k][tx * 4]);
             const float4 x1 = *reinterpret_cast<const float4*>(&As[k][32 + tx * 4]);
             const float4 y0 = *reinterpret_cast<const float4*>(&Bs[k][cb + ty * 4]);
-            const float4 y1 = *reinterpret_cast<const float4*>(&Bs[k][cb + 32 + ty * 4]);
             a[s][0] = x0.x; a[s][1] = x0.y; a[s][2] = x0.z; a[s][3] = x0.w;
             a[s][4] = x1.x; a[s][5] = x1.y; a[s][6] = x1.z; a[s][7] = x1.w;
             b[s][0] = y0.x; b[s][1] = y0.y; b[s][2] = y0.z; b[s][3] = y0.w;
-            b[s][4] = y1.x; b[s][5] = y1.y; b[s][6] = y1.z; b[s][7] = y1.w;
+            if constexpr (PNW == 8) {
+                const float4 y1 = *reinterpret_cast<const float4*>(&Bs[k][cb + 32 + ty * 4]);
+                b[s][4] = y1.x; b[s][5] = y1.y; b[s][6] = y1.z; b[s][7] = y1.w;
+            }
         };
         read(0, 0);
         #pragma unroll
@@ -1788,7 +1797,7 @@ gfx803_w2_kernel(int M, int N, int K, float alpha,
             #pragma unroll
             for (int i = 0; i < 8; i++)
                 #pragma unroll
-                for (int j = 0; j < 8; j++) acc[i][j] += a[k & 1][i] * b[k & 1][j];
+                for (int j = 0; j < PNW; j++) acc[i][j] += a[k & 1][i] * b[k & 1][j];
             __builtin_amdgcn_sched_barrier(0);
         }
     };
@@ -1812,11 +1821,11 @@ gfx803_w2_kernel(int M, int N, int K, float alpha,
         #pragma unroll
         for (int i = 0; i < 8; i++)
             #pragma unroll
-            for (int j = 0; j < 8; j++) acc[i][j] += 0.0f;
+            for (int j = 0; j < PNW; j++) acc[i][j] += 0.0f;
     }
 
     #pragma unroll
-    for (int j = 0; j < 8; j++) {
+    for (int j = 0; j < PNW; j++) {
         const int col = col0 + cb + (j < 4 ? ty * 4 + j : 32 + ty * 4 + j - 4);
         #pragma unroll
         for (int i = 0; i < 8; i++) {
@@ -1852,15 +1861,37 @@ inline long gfx803_sgemm_cus() {
 // 8192x2048x2048 took 19.0 ms against 17.6 (14.7 with the columns 16 floats
 // further apart). GFX803_SGEMM_W2 overrides the rule for timing: 0 = never,
 // 1 = every call whose shape it supports.
-inline bool gfx803_w2_applies(int M, int N, int K, int batch, bool transA, bool transB, int ldc, size_t elem) {
+//
+// Calls with whole 64-wide tiles but too few 64x128 tiles take the same
+// kernel at 64x64: twice the tiles, and at 8x4 outputs per thread three
+// wavefronts per SIMD, six workgroups per CU. It needs two full rounds of
+// those slots (12 * CUs tiles): SDXL's TN 1280x2048x1280 (640 tiles) ran
+// 1.34 -> 1.19 ms and SD 1.5's 320x8192x320 (640) 0.334 -> 0.317 ms, while
+// 640x2048x640 (320 tiles) and 1280x512x1280 (160) ran 1.5% and 2.3%
+// slower. Rows of A or B a multiple of 1 KiB apart keep the older tiles:
+// the tile fetches 32 bytes from each of 64 rows at once, rows that far apart
+// fall in one or two DRAM channels, and the call ran 4-68% slower than the
+// 64x64 tile there (SDXL's K = 5120, 10 KiB rows: 6.2 -> 10.2 ms), against
+// 4-23% faster at the same shapes with the rows 16 elements further apart.
+// Returns the tile width, 128 or 64, or 0 for the older tiles.
+// GFX803_SGEMM_W2_BN64_MIN overrides the tile count from which 64x64 is taken
+// (0 = never); GFX803_SGEMM_W2=2 takes 64x64 on every call it supports.
+inline int gfx803_w2_pick_bn(int M, int N, int K, int batch, bool transA, bool transB, int lda, int ldb, int ldc,
+                             size_t elem) {
     static const long mode = gfx803_sgemm_env_long("GFX803_SGEMM_W2", -1);
-    if (mode == 0 || !transA || transB || M % 64 != 0 || N % 128 != 0 || K % GFX803_W2_KH != 0)
-        return false;
-    if (mode == 1)
-        return true;
+    static const long min64 = gfx803_sgemm_env_long("GFX803_SGEMM_W2_BN64_MIN", 12 * gfx803_sgemm_cus());
+    if (mode == 0 || !transA || transB || M % 64 != 0 || N % 64 != 0 || K % GFX803_W2_KH != 0)
+        return 0;
+    const bool wide = N % 128 == 0;
+    if (mode == 1) return wide ? 128 : 64;
+    if (mode == 2) return 64;
     if (elem == 4 && (int64_t)ldc * 4 % 32768 == 0)
-        return false;
-    return (long)(M / 64) * (N / 128) * batch >= 3 * 4 * gfx803_sgemm_cus();
+        return 0;
+    if (wide && (long)(M / 64) * (N / 128) * batch >= 3 * 4 * gfx803_sgemm_cus())
+        return 128;
+    if ((int64_t)lda * (int64_t)elem % 1024 == 0 || (int64_t)ldb * (int64_t)elem % 1024 == 0)
+        return 0;
+    return min64 > 0 && (long)(M / 64) * (N / 64) * batch >= min64 ? 64 : 0;
 }
 
 // Tile width for gfx803_w_kernel: 64x64 tiles unless 64x32 tiles fill the
@@ -2001,7 +2032,7 @@ inline hipError_t gfx803_scale_c(int M, int N, float beta, T* C, int ldc, int64_
 // route. Products and sums are fp32 either way and C is rounded once, when it
 // is stored, which is what rocBLAS does for fp16 with fp32 compute.
 template <typename T>
-inline hipError_t gfx803_gemm_strided_batched(int M, int N, int K,
+inline hipError_t gfx803_gemm_strided_batched_impl(int M, int N, int K,
                                               float alpha,
                                               const T* A, int lda, int64_t strideA, bool transA,
                                               const T* B, int ldb, int64_t strideB, bool transB,
@@ -2026,18 +2057,25 @@ inline hipError_t gfx803_gemm_strided_batched(int M, int N, int K,
     }
     const int tile = gfx803_sgemm_pick_tile(M, N, K, batch_count, sizeof(T) == 2);
     {
-        if (gfx803_w2_applies(M, N, K, batch_count, transA, transB, ldc, sizeof(T)) &&
-            (int64_t)(M / 64) * (N / 128) <= 0x7fffffff) {
+        const int w2_bn = gfx803_w2_pick_bn(M, N, K, batch_count, transA, transB, lda, ldb, ldc, sizeof(T));
+        if (w2_bn != 0 && (int64_t)(M / 64) * (N / w2_bn) <= 0x7fffffff) {
             const int kt_old = gfx803_sgemm_g_applies<T>(tile, M, K, lda, transA, ldb, transB) ? 32 : GFX803_SGEMM_BIG_K;
             (void)hipGetLastError();
             for (int start = 0; start < batch_count; start += GFX803_SGEMM_MAX_GRID_YZ) {
                 int chunk = batch_count - start;
                 if (chunk > GFX803_SGEMM_MAX_GRID_YZ) chunk = GFX803_SGEMM_MAX_GRID_YZ;
-                hipLaunchKernelGGL(gfx803_w2_kernel<T>, dim3((unsigned)((M / 64) * (N / 128)), 1, (unsigned)chunk),
-                                   dim3(128), 0, stream, M, N, K, alpha,
-                                   A + (int64_t)start * strideA, lda, strideA,
-                                   B + (int64_t)start * strideB, ldb, strideB, beta,
-                                   C + (int64_t)start * strideC, ldc, strideC, K % kt_old != 0 ? 1 : 0);
+                const dim3 grid((unsigned)((M / 64) * (N / w2_bn)), 1, (unsigned)chunk);
+                const int pz = K % kt_old != 0 ? 1 : 0;
+                if (w2_bn == 128)
+                    hipLaunchKernelGGL((gfx803_w2_kernel<T, 128>), grid, dim3(128), 0, stream, M, N, K, alpha,
+                                       A + (int64_t)start * strideA, lda, strideA,
+                                       B + (int64_t)start * strideB, ldb, strideB, beta,
+                                       C + (int64_t)start * strideC, ldc, strideC, pz);
+                else
+                    hipLaunchKernelGGL((gfx803_w2_kernel<T, 64>), grid, dim3(128), 0, stream, M, N, K, alpha,
+                                       A + (int64_t)start * strideA, lda, strideA,
+                                       B + (int64_t)start * strideB, ldb, strideB, beta,
+                                       C + (int64_t)start * strideC, ldc, strideC, pz);
                 hipError_t err = hipGetLastError();
                 if (err != hipSuccess) return err;
             }
@@ -2142,6 +2180,157 @@ inline hipError_t gfx803_gemm_strided_batched(int M, int N, int K,
     }
     return hipSuccess;
 }
+
+// Rows of a K-contiguous operand (op(A) = T, op(B) = N) 2 KiB or any multiple
+// of it apart all lie in one DRAM channel at each K offset (8 channels of 256
+// bytes), and a tile reads the same K offset of 64 to 192 rows at once, as do
+// all the tiles running beside it. With rows 16 elements further apart the
+// two-wavefront 64x64 tile ran fp16 TN 2.0-2.6x and fp32 TN 4-8x faster than
+// at 2 KiB multiples, the 64x64 tile 1.05-2.3x. Odd multiples of 1 KiB use two
+// channels (1.2-1.4x on the two-wavefront tile). Such an operand is copied,
+// rows padded by 16 elements, into per-stream scratch and the call runs on
+// the copy: every kernel sees the same values, so results are bit-identical.
+// The copy reads and writes each operand once; with it SDXL's 1280x2048x5120
+// linear (nn.Linear passes ld = K, 10 KiB rows) ran 6.29 -> 4.89 ms and fp32
+// TN 4096x2048x2048 14.5 -> 7.4 ms.
+template <typename T, int V>
+__global__ void __launch_bounds__(128)
+gfx803_pad_rows_kernel(const T* __restrict__ src, int ld_src, T* __restrict__ dst, int ld_dst, int K) {
+    typedef T vec __attribute__((ext_vector_type(V)));
+    const int64_t row = blockIdx.x;
+    const int kv = (int)(blockIdx.y * blockDim.x + threadIdx.x);
+    if (kv * V >= ld_dst) return;
+    const T* s = src + row * ld_src;
+    T* d = dst + row * ld_dst;
+    if (V == 1) {
+        d[kv] = kv < K ? s[kv] : T(0);
+    } else {
+        vec v;
+        if (kv * V + V <= K) {
+            v = *reinterpret_cast<const vec*>(s + (int64_t)kv * V);
+        } else {
+            #pragma unroll
+            for (int e = 0; e < V; e++) v[e] = kv * V + e < K ? s[kv * V + e] : T(0);
+        }
+        *reinterpret_cast<vec*>(d + (int64_t)kv * V) = v;
+    }
+}
+
+inline std::mutex& gfx803_pad_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+// Scratch is per (device, stream) so copies of concurrent streams don't
+// overwrite each other; the caller holds gfx803_pad_mutex() from the copy to
+// the end of the GEMM launch so threads sharing a stream don't either.
+inline void* gfx803_pad_scratch(hipStream_t stream, size_t bytes) {
+    static std::map<std::pair<int, hipStream_t>, std::pair<void*, size_t>> bufs;
+    static const size_t cap = (size_t)gfx803_sgemm_env_long("GFX803_SGEMM_PAD_MAX_MB", 512) << 20;
+    if (bytes > cap) return nullptr;
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess) return nullptr;
+    auto& b = bufs[{dev, stream}];
+    if (b.second < bytes) {
+        // Earlier kernels of this stream may still read the old buffer.
+        if (b.first) {
+            if (hipStreamSynchronize(stream) != hipSuccess) return nullptr;
+            (void)hipFree(b.first);
+            b = {nullptr, 0};
+        }
+        const size_t want = (bytes + (4u << 20) - 1) & ~(size_t)((4u << 20) - 1);
+        void* p = nullptr;
+        if (hipMalloc(&p, want) != hipSuccess) {
+            (void)hipGetLastError();
+            return nullptr;
+        }
+        b = {p, want};
+    }
+    return b.first;
+}
+
+template <typename T>
+inline int gfx803_pad_ld(int K) {
+    constexpr int e = (int)(1024 / sizeof(T));
+    int ld = (K + 15) / 16 * 16 + 16;
+    if (ld % e == 0) ld += 16;
+    return ld;
+}
+
+// Which operands to copy; bit 0 = A, bit 1 = B. Batched calls keep their
+// leading dimensions (their per-matrix copies would multiply the traffic).
+template <typename T>
+inline int gfx803_pad_wanted(int M, int N, int K, int batch, bool transA, bool transB, int lda, int ldb, int ldc) {
+    static const long mode = gfx803_sgemm_env_long("GFX803_SGEMM_PAD", 1);
+    if (mode == 0 || batch != 1 || !transA || transB || K < 64) return 0;
+    const int64_t ba = (int64_t)lda * sizeof(T), bb = (int64_t)ldb * sizeof(T);
+    const bool ca = ba % 1024 == 0, cb = bb % 1024 == 0;
+    if (!ca && !cb) return 0;
+    // The copy costs 4 bytes per element at ~200 GB/s; the gain is a fraction of
+    // 2*M*N*K flops, so small M or N does not repay it.
+    if (mode != 2 && (int64_t)M * N < 256 * ((int64_t)M + N)) return 0;
+    const bool one_channel = (ca && ba % 2048 == 0) || (cb && bb % 2048 == 0);
+    if (!one_channel && mode != 2) {
+        // Two channels: only the two-wavefront tile loses visibly there.
+        const int ldp = gfx803_pad_ld<T>(K);
+        if (gfx803_w2_pick_bn(M, N, K, batch, transA, transB, ldp, ldp, ldc, sizeof(T)) == 0) return 0;
+    }
+    return (ca ? 1 : 0) | (cb ? 2 : 0);
+}
+
+template <typename T>
+inline hipError_t gfx803_gemm_strided_batched(int M, int N, int K,
+                                              float alpha,
+                                              const T* A, int lda, int64_t strideA, bool transA,
+                                              const T* B, int ldb, int64_t strideB, bool transB,
+                                              float beta,
+                                              T* C, int ldc, int64_t strideC,
+                                              int batch_count,
+                                              hipStream_t stream = 0) {
+    const int want = alpha == 0.0f || K == 0
+                         ? 0
+                         : gfx803_pad_wanted<T>(M, N, K, batch_count, transA, transB, lda, ldb, ldc);
+    hipStreamCaptureStatus cap = hipStreamCaptureStatusNone;
+    if (want == 0 || hipStreamIsCapturing(stream, &cap) != hipSuccess || cap != hipStreamCaptureStatusNone)
+        return gfx803_gemm_strided_batched_impl<T>(M, N, K, alpha, A, lda, strideA, transA, B, ldb, strideB,
+                                                   transB, beta, C, ldc, strideC, batch_count, stream);
+    const int ldp = gfx803_pad_ld<T>(K);
+    const size_t bytes_a = (want & 1) ? ((size_t)M * ldp * sizeof(T) + 255) & ~(size_t)255 : 0;
+    const size_t bytes_b = (want & 2) ? ((size_t)N * ldp * sizeof(T) + 255) & ~(size_t)255 : 0;
+    std::lock_guard<std::mutex> lock(gfx803_pad_mutex());
+    char* scratch = static_cast<char*>(gfx803_pad_scratch(stream, bytes_a + bytes_b));
+    if (scratch != nullptr) {
+        (void)hipGetLastError();
+        auto copy = [&](const T* src, int ld_src, int rows, T* dst) {
+            constexpr int V = 16 / (int)sizeof(T);
+            const bool vec = K % V == 0 && (reinterpret_cast<uintptr_t>(src) % 16) == 0 &&
+                             ((size_t)ld_src * sizeof(T)) % 16 == 0;
+            const unsigned n = vec ? ldp / V : ldp;
+            const dim3 grid((unsigned)rows, (n + 127) / 128);
+            if (vec)
+                hipLaunchKernelGGL((gfx803_pad_rows_kernel<T, V>), grid, dim3(128), 0, stream, src, ld_src, dst, ldp, K);
+            else
+                hipLaunchKernelGGL((gfx803_pad_rows_kernel<T, 1>), grid, dim3(128), 0, stream, src, ld_src, dst, ldp, K);
+        };
+        if (want & 1) {
+            T* dst = reinterpret_cast<T*>(scratch);
+            copy(A, lda, M, dst);
+            A = dst;
+            lda = ldp;
+        }
+        if (want & 2) {
+            T* dst = reinterpret_cast<T*>(scratch + bytes_a);
+            copy(B, ldb, N, dst);
+            B = dst;
+            ldb = ldp;
+        }
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess) return err;
+    }
+    return gfx803_gemm_strided_batched_impl<T>(M, N, K, alpha, A, lda, strideA, transA, B, ldb, strideB, transB,
+                                               beta, C, ldc, strideC, batch_count, stream);
+}
+
 
 inline hipError_t gfx803_sgemm_strided_batched(int M, int N, int K,
                                                float alpha,

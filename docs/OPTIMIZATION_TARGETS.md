@@ -103,21 +103,21 @@ op(B) = not transposed.
 ### SDXL inference
 
 Pony V6 (SDXL), 1024 px, CFG batch 2, fp16 UNet, the gfx803 node: one UNet
-step 2.75 s. By kernel, before the two-wavefront TN tile (BLAS-7; step
+step 2.67 s. By kernel, before the two-wavefront TN tile (BLAS-7; step
 2.98 s then): the shim's GEMMs 2.23 s (75%), fused attention 0.50 s (17%),
 elementwise and norms 0.18 s, Winograd transforms 0.04 s; the fused
 attention is now 0.42 s (SD-9). At sustained clocks the large linears run
 at 5.0-5.3 TFLOPS (10240x2048x1280 10.2 ms), the 1280-wide ones with few
-tiles stay on the 64x64 tile at 4.1-4.6 (see BLAS-7), and the
-cross-attention K/V projections of the 77-token context (n = 154, 1.1-2.5
-TFLOPS) lose about 30 ms per step.
+tiles at about 5.5 (short timings) on the 64x64 two-wavefront tile and a
+padded copy of their operands (see BLAS-7), and the cross-attention K/V projections of the
+77-token context (n = 154, 1.1-2.5 TFLOPS) lose about 30 ms per step.
 
 The VAE decode at 1024 px is the other cost. With `--bf16-vae` its
 convolutions run on im2col GEMMs (there is no bf16 Winograd), and ComfyUI
 falls back to tiled decoding when the regular decode runs out of memory,
 which it does on some images and not others: 20-step images took 83 and
 99 s end to end with the same 67 s of sampling, at 3.36 s per UNet step (now
-2.75 s, about 55 s of sampling; the end-to-end times are not re-measured).
+2.67 s, about 53 s of sampling; the end-to-end times are not re-measured).
 With `--fp32-vae` the decode uses the F(2x2,3x3) solver and the shim and took
 86 s with tiling (decode alone, tiled: bf16 24.6 s, fp32 12.2 s; outputs
 within 0.03 of each other on a 0-1 scale). MIOpen's first Find over the bf16
@@ -180,7 +180,7 @@ Open targets in recommended order, then the done ones.
 | SD-12 | SDXL VAE decode at 1024 px | 12-25 s of an 83-99 s image, by VAE precision | Open, measured end to end |
 | SD-2 | Winograd F(4x4, 3x3) in the gfx803 HIP solver | estimate ~25 ms (7%) of an fp16 SD 1.5 step, more at SDXL; precision and small latents unknown | Open, estimate |
 | TRAIN-3 | Where a training step goes | unmeasured; fp16 NT GEMMs still run on the older tiles | Open, profile first |
-| BLAS-7 | Shim GEMM efficiency at SD 1.5 / SDXL shapes | fp16 dispatch fixes, fp16 widening, a one-wavefront tile for batched NN and a two-wavefront TN tile took the SD 1.5 step 415 -> 355 ms, SDXL 3.34 -> 2.84 s; the two-wavefront tile also takes fp32 TN (8-23% faster at llama.cpp's prompt shapes and SD's fp32 linears); left: a faster main tile, a 64x64 two-wavefront tile for few-tile TN calls | Open, measured |
+| BLAS-7 | Shim GEMM efficiency at SD 1.5 / SDXL shapes | fp16 dispatch fixes, fp16 widening, a one-wavefront tile for batched NN and a two-wavefront TN tile took the SD 1.5 step 415 -> 355 ms, SDXL 3.34 -> 2.84 s; the two-wavefront tile also takes fp32 TN (8-23% faster at llama.cpp's prompt shapes and SD's fp32 linears); its 64x64 form for TN calls with few tiles and a padded copy of operands whose rows camp on one DRAM channel took the SDXL step 2.77 -> 2.67 s, bit-identical; left: a faster main tile | Open, measured |
 | SD-9 | SDXL attention | P now moves between lanes inside the multiply-adds (DPP): SDXL step attention 0.50 -> 0.42 s (step 2.84 -> 2.75 s), SD 1.5 91 -> 79 ms (step 355 -> 342 ms); self-attention at ~4 TFLOPS against ~5.4 for its instruction mix | Open, measured |
 | LLM-10 | Image prompts | a 1080p image (~2000 tokens) 56 s, against ~15 s for 2000 text tokens (Qwen3.5 9B) | Open, unmeasured |
 | SD-7 | Fused Winograd F(2x2, 3x3) | fp16 SD at most ~9 ms per step (2%); fp32 and training unmeasured | Open, low |
@@ -671,21 +671,37 @@ rule and with the tile forced on every call it supports. Qwen3.6 35B-A3B
 pp2048 (llama-bench, experts in RAM): 584 / 574 -> 603 / 592 tok/s with the
 desktop busy, and with patch 127 on top 602 / 602 -> 616 / 615.
 
-SDXL's 1280-wide linears have too few 64x128 tiles for the rule (320 for
-1280x2048) and stay on the 64x64 tile, at 4.1-4.6 TFLOPS sustained:
-1280x2048x1280 1.45 ms (372 calls per step) and the feed-forward output
-projection 1280x2048x5120 6.5 ms (60 calls). The second also shows why
-the two-wavefront tile is limited to many tiles. Its rows are 10240 bytes
-apart, a multiple of 2048, so the 192 rows a tile reads at one k fall in
-the same DRAM channel, and the two-wavefront tile, which reads half of
-each 64-byte line per slice and needs L2 to keep the other half, took
-9.2 ms. Every row stride that is a multiple of 2048 bytes does the same
-(K = 3072, 4096, 6144 at fp16); with rows padded by 64 halves it ran 4.9-6.4
-ms, depending on where the buffers landed. At 2048 tiles (4096x4096xK) it
-stays at or ahead of the 64x64 tile even at those strides, so the rule
-needs no stride test. Padding the operands into a copy would take scratch
-memory, which the shim has none of by design, for at most ~80 ms of
-SDXL's step.
+SDXL's 1280-wide linears have too few 64x128 tiles for that rule (320 for
+1280x2048). They take the same kernel at 64x64 (`gfx803_w2_pick_bn`): twice
+the tiles, 8x4 outputs per thread, 77 VGPRs and three wavefronts per SIMD,
+from two full rounds of its six slots per CU (12 x CUs tiles) on. TN
+1280x2048x1280 (372 calls per step) ran 1.34 -> 1.19 ms, SD 1.5's
+320x8192x320 0.334 -> 0.317; 640x2048x640 (320 tiles) and 1280x512x1280
+(160) ran 1.5% and 2.3% slower and keep the 64x64 tile.
+
+Row strides that are a multiple of 1 KiB camp on DRAM channels (8 channels
+of 256 bytes, the channel picked by address bits 8-10): rows a multiple of
+2 KiB apart put every row a tile reads at one k, and the rows of every tile
+beside it, in one channel, odd multiples of 1 KiB in two. nn.Linear passes
+ld = K, so SDXL's feed-forward output projection 1280x2048x5120 (10240-byte
+rows, 60 calls, 6.3 ms) camps. Rows at ld = K against K + 16, fp16 TN
+1280x2048xK: the 64x64 tile is 5-13% slower at 2 KiB multiples, the 64x64
+two-wavefront tile 2.0-2.6x; fp32 TN 512x2048xK 1.4-2.3x and 4-8x. The shim
+therefore copies a TN operand whose rows lie a multiple of 1 KiB apart
+into per-stream scratch with rows 16 elements longer (`gfx803_pad_wanted`:
+batch 1, K >= 64, M x N >= 256 (M + N); odd multiples only where the
+two-wavefront tile then takes the call) and runs the call on the copy.
+With the copy: TN 1280x2048x5120 6.29 -> 4.89 ms, 1280x2048x3072 3.43 ->
+2.92, 320x8192x5120 6.58 -> 5.80, fp32 TN 4096x2048x2048 14.5 -> 7.4 and
+512x2048x4096 4.63 -> 3.16. SDXL's GEMM log 1985 -> 1858 ms, and the step
+(same setup as above) 2.77 -> 2.67 s with the UNet output bit-identical,
+three alternating runs each; SD 1.5's strides do not camp (its log is
+unchanged). Bit-identical to the previous shim on the 956-case check
+(camped strides on one or both operands, offsets, batch 2, the copy off,
+on and forced), the 46-case shim_equal set and the fp16 GEMM sweep. The
+copy buffer is allocated per stream outside PyTorch's allocator (34 MB for
+SDXL's call, capped by `GFX803_SGEMM_PAD_MAX_MB`, default 512); when the
+allocation fails the call runs on the original operands.
 
 **Left, by time lost per step against 4.8 TFLOPS** (each shape timed alone):
 TN with n = 128/154 (cross-attention K/V projections and the 16x16 level)
@@ -696,8 +712,8 @@ needs a faster main tile rather than more dispatch rules. The two-wavefront
 tile loses where a call has fewer than three rounds of its tiles (TN
 1280x512x1280 0.41 -> 0.51 ms, 640x2048x640 0.38 -> 0.44, and
 1280x2048x5120 6.5 -> 9.2 ms, where the channel camping above adds to it),
-and the rule leaves those calls on the 64x64 tile. A 64x64 two-wavefront
-variant for them is what is left of the TN linears.
+and the rule leaves those calls on the 64x64 tile or, from two rounds of
+64x64 tiles on, on the 64x64 two-wavefront tile.
 
 **Measured, not adopted** (short timings at the boost clock; the ratios
 hold). Ablating a 64x64 4x4-per-thread NN tile (2048^3, fp32) attributes its
