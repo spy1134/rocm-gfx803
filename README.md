@@ -134,6 +134,14 @@ gives each problem's symptom, cause, fix and how to reproduce the check.
   operand instead of updating the value: `atomicAdd()` of 5 to 1 leaves 5. Use the returned value or keep such counters in
   device memory. The image's patched `ockl.bc` does this for HSA signals, which
   is what makes device `printf` and `assert()` messages work.
+- In PyTorch, a binary elementwise op on an fp16 and an fp32 tensor
+  (`torch.maximum`, `atan2`, `fmod`, `mse_loss`, `gelu_backward` and others)
+  crashes with `Memory access fault ... on address (nil)` when the element
+  count is not a multiple of 16384. Convert both operands to one dtype first.
+  The cause is a compiler bug on gfx8 ("Non-inlined device functions read
+  implicit kernel arguments from address 0" in
+  [`docs/FINDINGS.md`](docs/FINDINGS.md)); a failed `assert()` faults at its
+  trap for the same reason.
 - Mining-edition cards often ship with memory clocked above its rating, which
   causes random faults and freezes. Check the memory clock first (see "Host
   VBIOS setting" in [`README-rocm10.md`](README-rocm10.md)).

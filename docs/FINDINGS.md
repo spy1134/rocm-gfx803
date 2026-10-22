@@ -103,7 +103,8 @@ run with wrong numbers, not a crash. "It runs" was never taken as evidence.
 | Kernels read stale data from the per-CU vector L1 after a freed address is reused (silent wrong results in rocBLAS, rocSOLVER, torch.linalg) | Fixed (libamdhip64 rebuilt); decode costs about 2.6% | 4 | `patches/clr/` |
 | Device printf and assert() hang (hostcall's doorbell signal never changes) | Fixed (ockl.bc rebuilt) | 4 | `patches/device-libs/` |
 | No-return atomics on fine-grained host memory store their operand instead (user kernels) | Open (hardware; use the returned value) | 4 | none |
-| A failed assert() in a non-inlined function faults at the trap (queue pointer read from address 0xc8) | Open (compiler) | 4 | none |
+| Non-inlined device functions read implicit kernel arguments from address 0: PyTorch's mixed fp16/fp32 binary ops crash, assert() faults at its trap | Open (compiler); fix drafted and verified in a scratch compiler, not in the images | 4 | none |
+| Flat (generic-pointer) accesses to LDS are dropped when M0 is not set (gfx8) | Open (compiler) | 4 | none |
 | rocSOLVER and rocSPARSE ship no gfx803 code, so their kernels silently never run | Fixed (rebuilt for gfx803) | 4 | `patches/rocsolver/`, `patches/rocsparse/` |
 | VRAM exhaustion freezes the desktop | Mitigated (VRAM cap) | 7 | `training/gfx803-train.sh` |
 | llama.cpp prompt processing 10x slow | Fixed | 9 | `patches/ollama/llama-cpp/100-*` |
@@ -683,16 +684,63 @@ Two problems remain:
   device memory. A compiler change would fix it everywhere; this image does not
   rebuild the compiler.
 - A failed `assert()` ends with `Memory access fault ... on address (nil)`
-  instead of a clean trap report. On gfx8 the trap handler expects the queue
-  pointer in `s[0:1]` at `s_trap`. A trap inside a function that is not
-  inlined (`__assert_fail`) loads it from address 0xc8, the implicit-argument
-  offset with no base, while a trap in the kernel body loads it from the
-  kernel arguments. This is a compiler bug, not fixed here. The process still
-  ends with the assertion message printed.
+  instead of a clean trap report, after the assertion message is printed: a
+  compiler bug, described in the next section.
 
 To check, build a kernel in which one lane calls `printf("x\n")` and
 synchronize. Without the patched `ockl.bc` the program hangs; with it the line
 prints and the call returns.
+
+### Non-inlined device functions read implicit kernel arguments from address 0
+
+Symptom: in the shipped PyTorch, a binary elementwise op on an fp16 and an
+fp32 tensor (`torch.maximum`, `atan2`, `fmod`, `hypot`, `logaddexp`,
+`mse_loss`, `sigmoid_backward`, `gelu_backward` and others) ends the process
+with `Memory access fault ... on address (nil)` whenever the element count is
+not a multiple of 16384; at an exact multiple it is correct. A failed
+`assert()` faults at its trap the same way.
+
+Cause: on gfx8 a few values come from the kernel's implicit arguments that
+gfx9 and newer read from hardware registers: the queue pointer the trap
+handler expects in `s[0:1]`, and the private and shared aperture bases
+needed to turn a stack or LDS address into a generic pointer. LLVM's
+`SITargetLowering::loadImplicitKernelArgument` computes their address from
+the kernel-argument pointer, which a function that is not inlined does not
+have, and then uses the bare offset: the callee loads the queue pointer from
+address 0xc8 and the apertures from 0xc0 and 0xc4. The kernel already passes
+the implicit-argument pointer to such callees (in `s[8:9]`); only this
+lowering ignores it. Upstream LLVM has the same code. It reaches only
+pre-gfx9 targets with code object v5 or later, which the images use.
+PyTorch's vectorized elementwise kernel runs its last, partial block through
+a non-inlined `elementwise_kernel_helper` whose prologue builds a generic
+pointer to its stack; that is the fault above. A scan of every gfx803 code
+object in the images finds this load in 155 functions of `libtorch_hip.so`
+(64 aperture loads, the rest on assert and unsupported-cast paths), on trap
+paths only in llama.cpp, and nowhere in rocBLAS, rocSOLVER, rocSPARSE,
+MIOpen's cached kernels, MIGraphX, ONNX Runtime or the SGEMM shim.
+
+Fix: in a callee, take the implicit-argument pointer the kernel passes. A
+ROCm 6.4.4 clang built with that change emits
+`s_load_dwordx2 s[0:1], s[8:9], 0xc8` where the shipped one emits a load from
+a null base; on the card the non-inlined stack-pointer probe passes (it
+faults with the shipped and with an unpatched build of the same source), and
+a failed `assert()` ends with a clean `HSA_STATUS_ERROR_EXCEPTION`. The
+images do not carry it yet: it needs the compiler, `libamd_comgr` (which
+embeds its own copy for run-time compilation) and PyTorch rebuilt with it.
+
+A second gfx8 bug sits behind the first for LDS: a flat (generic-pointer)
+access that lands in LDS is bounds-checked against M0, and LLVM sets M0 only
+for direct LDS instructions. A kernel that reaches LDS only through a
+generic pointer, as a non-inlined function returning a pointer into a
+`__shared__` array makes it, runs with M0 unset: its stores are dropped and
+its loads return 0, with no error. With the first fix alone such a callee
+stops faulting and starts returning zeros; setting M0 to -1 at kernel entry
+makes it correct. No shipped code object reads the LDS aperture from a
+callee.
+
+To check: `torch.maximum(torch.randn(1000, device="cuda").half(),
+torch.randn(1000, device="cuda"))` faults with the shipped images; with an
+element count of 1048576 it does not.
 
 ### rocSOLVER and rocSPARSE had no gfx803 code
 
