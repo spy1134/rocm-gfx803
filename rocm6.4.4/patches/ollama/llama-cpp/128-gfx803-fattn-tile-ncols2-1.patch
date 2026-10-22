@@ -1,0 +1,242 @@
+llama.cpp (as fetched by Ollama v0.35.1, llama.cpp b11232, applied after
+127; changes code that patch 101 adds): on gfx803, flash-attention tiles
+that serve one query head per K/V head run at most 32 columns wide, with a
+register budget chosen per head size.
+gfx803-specific: engages only for cc == GGML_CUDA_CC_GCN4 (host) and GCN4
+(device code).
+
+WHY
+---
+Image prompts are slow on gfx803. With Qwen3.5 9B and its vision projector,
+a 1920x1080 image (2061 prompt tokens) takes 50.4 s to process against 8.8 s
+for 2028 text tokens. rocprof puts 38.7 s of it in one kernel, the vision
+encoder's flash attention: 27 calls of flash_attn_tile<72, 72, 64, 1>, 1.43
+s each for about 307 GFLOP (8160 patches attending to 8160, 16 heads), or
+0.21 TFLOPS.
+
+A vision encoder gives each query head its own K and V, so its attention
+runs the tile kernel with ncols2 == 1. Patch 101 moved the wide tiles with
+ncols2 > 1 to the fp32 path; the ncols2 == 1 tiles stay on the half2 path,
+because on the fp32 path they spill more and run slower. For prompt-sized
+batches they run 64 columns wide, and at the AMD table's occupancy of 2
+(128 VGPRs) the 64x1 tile spills for every head size: 154 VGPRs to scratch
+at head size 40, 305 at 72, 578 at 80, 817 at 112, and 568 at 128 even at
+patch 101's occupancy of 1. Text models whose GQA ratio is odd run the same
+tiles: Qwen2.5-Coder 7B (head size 128, GQA 7) processes a 512-token prompt
+8192 tokens deep at 60 tok/s.
+
+Narrower tiles need fewer registers. Raising the 64x1 tile to occupancy 1
+only halves the time (head size 72: 1.43 -> 0.72 s), and moving these tiles
+to the fp32 path makes them 2.2x slower (head size 72). The 32- and
+16-column tiles, at occupancy 1 where it helps, spill little or not at all
+and run 1.9-5.7x faster.
+
+WHAT
+----
+launch_fattn_tile_switch_ncols1() never picks the 64-column tile for
+ncols2 == 1 on gfx803, and picks the 32-column tile only for head sizes
+40, 64, 80 and 96 (ggml_cuda_fattn_tile_gcn4_ncols2_1_max_ncols()); other
+head sizes use at most 16 columns. Device code looks up a tile's
+configuration with its ncols2 (the device getters take it as a template
+argument); on GCN4 with ncols2 == 1 a new table,
+ggml_cuda_fattn_tile_get_config_amd_gcn4_ncols2_1(), gives the 16- and
+32-column tiles occupancy 1 for head sizes 64, 80, 96, 112, 128 and 256 and
+falls back to the gcn4 table otherwise. Only occupancy changes, so the host,
+which reads the AMD table, still computes the right thread counts and batch
+sizes. Tiles with ncols2 > 1 compile to the same code as before (VGPR,
+occupancy and spill counts of every instance compared).
+
+Measured on an RX 590, test-backend-ops perf, 16 heads, f16 K/V, no mask,
+ms per call at 1024 x 1024 / 8160 x 8160:
+
+    head size  40:    8.4 /  522.3  ->   2.4 /  138.8
+               64:   15.4 /  957.4  ->   3.3 /  168.4
+               72:   22.0 / 1389.8  ->   4.4 /  254.2
+               80:   29.5 / 1820.7  ->   5.6 /  327.2
+               96:   39.9 / 2495.7  ->   8.0 /  434.2
+              112:   43.7 / 2727.2  ->  10.0 /  681.1
+              128:   29.3 / 1904.3  ->   9.2 /  535.1
+              256:  108.2 / 6818.8  ->  53.8 / 3506.4
+
+The 1920x1080 image with Qwen3.5 9B (llama-server, flash attention on,
+q8_0 KV cache): 50.4 -> 18.7 s; the 2028-token text prompt is unchanged
+(8.77 s, the model's text layers use GQA). The same image with Qwen3.6
+35B-A3B Q4_K_M and its vision projector, every expert in system RAM
+(-ncmoe 99, 1024-token batches): 47.3 -> 16.0 s, generation unchanged
+(23.3 / 23.9 tok/s). Qwen2.5-Coder 7B Q4_K_M,
+llama-bench -fa 1 -ctk q8_0 -ctv q8_0 -p 512 at depth 0 / 4096 / 8192:
+208.0 / 93.8 / 60.2 -> 224.8 / 158.8 / 123.1 tok/s.
+
+The results are not bit-identical: a different tile width sums in a
+different order. Against the CPU backend (1024 x 1024, 16 heads, with and
+without mask), the normalized mean squared error is the same as before for
+head sizes 40-96 (2.5e-5 - 3.1e-5) and lower for 112, 128 and 256 (2.5e-5 -
+2.9e-5 -> 3.4e-6 - 5.2e-6).
+
+Verified on an RX 590: test-backend-ops test -b ROCm0 -o FLASH_ATTN_EXT
+passes against the CPU backend (3982/3982, 1913 of them with ncols2 == 1).
+To reproduce the slowdown, run test-backend-ops perf -o FLASH_ATTN_EXT with
+a case of head size 72, 16 heads, one query head per K/V head, 4096 queries
+and keys, f16 K/V and no mask, with and without the patch.
+
+--- a/ggml/src/ggml-cuda/fattn-tile-kernel.cuh
++++ b/ggml/src/ggml-cuda/fattn-tile-kernel.cuh
+@@ -418,7 +418,7 @@
+ }
+ 
+ template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap> // D == head size
+-__launch_bounds__(ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_tile_get_occupancy(DKQ, DV, ncols1*ncols2))
++__launch_bounds__(ggml_cuda_fattn_tile_get_nthreads<ncols2>(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_tile_get_occupancy<ncols2>(DKQ, DV, ncols1*ncols2))
+ static __global__ void flash_attn_tile(
+         const char * Q_ptr,
+         const char * K_ptr,
+@@ -467,13 +467,13 @@
+         return;
+     }
+ 
+-    static_assert(ggml_cuda_fattn_tile_get_config(DKQ, DV, ncols1*ncols2) != 0, "kernel config not defined");
++    static_assert(ggml_cuda_fattn_tile_get_config<ncols2>(DKQ, DV, ncols1*ncols2) != 0, "kernel config not defined");
+ 
+     constexpr int ncols     = ncols1*ncols2;
+     constexpr int warp_size = 32;
+-    constexpr int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, ncols1*ncols2) / warp_size;
+-    constexpr int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, ncols1*ncols2);
+-    constexpr int nbatch_K  = ggml_cuda_fattn_tile_get_nbatch_K (DKQ, DV, ncols1*ncols2);
++    constexpr int nwarps    = ggml_cuda_fattn_tile_get_nthreads<ncols2> (DKQ, DV, ncols1*ncols2) / warp_size;
++    constexpr int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa<ncols2>(DKQ, DV, ncols1*ncols2);
++    constexpr int nbatch_K  = ggml_cuda_fattn_tile_get_nbatch_K<ncols2> (DKQ, DV, ncols1*ncols2);
+ 
+     // In this kernel Q, K, V are matrices while i, j, k are matrix indices.
+ 
+--- a/ggml/src/ggml-cuda/fattn-tile.cuh
++++ b/ggml/src/ggml-cuda/fattn-tile.cuh
+@@ -317,6 +317,44 @@
+     return 0;
+ }
+ 
++// gfx803, tiles with one query head per K/V head (ncols2 == 1: vision encoders,
++// and text models whose GQA ratio is odd). These tiles stay on the half2 path,
++// which spills at 64 columns for every head size (head size 72: 305 VGPRs).
++// launch_fattn_tile_switch_ncols1() caps their width at
++// ggml_cuda_fattn_tile_gcn4_ncols2_1_max_ncols(); this table raises the VGPR
++// budget of the 16- and 32-column tiles to occupancy 1 where that is faster.
++// Measured on an RX 590 with 16 heads, 4096 queries x 4096 keys, f16 K/V, no
++// mask: occupancy 2 is better for head sizes 40 and 72 and is left as it is.
++// Only the occupancy differs from the table above, so the host's thread counts
++// and batch sizes stay correct.
++static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_amd_gcn4_ncols2_1(const int DKQ, const int DV, const int ncols) {
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 64,  64, 16, 256, 1, 128,  64)
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 64,  64, 32, 256, 1,  64,  64)
++
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 80,  80, 16, 256, 1,  32,  40)
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 80,  80, 32, 256, 1,  32,  40)
++
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 96,  96, 16, 256, 1,  32,  48)
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 96,  96, 32, 256, 1,  32,  48)
++
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE(112, 112, 16, 256, 1,  32,  56)
++
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128, 16, 256, 1,  64, 128)
++
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 16, 256, 1,  32, 128)
++
++    return ggml_cuda_fattn_tile_get_config_amd_gcn4(DKQ, DV, ncols);
++}
++
++// Widest ncols2 == 1 tile on gfx803, by head size. Time per call against the
++// 64-column tile (RX 590, same shapes as above): 0.27x for head size 40, 0.18x
++// for 64, 80 and 96 at 32 columns; 0.18x for 72, 0.25x for 112 and 0.28x for 128
++// at 16 columns (128 at 32 columns: 0.55x). Head size 256, which has no
++// 64-column tile: 0.51x of its 32-column tile at 16 columns.
++static constexpr __host__ int ggml_cuda_fattn_tile_gcn4_ncols2_1_max_ncols(const int DKQ) {
++    return DKQ == 40 || DKQ == 64 || DKQ == 80 || DKQ == 96 ? 32 : 16;
++}
++
+ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_amd_rdna(const int DKQ, const int DV, const int ncols) {
+     GGML_CUDA_FATTN_TILE_CONFIG_CASE( 40,  40,  2,  64, 2,  32,  40)
+     GGML_CUDA_FATTN_TILE_CONFIG_CASE( 40,  40,  4, 128, 2,  32,  40)
+@@ -400,6 +438,8 @@
+         if (GGML_CUDA_CC_IS_RDNA(cc)) {
+             return ggml_cuda_fattn_tile_get_config_amd_rdna(DKQ, DV, ncols);
+         }
++        // Also for gfx803: its tables change only the occupancy, which the host
++        // does not read.
+         return ggml_cuda_fattn_tile_get_config_amd(DKQ, DV, ncols);
+     }
+     if (fast_fp16_available(cc)) {
+@@ -408,12 +448,14 @@
+     return ggml_cuda_fattn_tile_get_config_nvidia_fp32(DKQ, DV, ncols);
+ }
+ 
++template <int ncols2>
+ static constexpr __device__ uint32_t ggml_cuda_fattn_tile_get_config(const int DKQ, const int DV, const int ncols) {
+ #ifdef GGML_USE_HIP
+ #ifdef RDNA
+     return ggml_cuda_fattn_tile_get_config_amd_rdna(DKQ, DV, ncols);
+ #elif defined(GCN4)
+-    return ggml_cuda_fattn_tile_get_config_amd_gcn4(DKQ, DV, ncols);
++    return ncols2 == 1 ? ggml_cuda_fattn_tile_get_config_amd_gcn4_ncols2_1(DKQ, DV, ncols) :
++                         ggml_cuda_fattn_tile_get_config_amd_gcn4(DKQ, DV, ncols);
+ #else
+     return ggml_cuda_fattn_tile_get_config_amd(DKQ, DV, ncols);
+ #endif // RDNA
+@@ -430,32 +472,36 @@
+     return (ggml_cuda_fattn_tile_get_config(DKQ, DV, ncols, cc) >> 0) & ((1 << 10) - 1);
+ }
+ 
++template <int ncols2>
+ static constexpr __device__ int ggml_cuda_fattn_tile_get_nthreads(const int DKQ, const int DV, const int ncols) {
+-    return (ggml_cuda_fattn_tile_get_config(DKQ, DV, ncols) >> 0) & ((1 << 10) - 1);
++    return (ggml_cuda_fattn_tile_get_config<ncols2>(DKQ, DV, ncols) >> 0) & ((1 << 10) - 1);
+ }
+ 
+ static __host__ int ggml_cuda_fattn_tile_get_occupancy(const int DKQ, const int DV, const int ncols, const int cc) {
+     return (ggml_cuda_fattn_tile_get_config(DKQ, DV, ncols, cc) >> 10) & ((1 << 4) - 1);
+ }
+ 
++template <int ncols2>
+ static constexpr __device__ int ggml_cuda_fattn_tile_get_occupancy(const int DKQ, const int DV, const int ncols) {
+-    return (ggml_cuda_fattn_tile_get_config(DKQ, DV, ncols) >> 10) & ((1 << 4) - 1);
++    return (ggml_cuda_fattn_tile_get_config<ncols2>(DKQ, DV, ncols) >> 10) & ((1 << 4) - 1);
+ }
+ 
+ static __host__ int ggml_cuda_fattn_tile_get_nbatch_fa(const int DKQ, const int DV, const int ncols, const int cc) {
+     return (ggml_cuda_fattn_tile_get_config(DKQ, DV, ncols, cc) >> 14) & ((1 << 9) - 1);
+ }
+ 
++template <int ncols2>
+ static constexpr __device__ int ggml_cuda_fattn_tile_get_nbatch_fa(const int DKQ, const int DV, const int ncols) {
+-    return (ggml_cuda_fattn_tile_get_config(DKQ, DV, ncols) >> 14) & ((1 << 9) - 1);
++    return (ggml_cuda_fattn_tile_get_config<ncols2>(DKQ, DV, ncols) >> 14) & ((1 << 9) - 1);
+ }
+ 
+ static __host__ int ggml_cuda_fattn_tile_get_nbatch_K(const int DKQ, const int DV, const int ncols, const int cc) {
+     return (ggml_cuda_fattn_tile_get_config(DKQ, DV, ncols, cc) >> 23) & ((1 << 9) - 1);
+ }
+ 
++template <int ncols2>
+ static constexpr __device__ int ggml_cuda_fattn_tile_get_nbatch_K(const int DKQ, const int DV, const int ncols) {
+-    return (ggml_cuda_fattn_tile_get_config(DKQ, DV, ncols) >> 23) & ((1 << 9) - 1);
++    return (ggml_cuda_fattn_tile_get_config<ncols2>(DKQ, DV, ncols) >> 23) & ((1 << 9) - 1);
+ }
+ 
+ // gfx803 has fp16 arithmetic but no packed half2 instructions and no double-rate
+@@ -502,7 +548,7 @@
+ 
+ #ifdef GGML_USE_HIP
+     if constexpr (DKQ <= 128) {
+-        if (Q->ne[1] > 32/ncols2) {
++        if (Q->ne[1] > 32/ncols2 && !(ncols2 == 1 && cc == GGML_CUDA_CC_GCN4)) {
+             constexpr int cols_per_block = 64;
+             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+@@ -518,7 +564,8 @@
+     if constexpr (DKQ <= 256)
+ #endif // GGML_USE_HIP
+     {
+-        if (Q->ne[1] > 16/ncols2) {
++        if (Q->ne[1] > 16/ncols2 &&
++                !(ncols2 == 1 && cc == GGML_CUDA_CC_GCN4 && ggml_cuda_fattn_tile_gcn4_ncols2_1_max_ncols(DKQ) < 32)) {
+             constexpr int cols_per_block = 32;
+             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);

@@ -47,9 +47,10 @@ GPU gets the native kernel. The fp32 templates are instantiated only where
 that function can return them.
 
 ggml_cuda_fattn_tile_get_config_amd_gcn4() is the AMD table with occupancy 1
-for the 32- and 64-column tiles of head size 128. The host selects it for
-cc == GGML_CUDA_CC_GCN4, device code for GCN4 (defined for __gfx803__ in
-vendors/hip.h).
+for the 32- and 64-column tiles of head size 128. Device code selects it for
+GCN4 (defined for __gfx803__ in vendors/hip.h). The host keeps reading the
+AMD table: the occupancy is the only field that differs, and only
+__launch_bounds__ in device code reads it.
 
 Result on an RX 590, llama-bench, flash attention on, q8_0 KV cache, pp512
 at depth 0 / 4096 / 8192 tokens:

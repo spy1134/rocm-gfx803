@@ -563,6 +563,18 @@ measurements and a reproduction. In short:
   prompt runs as a 2048- and a 752-token batch and only the first gains,
   the tile and this patch together give 516 -> 519 tok/s; greedy output
   identical. gfx803 only (where 106 pads).
+- **128-gfx803-fattn-tile-ncols2-1.patch**: flash-attention tiles that serve
+  one query head per K/V head (vision encoders, and text models with an odd
+  GQA ratio) stayed on 101's half2 path at 64 columns, where they spill
+  hundreds of VGPRs for every head size. A 1080p image prompt spent 38.7 of
+  its 50.4 s in the vision encoder's attention (head size 72, 0.21 TFLOPS).
+  On gfx803 these tiles now run at most 32 columns wide (16 for head sizes
+  72, 112, 128 and 256), at occupancy 1 where that is faster; the GQA tiles
+  compile to the same code as before. Attention per call 1.9-5.7x faster
+  across head sizes 40-256. A 1080p image prompt: Qwen3.5 9B 50.4 -> 18.7 s,
+  Qwen3.6 35B-A3B (experts in system RAM) 47.3 -> 16.0 s; Qwen2.5-Coder 7B
+  (GQA 7) prompts 8192 tokens deep 60 -> 123 tok/s. Error
+  against the CPU equal or lower; FLASH_ATTN_EXT tests pass (3982/3982).
 - **113-116: fewer dispatches per generated token.** On gfx803 every GPU
   dispatch costs about 4.3 us of command-processor time however small the
   kernel, and a Qwen3.6 35B-A3B token issues about 1,425 of them. Four
@@ -689,7 +701,7 @@ GPU:
   now twice the first discovery's duration, between 3 and 30 s; GPUs that start
   quickly keep 3 s.
 
-The llama.cpp kernel patches 100-104, 106, 118 and 127 are gfx803-only by
+The llama.cpp kernel patches 100-104, 106, 118, 127 and 128 are gfx803-only by
 construction: each takes effect only for `GGML_CUDA_CC_GCN4` or `__gfx803__` and
 is sized from gfx803 register and bandwidth measurements. 105 changes q5_K's dot
 product for every GPU, with the same arithmetic. 107, 108, 111-117, 119-126, 090

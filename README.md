@@ -28,6 +28,7 @@ without this project's patches.
 | Text generation, MoE model with experts in system RAM, without and with the dispatch fusions (Qwen3.6 35B-A3B through Ollama) | 22.7 tokens/s | 24.2 tokens/s | 1.07x |
 | Prompt processing, MoE model with experts in system RAM, without and with the fp32 expert GEMM (Qwen3.6 35B-A3B through Ollama, 2,800-token prompt, mean of two rounds) | 395 tokens/s | 483 tokens/s | 1.22x |
 | Text generation (Qwen3 8B, short context, llama-bench on Ollama's llama.cpp) | 27 tokens/s | 30.5 tokens/s | 1.1x |
+| A 1080p image prompt, without and with the vision-encoder attention fix (Qwen3.6 35B-A3B with experts in system RAM, through Ollama) | 51.7 s | 14.0 s | 3.7x |
 
 The largest gains come from replacing the code paths that were slowest on this
 architecture:

@@ -1168,6 +1168,17 @@ bullets are the original findings (patches 100-105); the rest build on them.
   packed half2 instructions, so the path gains nothing and its extra registers
   made the wide tiles spill (648 VGPRs for the 16x4 tile). On the kernel's fp32
   path they spill 43. Qwen3 8B, 8k tokens deep: 34 -> 127 tok/s.
+- **Image prompts 6x slower than text** (a 1080p image, 2061 tokens, 50.4 s
+  against 8.8 s for 2028 text tokens, Qwen3.5 9B). 38.7 s of it was the
+  vision encoder's attention at 0.21 TFLOPS. A vision encoder gives every
+  query head its own K and V, and those tiles (ncols2 == 1, also used by
+  text models with an odd GQA ratio) stayed on the half2 path at 64 columns,
+  where they spill for every head size (305 VGPRs at head size 72, 817 at
+  112). Moving them to the fp32 path made them slower; occupancy 1 at 64
+  columns only halved the time. At most 32 columns (16 for head sizes 72,
+  112, 128, 256), at occupancy 1 where it helps, they run 1.9-5.7x faster:
+  the image 50.4 -> 18.7 s, and Qwen2.5-Coder 7B (GQA 7) prompts 8k deep
+  60 -> 123 tok/s (patch 128).
 - **Generation with an 8-bit KV cache slowed with context** (27.9 tok/s empty,
   20.9 at 8k). The vec kernel that generates with a quantized cache needs 229
   VGPRs on gfx803, so one wave runs per SIMD and its memory latency goes
