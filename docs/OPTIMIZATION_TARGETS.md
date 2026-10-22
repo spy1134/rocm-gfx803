@@ -182,7 +182,7 @@ Open targets in recommended order, then the done ones.
 | TRAIN-3 | Where a training step goes | unmeasured; fp16 NT GEMMs still run on the older tiles | Open, profile first |
 | BLAS-7 | Shim GEMM efficiency at SD 1.5 / SDXL shapes | fp16 dispatch fixes, fp16 widening, a one-wavefront tile for batched NN and a two-wavefront TN tile took the SD 1.5 step 415 -> 355 ms, SDXL 3.34 -> 2.84 s; the two-wavefront tile also takes fp32 TN (8-23% faster at llama.cpp's prompt shapes and SD's fp32 linears); its 64x64 form for TN calls with few tiles and a padded copy of operands whose rows camp on one DRAM channel took the SDXL step 2.77 -> 2.67 s, bit-identical; left: a faster main tile | Open, measured |
 | SD-9 | SDXL attention | P now moves between lanes inside the multiply-adds (DPP): SDXL step attention 0.50 -> 0.42 s (step 2.84 -> 2.75 s), SD 1.5 91 -> 79 ms (step 355 -> 342 ms); self-attention at ~4 TFLOPS against ~5.4 for its instruction mix | Open, measured |
-| LLM-10 | Image prompts | a 1080p image (2061 tokens) took 50.4 s against 8.8 s for 2028 text tokens (Qwen3.5 9B), 38.7 s of it the vision encoder's attention at 0.21 TFLOPS; patch 128 (narrower, non-spilling one-head-per-K/V tiles): 18.7 s; Qwen3.6 35B-A3B through Ollama 51.7 -> 14.0 s. What is left: the encoder's attention at ~1.2 TFLOPS (~6.9 s), its other kernels (~5 s), the image tokens' decode (~6.6 s) | Open: attention kernel for one query head per K/V head |
+| LLM-10 | Image prompts | a 1080p image (2061 tokens) took 50.4 s against 8.8 s for 2028 text tokens (Qwen3.5 9B), 38.7 s of it the vision encoder's attention at 0.21 TFLOPS; patch 128 (narrower, non-spilling one-head-per-K/V tiles): 18.7 s; patch 129 (gfx803 attention kernel for head sizes 40-80, 3.5 TFLOPS): 14.2 s; Qwen3.6 35B-A3B through Ollama 51.7 -> 14.0 -> 9.6 s. What is left (9B, rocprof): the image tokens' own prefill (~6.6 s, the same rate as text), the encoder's projections on rocBLAS fp16 (~2.0 s at ~3.3 TFLOPS), its attention (~2.4 s) | Open: encoder projections on the shim; the rest is text-rate prefill |
 | SD-7 | Fused Winograd F(2x2, 3x3) | fp16 SD at most ~9 ms per step (2%); fp32 and training unmeasured | Open, low |
 | SD-1 | Winograd weight gradients | full fine-tuning and LoCon only | Open |
 | LLM-3 | mmvq vs mmq for 9-16 tokens | speculative/parallel decoding | Open |
@@ -788,19 +788,23 @@ of the tile kernel at head size 72, one query head per K/V head, 8160 x 8160
 positions, 0.21 TFLOPS. Those tiles spilled hundreds of VGPRs at 64 columns
 (llama.cpp patch 128 and FINDINGS section 9).
 
-**Now.** 18.7 s with patch 128: the encoder's attention runs at about
-1.2 TFLOPS (0.25 s per call, ~6.9 s per image), its other kernels (the
-projections on the shim, GELU, norms) take about 5 s, and the image tokens'
-decode about 6.6 s. Through Ollama the same image takes 50.7 -> 18.7 s with
-Qwen3.5 9B and 51.7 -> 14.0 s with Qwen3.6 35B-A3B (experts in system RAM).
+**Now.** 14.2 s with patches 128 and 129. Patch 129 runs the encoder's
+attention on a gfx803 kernel with the layout of the SD attention kernel in
+`tools/` (128 query rows per block, a 4x4 block of scores per lane from
+registers, fp32): 3.5 TFLOPS, 88 ms per call, ~2.4 s per image. Under
+rocprof the rest is the image tokens' prefill in the language model (~6.6 s,
+the same rate as text, LLM-4 and LLM-6), the encoder's projections, which
+run as fp16 GEMMs on rocBLAS's Tensile kernels (`Cijk_Alik_Bljk_HB`, 112
+calls, ~2.0 s at ~3.3 TFLOPS), and small kernels. Through Ollama the image
+takes 50.7 -> 14.1 s with Qwen3.5 9B and 51.7 -> 9.6 s with Qwen3.6
+35B-A3B (experts in system RAM).
 
-**Next.** The attention runs at about a fifth of the card's sustained FMA
-rate (~6.2 TFLOPS) and under a third of what the SD attention kernel in
-`tools/` reaches at head sizes 40-80 (~4 TFLOPS). A gfx803 kernel for one query head per K/V head and long
-prompts (fp32 accumulation, K/V tiles in LDS, no masking beyond the
-encoder's optional one) would take the encoder's attention from ~6.9 to
-~2 s. Measure: `test-backend-ops perf -o FLASH_ATTN_EXT` at head size 72,
-16 heads, 8160 x 8160; gate: FLASH_ATTN_EXT tests against the CPU.
+**Next.** The projections are TN fp16 GEMMs that the shim's two-wavefront
+tile runs at 4.2-5 TFLOPS: routing them there would save ~0.5 s per image.
+Head sizes 96 and above (InternViT-6B's 128, for one) do not fit
+patch 129's layout, because Q alone takes 128 x (D+4) x 4 bytes of LDS;
+they would need fp16 Q in LDS or 64-row blocks. Measure: rocprof on the
+image prompt (`Cijk_Alik_Bljk_HB` against the shim's kernels).
 
 ### SD-7: fused Winograd F(2x2, 3x3)
 

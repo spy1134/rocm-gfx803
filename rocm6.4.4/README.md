@@ -575,6 +575,19 @@ measurements and a reproduction. In short:
   Qwen3.6 35B-A3B (experts in system RAM) 47.3 -> 16.0 s; Qwen2.5-Coder 7B
   (GQA 7) prompts 8192 tokens deep 60 -> 123 tok/s. Error
   against the CPU equal or lower; FLASH_ATTN_EXT tests pass (3982/3982).
+- **129-gfx803-fattn-prompt.patch**: a gfx803 flash-attention kernel for
+  prompt-sized batches at head sizes 40-80, the vision encoders' sizes. Even
+  after 128 the tile kernel ran a 1080p image's encoder attention at 1.2
+  TFLOPS (6.85 of 18.6 s), and with a mask at about 0.2. The new kernel is
+  the layout of the ComfyUI node's multi-wave attention: 128 query rows per
+  block of four waves, a 4x4 block of scores per lane computed from
+  registers in fp32, and the softmax weights passed between lanes by DPP
+  inside the multiply-adds. It takes a batch from 48 query rows per head the
+  tile kernel would serve together. Attention per call 2.4-3.5x faster
+  without a mask (head size 72: 253 -> 88 ms, 3.5 TFLOPS) and 1.7-23x with
+  one. A 1080p image prompt: Qwen3.5 9B 18.6 -> 14.2 s, Qwen3.6 35B-A3B
+  (experts in system RAM) through Ollama 14.0 -> 9.6 s. Error against the CPU lower on the cases it
+  serves; FLASH_ATTN_EXT tests pass (3982/3982).
 - **113-116: fewer dispatches per generated token.** On gfx803 every GPU
   dispatch costs about 4.3 us of command-processor time however small the
   kernel, and a Qwen3.6 35B-A3B token issues about 1,425 of them. Four
@@ -701,7 +714,7 @@ GPU:
   now twice the first discovery's duration, between 3 and 30 s; GPUs that start
   quickly keep 3 s.
 
-The llama.cpp kernel patches 100-104, 106, 118, 127 and 128 are gfx803-only by
+The llama.cpp kernel patches 100-104, 106, 118 and 127-129 are gfx803-only by
 construction: each takes effect only for `GGML_CUDA_CC_GCN4` or `__gfx803__` and
 is sized from gfx803 register and bandwidth measurements. 105 changes q5_K's dot
 product for every GPU, with the same arithmetic. 107, 108, 111-117, 119-126, 090

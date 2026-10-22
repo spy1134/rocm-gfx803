@@ -1178,7 +1178,13 @@ bullets are the original findings (patches 100-105); the rest build on them.
   columns only halved the time. At most 32 columns (16 for head sizes 72,
   112, 128, 256), at occupancy 1 where it helps, they run 1.9-5.7x faster:
   the image 50.4 -> 18.7 s, and Qwen2.5-Coder 7B (GQA 7) prompts 8k deep
-  60 -> 123 tok/s (patch 128).
+  60 -> 123 tok/s (patch 128). A gfx803 kernel for prompt-sized attention at
+  head sizes 40-80 (patch 129), the layout of the ComfyUI node's multi-wave
+  attention (a 4x4 block of scores per lane from registers, fp32, softmax
+  weights passed by DPP inside the multiply-adds), runs the encoder's
+  attention at 3.5 TFLOPS: 254 -> 88 ms per call, the image 18.6 -> 14.2 s,
+  and Qwen3.6 35B-A3B through Ollama 14.0 -> 9.6 s. Loading the mask values
+  inside the softmax spilled 200-590 VGPRs; loaded ahead of Q*K^T they fit.
 - **Generation with an 8-bit KV cache slowed with context** (27.9 tok/s empty,
   20.9 at 8k). The vec kernel that generates with a quantized cache needs 229
   VGPRs on gfx803, so one wave runs per SIMD and its memory latency goes
