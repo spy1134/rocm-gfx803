@@ -127,7 +127,7 @@ index 6d1ce52..4ed4b0b 100644
              const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
              const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
 diff --git a/ggml/src/ggml-cuda/fattn-gcn4-prompt.cuh b/ggml/src/ggml-cuda/fattn-gcn4-prompt.cuh
-index 5655f62..b8e1e85 100644
+index 5655f62..e63917d 100644
 --- a/ggml/src/ggml-cuda/fattn-gcn4-prompt.cuh
 +++ b/ggml/src/ggml-cuda/fattn-gcn4-prompt.cuh
 @@ -404,6 +404,387 @@ static __global__ void flash_attn_gcn4_prompt(
@@ -495,7 +495,7 @@ index 5655f62..b8e1e85 100644
 +// A 96-row block (R = 3) takes about a fifth less time per query row than a 64-row block (R = 2),
 +// but pads the batch further and leaves a different tail on the last wave of blocks. The estimate
 +// counts query rows per CU over whole waves, or over the blocks alone where launch_fattn splits the
-+// K/V range to fill the GPU. On an RX 590 the pick is within 2.3% of the faster block size on
++// K/V range to fill the GPU. On an RX 590 the pick is within 2.9% of the faster block size on
 +// geometric mean over batches of 64-2048 queries, 512-16384 keys and GQA ratios 1-8.
 +template <int D>
 +static void ggml_cuda_flash_attn_ext_gcn4_prompt_qreg(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

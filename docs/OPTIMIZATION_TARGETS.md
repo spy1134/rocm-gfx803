@@ -837,6 +837,11 @@ part of the last wave of blocks idle. Coder 7B 97.4 -> 65.8 s, Qwen3 8B
   `flash_attn_combine_results` takes 1.1-1.4 ms per call at these sizes for
   every kernel. The kernel avoids the split except when the GPU would sit
   mostly idle, so the cost is not paid in practice, but its cause is unknown.
+  With few heads and long contexts the split still wins: 4 query heads over
+  16,384 keys take 18.1 ms per 2048-query batch split and 21.0 ms unsplit
+  (8 heads at 1024 queries: 18.1 against 20.6 ms). Qwen3 8B and
+  Qwen2.5-Coder 7B, with 32 and 28 query heads, give enough blocks that the
+  rule does not split there.
 
 ### SD-7: fused Winograd F(2x2, 3x3)
 
