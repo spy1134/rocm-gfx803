@@ -1,5 +1,10 @@
 # gfx803 kernel bugs: what's broken, how we found it, how to fix more of it
 
+> Most of this document is [Schaka](https://github.com/Schaka)'s investigation
+> from the original ROCm 6.4.4 setup in
+> [Schaka/rocm-gfx803](https://github.com/Schaka/rocm-gfx803). Later findings
+> are in [`FINDINGS.md`](FINDINGS.md).
+
 gfx803 (Polaris) has been unsupported since ROCm 6.0 and untouched by AMD's
 own testing for years before that. Its Tensile/rocBLAS kernel library --
 generated code, some hand-written assembly -- has never had a reliable
@@ -7,8 +12,8 @@ correctness bar applied to it on this hardware. We are not going to get
 upstream fixes for any of this. Nobody is going to report these bugs to AMD:
 the platform is abandoned, and there is no realistic path to a fix landing.
 The only way gfx803 stays usable is patching this ourselves, kernel by
-kernel, the same way [`patches/rocblas/wgm-miscompute.sh`](patches/rocblas/wgm-miscompute.sh)
-already did for one bug and [`patches/rocblas/sgemm-shim/`](patches/rocblas/sgemm-shim/)
+kernel, the same way [`patches/rocblas/wgm-miscompute.sh`](../patches/rocblas/wgm-miscompute.sh)
+already did for one bug and [`patches/rocblas/sgemm-shim/`](../patches/rocblas/sgemm-shim/)
 does for a second, larger one. This document is the playbook for finding the
 next one.
 
@@ -16,15 +21,15 @@ next one.
 
 | Bug | Scope | Symptom | Status |
 |---|---|---|---|
-| WGM8 (`WorkGroupMapping != 1`) | rocBLAS assembly GEMM kernels, all dtypes | Silent wrong results, `rocblas_status_success` | Fixed: [`patches/rocblas/wgm-miscompute.sh`](patches/rocblas/wgm-miscompute.sh) |
-| Pervasive Tensile fp32 GEMM miscompute | Every rocBLAS/Tensile fp32 GEMM solution (assembly and source-kernel), any shape, any GSU, any tile config | First call in a process correct, every call after intermittently wrong (1%-100% of output elements, error magnitude up to 1e5) | Fixed for the standard-algo fp32 path: [`patches/rocblas/sgemm-shim/`](patches/rocblas/sgemm-shim/) |
-| MIOpen `ConvOclDirectFwd` grouped-conv OOB | `MIOpenConvUniBatchNormActiv` kernel (`ConvOclDirectFwd`/`ConvOclDirectFwdFused` solver), grouped/depthwise convolutions specifically | GPU memory access fault, page not present -- an actual out-of-bounds read past the weights buffer, not stale/uninitialized data | Fixed: [`patches/miopen/conv-direct-fwd-grouped-oob.sh`](patches/miopen/conv-direct-fwd-grouped-oob.sh), MIOpen rebuilt from source (`miopen-builder` stage in the Dockerfile). Confirmed NOT the same bug as the GEMM one above -- the sgemm-shim fix only measurably delayed this crash (1-4 sessions -> 11 sessions) because it never touched MIOpen at all. See "MIOpen ConvActivationFusion investigation" below for the full root-cause chase. |
-| Small-shape Tensile assembly GEMM miscompute | rocBLAS/Tensile fp32 GEMM, gfx803 assembly (`ISA803`/`KLA`) kernels, whenever *every* dimension is small (correct from ~48x48x48 up; thin shapes fine if one dimension is large) | Silent wrong results, `rocblas_status_success`. Reproduced down to a **1x1x1** problem: a cross-workgroup race in the GSU CAS-accumulate path, winner decided by GPU queue occupancy, so it only manifests under back-to-back dispatch. Surfaced as 84 of `onnxruntime_test_all`'s 96 failures (Einsum, Attention, DecoderAttention, MultiHeadAttention, FusedMatMul) | Worked around, not root-caused: [`patches/rocblas/small-gemm-assembly-miscompute.sh`](patches/rocblas/small-gemm-assembly-miscompute.sh) makes Tensile dispatch prefer a HIP source kernel for small fp32 problems (guarded to `prob.strided_batch` -- the array-of-pointers batched GEMM API isn't supported by that source solution and must fall through to the tuned assembly). 96 -> 12 failures. The race *inside* the assembly kernels is understood but not fixable via patch -- see "The small-shape assembly GEMM miscompute" below |
+| WGM8 (`WorkGroupMapping != 1`) | rocBLAS assembly GEMM kernels, all dtypes | Silent wrong results, `rocblas_status_success` | Fixed: [`patches/rocblas/wgm-miscompute.sh`](../patches/rocblas/wgm-miscompute.sh) |
+| Pervasive Tensile fp32 GEMM miscompute | Every rocBLAS/Tensile fp32 GEMM solution (assembly and source-kernel), any shape, any GSU, any tile config | First call in a process correct, every call after intermittently wrong (1%-100% of output elements, error magnitude up to 1e5) | Fixed for the standard-algo fp32 path: [`patches/rocblas/sgemm-shim/`](../patches/rocblas/sgemm-shim/) |
+| MIOpen `ConvOclDirectFwd` grouped-conv OOB | `MIOpenConvUniBatchNormActiv` kernel (`ConvOclDirectFwd`/`ConvOclDirectFwdFused` solver), grouped/depthwise convolutions specifically | GPU memory access fault, page not present -- an actual out-of-bounds read past the weights buffer, not stale/uninitialized data | Fixed: [`patches/miopen/conv-direct-fwd-grouped-oob.sh`](../patches/miopen/conv-direct-fwd-grouped-oob.sh), MIOpen rebuilt from source (`miopen-builder` stage in the Dockerfile). Confirmed NOT the same bug as the GEMM one above -- the sgemm-shim fix only measurably delayed this crash (1-4 sessions -> 11 sessions) because it never touched MIOpen at all. See "MIOpen ConvActivationFusion investigation" below for the full root-cause chase. |
+| Small-shape Tensile assembly GEMM miscompute | rocBLAS/Tensile fp32 GEMM, gfx803 assembly (`ISA803`/`KLA`) kernels, whenever *every* dimension is small (correct from ~48x48x48 up; thin shapes fine if one dimension is large) | Silent wrong results, `rocblas_status_success`. Reproduced down to a **1x1x1** problem: a cross-workgroup race in the GSU CAS-accumulate path, winner decided by GPU queue occupancy, so it only manifests under back-to-back dispatch. Surfaced as 84 of `onnxruntime_test_all`'s 96 failures (Einsum, Attention, DecoderAttention, MultiHeadAttention, FusedMatMul) | Worked around, not root-caused: [`patches/rocblas/small-gemm-assembly-miscompute.sh`](../patches/rocblas/small-gemm-assembly-miscompute.sh) makes Tensile dispatch prefer a HIP source kernel for small fp32 problems (guarded to `prob.strided_batch` -- the array-of-pointers batched GEMM API isn't supported by that source solution and must fall through to the tuned assembly). 96 -> 12 failures. The race *inside* the assembly kernels is understood but not fixable via patch -- see "The small-shape assembly GEMM miscompute" below |
 | int8_float32 GEMM (CT2) | rocBLAS int8_r/int32_r GEMM path | Garbled/repeating output, not a crash | **Confirmed fixed as of the MIOpen grouped-conv fix**, though not independently re-isolated. Retested end-to-end via the real audiomuse-rocm-plugin image (JFK sample, `faster_whisper`, `int8_float32`) after rebuilding the base image with the MIOpen fix: correct transcription, whereas this was previously garbled. Whisper's encoder has real Conv1D layers, so this was plausibly the same `ConvOclDirectFwd` grouped-conv defect corrupting the int8 path's output, not a separate rocBLAS int8 bug -- but that's an inference from the retest, not a confirmed root cause the way the fp32 GEMM and MIOpen bugs above were. Worth a real isolation pass if it regresses. |
-| MultiHeadAttention "MHA basic" mode rejected on ROCm | ORT's own `GemmSoftmaxGemmPermuteGenericPipeline` (contrib op C++, not rocBLAS/MIOpen) -- the only path available once Composable Kernel is compiled out | `Could not find viable op` for any plain 3-tensor MultiHeadAttention call with query sequence_length > 1 (an ordinary shape, not an edge case); rocBLAS is never even reached | Fixed in ORT source: [`patches/onnxruntime/mha-basic-mode-no-viable-op.sh`](patches/onnxruntime/mha-basic-mode-no-viable-op.sh) adds the missing Q/K/V transpose (via ORT's own existing `LaunchTransQkv` utility) before the GEMMs that need it. 12 -> 3 failures, no regressions. |
-| Generic TopK RadixTopK tie-break nondeterminism | ORT's own generic TopK kernel (`topk_impl.cuh`, contrib op / core op C++, not rocBLAS/MIOpen) -- hipified verbatim from CUDA, no ROCm-specific source | Picks a different winner among exactly-tied candidates from run to run on bit-identical input (hipCUB `BlockScan`/`BlockReduce`-based tie allocation). Surfaced as `BeamSearchTest.GptBeamSearchFp32_DisableFastTopK` decoding a different token sequence each run, ~50% of isolated runs | Fixed in ORT source: [`patches/onnxruntime/topk-radix-tiebreak-nondeterministic.sh`](patches/onnxruntime/topk-radix-tiebreak-nondeterministic.sh) replaces the affected dispatch path with a self-contained, hipCUB-free kernel on ROCm only. 18 isolated runs: 17 passed (was ~50%). Not gfx803-specific in principle. |
-| Stale per-CU vector L1 across dispatches | Every kernel on gfx803 that reads a page a copy kernel just refilled, seen as wrong rocBLAS/rocSOLVER results after `hipFree` then `hipMalloc` | Silent wrong numbers, bit-identical per run | Fixed: [`patches/clr/`](patches/clr/clr-gfx8-tc-invalidate-6.4.4.patch), see the last section |
-| MIOpen `miopenReduceTensor` dynamic-reduction intermittent wrong sums | Root cause: below MIOpen. The HIP allocator's **device-address recycling** (hipFree->hipMalloc returning the same input VA) interacts with gfx803's GPU memory-system state (stale cache/TLB coherence) so the **specific CK reduction kernels mis-read freshly-written input** at the reused address. Proven via the committed `tools/reduce-harness/` (real CK kernels, plain hipModule + hipMalloc/hipFree reuse, no MIOpen host code: reuse=10/52, fresh-distinct-input=0/52, dominated by the INPUT buffer). Rock-solid: seq5-via-API reuse=7/52 vs fresh=0/52; observer effect ruled out (copy to a *recycled* internal buffer = 21/52). | **Not built by the images.** The cause is the stale per-CU vector L1 (see "FIXED (root cause): stale vector L1 across kernel dispatches" below and `docs/FINDINGS.md` section 4), fixed in CLR (`patches/clr/`); with it the reduce programs pass on AMD's stock runtime. The runtime patch written for it, [`patches/rocr/va-reuse-defer.patch`](patches/rocr/va-reuse-defer.patch) ("FIXED (runtime): ROCR va-reuse-defer patch" below, version history in `wip_patches/README.md`), page-faults on gfx803 in workloads that free and reallocate GPU memory. |
+| MultiHeadAttention "MHA basic" mode rejected on ROCm | ORT's own `GemmSoftmaxGemmPermuteGenericPipeline` (contrib op C++, not rocBLAS/MIOpen) -- the only path available once Composable Kernel is compiled out | `Could not find viable op` for any plain 3-tensor MultiHeadAttention call with query sequence_length > 1 (an ordinary shape, not an edge case); rocBLAS is never even reached | Fixed in ORT source: [`patches/onnxruntime/mha-basic-mode-no-viable-op.sh`](../patches/onnxruntime/mha-basic-mode-no-viable-op.sh) adds the missing Q/K/V transpose (via ORT's own existing `LaunchTransQkv` utility) before the GEMMs that need it. 12 -> 3 failures, no regressions. |
+| Generic TopK RadixTopK tie-break nondeterminism | ORT's own generic TopK kernel (`topk_impl.cuh`, contrib op / core op C++, not rocBLAS/MIOpen) -- hipified verbatim from CUDA, no ROCm-specific source | Picks a different winner among exactly-tied candidates from run to run on bit-identical input (hipCUB `BlockScan`/`BlockReduce`-based tie allocation). Surfaced as `BeamSearchTest.GptBeamSearchFp32_DisableFastTopK` decoding a different token sequence each run, ~50% of isolated runs | Fixed in ORT source: [`patches/onnxruntime/topk-radix-tiebreak-nondeterministic.sh`](../patches/onnxruntime/topk-radix-tiebreak-nondeterministic.sh) replaces the affected dispatch path with a self-contained, hipCUB-free kernel on ROCm only. 18 isolated runs: 17 passed (was ~50%). Not gfx803-specific in principle. |
+| Stale per-CU vector L1 across dispatches | Every kernel on gfx803 that reads a page a copy kernel just refilled, seen as wrong rocBLAS/rocSOLVER results after `hipFree` then `hipMalloc` | Silent wrong numbers, bit-identical per run | Fixed: [`patches/clr/`](../patches/clr/clr-gfx8-tc-invalidate-6.4.4.patch), see the last section |
+| MIOpen `miopenReduceTensor` dynamic-reduction intermittent wrong sums | Root cause: below MIOpen. The HIP allocator's **device-address recycling** (hipFree->hipMalloc returning the same input VA) interacts with gfx803's GPU memory-system state (stale cache/TLB coherence) so the **specific CK reduction kernels mis-read freshly-written input** at the reused address. Proven via the committed `tools/reduce-harness/` (real CK kernels, plain hipModule + hipMalloc/hipFree reuse, no MIOpen host code: reuse=10/52, fresh-distinct-input=0/52, dominated by the INPUT buffer). Rock-solid: seq5-via-API reuse=7/52 vs fresh=0/52; observer effect ruled out (copy to a *recycled* internal buffer = 21/52). | **Not built by the images.** The cause is the stale per-CU vector L1 (see "FIXED (root cause): stale vector L1 across kernel dispatches" below and `docs/FINDINGS.md` section 4), fixed in CLR (`patches/clr/`); with it the reduce programs pass on AMD's stock runtime. The runtime patch written for it, [`patches/rocr/va-reuse-defer.patch`](../patches/rocr/va-reuse-defer.patch) ("FIXED (runtime): ROCR va-reuse-defer patch" below, version history in `wip_patches/README.md`), page-faults on gfx803 in workloads that free and reallocate GPU memory. |
 
 ## How we found the pervasive GEMM bug
 
@@ -171,7 +176,7 @@ affected op:
 1. Write a plain, unoptimized, correctness-first replacement using the SAME
    primitives already proven reliable in step 4's hardware tests (LDS tiling,
    FMA accumulation, no cleverness). See
-   [`patches/rocblas/sgemm-shim/gfx803_sgemm.h`](patches/rocblas/sgemm-shim/gfx803_sgemm.h)
+   [`patches/rocblas/sgemm-shim/gfx803_sgemm.h`](../patches/rocblas/sgemm-shim/gfx803_sgemm.h)
    for the SGEMM version -- 16x16 tiles, no prefetch, no vectorized loads,
    nothing for a miscompile to hide in.
 2. Verify it exhaustively: aligned shapes, misaligned shapes, tiny shapes,
@@ -182,7 +187,7 @@ affected op:
    (`rocblas_sgemm`, `rocblas_gemm_ex`, etc.), route the verified-safe subset
    of calls to the replacement, and `dlsym(RTLD_NEXT, ...)` everything else
    through to the real symbol unchanged. See
-   [`patches/rocblas/sgemm-shim/sgemm_shim.cpp`](patches/rocblas/sgemm-shim/sgemm_shim.cpp).
+   [`patches/rocblas/sgemm-shim/sgemm_shim.cpp`](../patches/rocblas/sgemm-shim/sgemm_shim.cpp).
    This keeps the blast radius explicit and auditable, and makes it trivial
    to A/B against stock rocBLAS (`GFX803_SGEMM_SHIM_DISABLE=1`) without
    rebuilding anything.
@@ -199,7 +204,7 @@ affected op:
 
 ### The shape-sweep tool, and why the shim is still blanket
 
-[`tools/rocblas_sweep.cpp`](tools/rocblas_sweep.cpp) generalizes step 2 above
+[`tools/repros/rocblas_sweep.cpp`](../tools/repros/rocblas_sweep.cpp) generalizes step 2 above
 into a matrix sweep: 21 shapes (tiny/aligned/prime/skinny/large/degenerate)
 x every candidate solution x 30 reps, run overnight. Result: every one of the
 55 candidate solutions was broken for every tested shape with
@@ -274,11 +279,11 @@ enumeration" trap documented above for the sweep tool, encountered again
 from a different angle. Reverted; fixing the workspace is necessary for
 correctness of any GSU-using solution but is not sufficient for gfx803's
 default path, and the structurally-immune (no GSU/atomic reduction at all)
-hand-written kernel in [`patches/rocblas/sgemm-shim/`](patches/rocblas/sgemm-shim/)
+hand-written kernel in [`patches/rocblas/sgemm-shim/`](../patches/rocblas/sgemm-shim/)
 remains the shipped fix.
 
 Diagnostic tools built during this investigation, kept in
-[`tools/`](tools/) for reference: `malloc_tracer.cpp` (LD_PRELOAD
+[`tools/repros/`](../tools/repros/) for reference: `malloc_tracer.cpp` (LD_PRELOAD
 hipMalloc/hipFree logger), `rocblas_workspace_test.cpp` and
 `rocblas_privatehandle_test.cpp` (workspace-management isolation tests),
 `rocblas_repro_abscheck.cpp` (combined abs+rel tolerance checker --
@@ -306,7 +311,7 @@ gfx803's tuned Tensile *assembly* GEMM kernels return wrong results, silently
 and with `rocblas_status_success`, whenever every dimension of the problem is
 small. Fixing this took `onnxruntime_test_all` from 96 failures to 12.
 
-The shipped fix ([`patches/rocblas/small-gemm-assembly-miscompute.sh`](patches/rocblas/small-gemm-assembly-miscompute.sh))
+The shipped fix ([`patches/rocblas/small-gemm-assembly-miscompute.sh`](../patches/rocblas/small-gemm-assembly-miscompute.sh))
 routes small fp32 problems to a HIP source kernel inside rocBLAS's Tensile
 dispatch. It is a workaround at the right layer, **not** a root-cause fix: what
 is actually wrong inside those assembly kernels is still unknown.
@@ -564,7 +569,7 @@ never happens. **rocBLAS is never called for this case at all** -- the
 rejection happens in ORT's own C++ dispatch, one layer above any GPU kernel
 launch, which is why the fix belongs in ORT and not in a rocBLAS/MIOpen patch.
 
-The fix ([`patches/onnxruntime/mha-basic-mode-no-viable-op.sh`](patches/onnxruntime/mha-basic-mode-no-viable-op.sh))
+The fix ([`patches/onnxruntime/mha-basic-mode-no-viable-op.sh`](../patches/onnxruntime/mha-basic-mode-no-viable-op.sh))
 adds the missing permute using `LaunchTransQkv` -- a utility ORT already ships
 and already uses for the equivalent step in the plain fused `Attention` op,
 just never wired up for this MultiHeadAttention mode. Extra workspace is
@@ -651,7 +656,7 @@ Two fixes that looked obvious were tried and rejected:
   test's dimension (4000) needs rewriting the compare-exchange network for
   multiple elements per thread throughout.
 
-Fix: [`patches/onnxruntime/topk-radix-tiebreak-nondeterministic.sh`](patches/onnxruntime/topk-radix-tiebreak-nondeterministic.sh)
+Fix: [`patches/onnxruntime/topk-radix-tiebreak-nondeterministic.sh`](../patches/onnxruntime/topk-radix-tiebreak-nondeterministic.sh)
 adds `SafeSmallKTopK` -- K sequential block-wide argmax passes, hand-written,
 no hipCUB block primitives, no `CudaKernel` dependency (works with
 `kernel=nullptr`), and no O(dimension) shared memory (tracks the K selected
@@ -722,7 +727,7 @@ The defect needed something about the *actual* ORT/model integration.
 
 ### Confirming genuine memory corruption, not stale data
 
-Before going further, `tools/malloc_tracer.cpp` (the same `LD_PRELOAD`
+Before going further, `tools/repros/malloc_tracer.cpp` (the same `LD_PRELOAD`
 `hipMalloc`/`hipFree` interposer that found the rocBLAS bug) was run against
 the real crashing `clap_churn_repro.py` session. The fault address
 (`0x911c12000`) landed **73728 bytes past the end of a legitimately-sized
@@ -758,7 +763,7 @@ future crash-not-miscompute investigation: don't trust which kernel a raw
 
 ### Finding the real shape, and the applicability bug
 
-`tools/miopen_stride_tracer.cpp` (an `LD_PRELOAD` interceptor for
+`tools/repros/miopen_stride_tracer.cpp` (an `LD_PRELOAD` interceptor for
 `miopenSetTensorDescriptor`/`miopenConvolutionForward`/`miopenExecuteFusionPlan`,
 reading real dims/strides at the API level since the raw kernel-arg trace
 couldn't render struct-typed arguments) traced the actual CLAP model's
@@ -780,7 +785,7 @@ ever having been established for gfx803.
 
 ### Minimal, deterministic, standalone reproduction
 
-`tools/miopen_depthwise_fusion_repro.cpp`: the exact depthwise shape
+`tools/repros/miopen_depthwise_fusion_repro.cpp`: the exact depthwise shape
 (`K=240, C=1 per group, groups=240, R=S=3`) through the fusion-plan API,
 nothing else involved. **Reliably faults on the very first execute** --
 the first fully isolated, deterministic repro of this bug, no ORT, no
@@ -824,7 +829,7 @@ Verified on real hardware after the source rebuild:
 - The real production workload (`clap_churn_repro.py`, 40 session churns,
   `ConvActivationFusion` enabled, no other workarounds): **40/40 clean**.
 
-Diagnostic tools from this investigation, kept in [`tools/`](tools/):
+Diagnostic tools from this investigation, kept in [`tools/repros/`](../tools/repros/):
 `miopen_handle_churn.cpp`, `miopen_fusion_churn.cpp`,
 `miopen_naive_shape_repro.cpp` (isolation attempts 1-4 above),
 `miopen_stride_tracer.cpp` (API-level dims/strides interceptor),
@@ -838,7 +843,7 @@ validated against).
 identifies a specific defective instruction sequence and corrects it. This
 section is different: a real, reproducible bug was found and worked around,
 but *why* the workaround works was never established. Read this before
-touching [`patches/miopen/reduce-kernel-cache-eviction.sh`](patches/miopen/reduce-kernel-cache-eviction.sh)
+touching [`patches/miopen/reduce-kernel-cache-eviction.sh`](../patches/miopen/reduce-kernel-cache-eviction.sh)
 or reusing its pattern anywhere else.
 
 **The bug.** A standalone, ORT-independent MIOpen-only repro -- one
@@ -1083,7 +1088,7 @@ small-ring version.
   `HAR_PRELOAD=1`) + `run_copyin.sh`, `run_bench.sh`, `/scratch/ckbuild*/`.
 - Local copies: `/tmp/opencode/harness_exp.cpp` and the padded-variant
   experiment files (tmpfs -- may not persist across reboot; the important
-  knowledge is recorded here and in `docs/AGENT_HANDOFF.md` §18).
+  knowledge is recorded here).
 
 ## FIXED (runtime): ROCR va-reuse-defer patch, both gates green
 

@@ -1,6 +1,6 @@
 # Optimization targets for gfx803
 
-Performance work on the `rocm6.4.4/` line: Stable Diffusion 1.5 and SDXL in
+Performance work on this repository's ROCm 6.4.4 stack: Stable Diffusion 1.5 and SDXL in
 ComfyUI, SD 1.5 LoRA training with sd-scripts, llama.cpp through Ollama (dense
 and MoE models) and the decode-shaped GEMMs of Chatterbox's TTS, on Polaris
 (gfx803). This file says where the time goes today, which targets are worth
@@ -611,7 +611,7 @@ sustains under its power limit.
 Each further 0.5 TFLOPS on average is about 25 ms per step, and training's
 GEMMs gain as well.
 
-**Where.** `rocm6.4.4/patches/sgemm-shim-batched/gfx803_sgemm.h`. The step's
+**Where.** `patches/sgemm-shim-batched/gfx803_sgemm.h`. The step's
 GEMMs, from the shim's call log (`GFX803_SGEMM_SHIM_VERBOSE` over the
 profiled steps only, so MIOpen's Find calls are excluded): TN linears
 (m = 320/640/1280, n = 154 to 8192, k = 320 to 5120), the Winograd solver's
@@ -872,7 +872,7 @@ input and output transforms take 9 ms per step and the filter transform
 17 ms; the rest (~100 ms) is the GEMM, which a fused kernel would still have
 to run. At fp32, before the shim's fp16 tiles, ~85 ms of 182 was outside the
 GEMM. `ConvHipWinogradF2x3`
-(`rocm6.4.4/patches/miopen/winograd-f2x3-hip-gfx803.patch`) transforms the
+(`patches/miopen/winograd-f2x3-hip-gfx803.patch`) transforms the
 input into 4x4 tiles (4x the data of the input) in one kernel, writes them to
 DRAM, runs a strided-batched GEMM over them, writes the result, and
 transforms it back in a third kernel. Those round trips through DRAM are most
@@ -1079,12 +1079,12 @@ gfx9 only), while the hardware runs 64-lane wavefronts and host code's
 one and computes with the other is wrong on gfx803 and correct on every
 architecture upstream tests. Four cases are fixed: layer_norm (PT-1); the
 binary prefix scan behind `torch.topk`
-([`gfx803-topk-scan-warp-size.patch`](../rocm6.4.4/patches/pytorch/gfx803-topk-scan-warp-size.patch)),
+([`gfx803-topk-scan-warp-size.patch`](../patches/pytorch/gfx803-topk-scan-warp-size.patch)),
 which wrote top-k results to wrong slots and, through its assert, hung the GPU
 until the driver reset it; index_put with accumulate
-([`gfx803-index-put-warp-size.patch`](../rocm6.4.4/patches/pytorch/gfx803-index-put-warp-size.patch)),
+([`gfx803-index-put-warp-size.patch`](../patches/pytorch/gfx803-index-put-warp-size.patch)),
 which dropped half of the repeated indices' sums; and embedding backward
-([`gfx803-embedding-backward-row-width.patch`](../rocm6.4.4/patches/pytorch/gfx803-embedding-backward-row-width.patch)),
+([`gfx803-embedding-backward-row-width.patch`](../patches/pytorch/gfx803-embedding-backward-row-width.patch)),
 which returned wrong weight gradients and faulted on some shapes. group_norm shows the
 opposite dependency: its weight and bias gradients need the 32, so the macro
 itself cannot change. FINDINGS section 5 describes all of them.
@@ -1142,7 +1142,7 @@ misses.
 
 ### LLM-9: one q8_1 conversion per shared input
 
-[`111-mmvq-reuse-quantized-src1.patch`](../rocm6.4.4/patches/ollama/llama-cpp/111-mmvq-reuse-quantized-src1.patch):
+[`111-mmvq-reuse-quantized-src1.patch`](../patches/ollama/llama-cpp/111-mmvq-reuse-quantized-src1.patch):
 each quantized matrix-vector product converted its fp32 input to q8_1 in a
 kernel of its own, also when the product before it had just converted the
 same input (attention's q, k and v; a DeltaNet layer's four input
@@ -1153,7 +1153,7 @@ the same perplexity to the last digit. Not specific to gfx803.
 
 ### LLM-4: prompts through dequantize + fp32 SGEMM
 
-[`106-gfx803-cublas-prompt.patch`](../rocm6.4.4/patches/ollama/llama-cpp/106-gfx803-cublas-prompt.patch)
+[`106-gfx803-cublas-prompt.patch`](../patches/ollama/llama-cpp/106-gfx803-cublas-prompt.patch)
 sends quantized matmuls with 128 or more columns (prompt batches) to cuBLAS in
 fp32 on gfx803, where the base image's shim runs them, instead of mmq's
 emulated int8. Three things had to change. llama.cpp chose fp16 compute with
@@ -1189,7 +1189,7 @@ next to the model ended in a GPU memory fault.
 
 ### LLM-7: DeltaNet conv-input concat
 
-[`107-concat-transposed-src1.patch`](../rocm6.4.4/patches/ollama/llama-cpp/107-concat-transposed-src1.patch)
+[`107-concat-transposed-src1.patch`](../patches/ollama/llama-cpp/107-concat-transposed-src1.patch)
 gives CONCAT along dim 0 with a transposed second operand (Gated DeltaNet's
 convolution input, in Qwen3.5/3.6 and Qwen3-Next) a tiled kernel. The generic
 kernel read the transposed operand with lanes 32 KiB apart: 27 ms per call,
@@ -1236,7 +1236,7 @@ token model matches the CPU as before: fp32 logits 8.7e-7, fp16 5.6e-4.
 ### BLAS-5: TN, NT and TT layouts
 
 `gfx803_sgemm_tile_g` in
-[`gfx803_sgemm.h`](../rocm6.4.4/patches/sgemm-shim-batched/gfx803_sgemm.h)
+[`gfx803_sgemm.h`](../patches/sgemm-shim-batched/gfx803_sgemm.h)
 serves the transposed layouts that `torch.nn.Linear` (TN) and its weight
 gradient (NT) produce. NN keeps `gfx803_sgemm_tile_p_fast`. Three changes,
 each measured on its own:
@@ -1301,7 +1301,7 @@ Results:
 
 ### BLAS-1, BLAS-2: pipelined 64x64 and 32x32 tiles
 
-[`gfx803_sgemm.h`](../rocm6.4.4/patches/sgemm-shim-batched/gfx803_sgemm.h)
+[`gfx803_sgemm.h`](../patches/sgemm-shim-batched/gfx803_sgemm.h)
 adds `gfx803_sgemm_tile_p_fast` (64x64) and `gfx803_sgemm_tile_p2_fast`
 (32x32) for fp32 calls with B not transposed. Each thread issues the LDS reads
 for the next K step before the multiply-adds of the current one, and with A
@@ -1376,14 +1376,14 @@ GroupNorm 0.194 -> 0.166 ms at (2, 320, 64, 64); GEGLU 1.075 -> 0.638 ms at
 only the fused attention, for training):
 `tools/ComfyUI-gfx803-attention/install.sh` compiles the kernels (with the
 base image's `hipcc` if the host has none) and copies the node into
-`rocm6.4.4/ComfyUI/custom_nodes/`.
+`ComfyUI/custom_nodes/`.
 
 ### PT-1: layer_norm
 
 PyTorch's HIP layer_norm was wrong on gfx803: its device code reduces over
 32-lane warps (`C10_WARP_SIZE` is 32 for every AMD target except gfx9) while
 the host launched it with 64-wide blocks (`at::cuda::warp_size()`).
-[`gfx803-layer-norm-warp-size.patch`](../rocm6.4.4/patches/pytorch/gfx803-layer-norm-warp-size.patch)
+[`gfx803-layer-norm-warp-size.patch`](../patches/pytorch/gfx803-layer-norm-warp-size.patch)
 sizes layer_norm's launches by the compiled warp size: native
 layer_norm matches a CPU float64 reference in 80 of 80 runs, all three
 gradients included.
@@ -1393,7 +1393,7 @@ FINDINGS section 5.
 
 ### LLM-1: SDWA dot product in the decode kernels
 
-[`104-gfx803-sdwa-dp4a.patch`](../rocm6.4.4/patches/ollama/llama-cpp/104-gfx803-sdwa-dp4a.patch)
+[`104-gfx803-sdwa-dp4a.patch`](../patches/ollama/llama-cpp/104-gfx803-sdwa-dp4a.patch)
 computes `ggml_cuda_dp4a` with SDWA byte-select multiplies in the decode
 kernels (mmvq, flash attention). It frees registers: decode kernels above 128
 VGPRs 56 -> 1, spills 2 -> 0, and 4-8 token decode matmuls up to 1.6x faster
@@ -1410,7 +1410,7 @@ MUL_MAT_ID 931/931, FLASH_ATTN_EXT 3982/3982.
 
 ### LLM-2: q5_K decode
 
-[`105-gfx803-q5k-decode.patch`](../rocm6.4.4/patches/ollama/llama-cpp/105-gfx803-q5k-decode.patch)
+[`105-gfx803-q5k-decode.patch`](../patches/ollama/llama-cpp/105-gfx803-q5k-decode.patch)
 reads q5_K's d/dmin and scales with one 16-byte load. With 104, the q5_K
 matmul (4096x14336) goes from 233 to 224 us for one column and from 287 to
 278 us for two.
@@ -1503,8 +1503,8 @@ comparisons. A 512 px
   kernel library whenever its `.hip` source is newer than it, then copies the
   node into ComfyUI; restart ComfyUI afterwards. The comfyui image builds the
   training attention from `tools/` (`docker build --build-context
-  tools=../tools ...`).
-- **llama.cpp.** Patches in `rocm6.4.4/patches/ollama/llama-cpp/` apply with
+  tools=tools ...`).
+- **llama.cpp.** Patches in `patches/ollama/llama-cpp/` apply with
   `git apply` in `Dockerfile-Ollama`, each checked by a marker grep. The
   scheduler patches in `llama-cpp-sched/` (108, 112) apply before the CPU
   build, because the scheduler is compiled into the `libggml-base` that build
@@ -1516,11 +1516,11 @@ comparisons. A 512 px
   (it has the gfx803 rocBLAS) with `LD_LIBRARY_PATH` pointing at the build's
   `bin/`. Editing a patch file's header text reruns the image's llama.cpp
   build (~12 min).
-- **PyTorch.** Patches in `rocm6.4.4/patches/pytorch/`, each with a `.sh`
+- **PyTorch.** Patches in `patches/pytorch/`, each with a `.sh`
   driver that applies it with `git apply` and checks a marker. Any change in
   that folder, header text included, reruns the PyTorch build: ~35 min with a
   warm ccache, hours without.
-- **MIOpen.** A change in `rocm6.4.4/patches/miopen/` rebuilds MIOpen, then
+- **MIOpen.** A change in `patches/miopen/` rebuilds MIOpen, then
   MIGraphX and ONNX Runtime (~50 min). Old find-db records keep their solver
   choices until the user find-db is cleared.
 
@@ -1532,7 +1532,7 @@ Run what the change can affect, on the image's own binaries:
   (all transposes, plain and batched, beta 0 and non-zero, odd sizes) and a
   few hundred random ones (odd leading dimensions, pointer offsets, batch
   strides, alpha/beta), plus their error against a CPU float64 product.
-- **SD:** `rocm6.4.4/training/gfx803_unet_check.py` (ops forward and backward,
+- **SD:** `training/gfx803_unet_check.py` (ops forward and backward,
   then the full UNet, against the CPU); a ComfyUI txt2img compared with a CPU
   run of the same seed (latent relative L2 ~1e-5, image within 1/255); for
   convolution changes, every SD 1.5 conv shape forward and backward-data

@@ -1,0 +1,7 @@
+# Dockerfile-ComfyUI takes tools/ as a named build context and COPYs only the
+# attention kernel's sources from it. The rest is host tooling, kernels
+# install.sh compiled on the host, llama.cpp binaries copied out of the Ollama
+# image, and bytecode.
+*.so
+ollama_bin/
+**/__pycache__

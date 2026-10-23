@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1
 # ComfyUI and sd-scripts (SD1.5 LoRA training) on the rocm-gfx803 base image.
-# Build the base first, from this directory:
+# Build the base first, from the repository root:
 #   docker build -t rocm-gfx803:rocm6.4.4 -f Dockerfile .
-#   docker build -t rocm-gfx803-comfyui:latest -f Dockerfile-ComfyUI .
+#   docker build -t rocm-gfx803-comfyui:latest -f Dockerfile-ComfyUI --build-context tools=tools .
 FROM rocm-gfx803:rocm6.4.4
 
 # None of these projects has release branches to pin to, so each is pinned to the

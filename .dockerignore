@@ -1,20 +1,29 @@
-# Build context for all three Dockerfiles is this directory (rocm6.4.4/). Only
+# Build context for all three Dockerfiles is the repository root. Only
 # patches/ and runtime/ (Dockerfile, Dockerfile-Ollama) and training/
-# (Dockerfile-ComfyUI) are COPYed from it; everything else here is
-# documentation, host-side tooling, or user data that would otherwise be hashed
+# (Dockerfile-ComfyUI) are COPYed from it; Dockerfile-ComfyUI takes tools/
+# through its own named build context. Everything else is documentation,
+# host-side tooling, git metadata, or user data that would otherwise be hashed
 # and shipped to the daemon on every build. The patterns below match the top
 # level only, so the Python files under training/ and runtime/ are kept.
 #
 # This does not affect layer caching: BuildKit keys a COPY on the checksums of
 # the files it actually copies, not on the whole context.
+.git/
 *.md
 *.py
+*.log
+docs/
 tools/
+wip_patches/
+ollama-tools/
 # Bytecode from running training/'s scripts on the host; the image compiles
 # its own.
 **/__pycache__
-# Models, datasets, run output, caches and MIOpen databases: hundreds of GB.
+# Models, datasets, run output, caches, MIOpen databases and local
+# environments: hundreds of GB.
 ComfyUI/
 workspace/
 ollama/
 miopen/
+setup-logs/
+.venv/

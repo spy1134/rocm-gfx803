@@ -96,8 +96,8 @@ and every non-square case to be wrong or to fault.
 
 ### pytorch/: top-k, rocPRIM and index_put
 
-Reproductions and checks for the PyTorch fixes in `rocm6.4.4/patches/pytorch/`. Run them in
-any image of the line with the card passed through.
+Reproductions and checks for the PyTorch fixes in `patches/pytorch/`. Run them in
+any image built from this repository with the card passed through.
 
 - `scan_repro.hip`: the binary prefix scan behind `torch.topk`, with 32-lane and hardware-wide
   warp numbering, in random blocks of 64-1024 threads. It cannot trap. On gfx803 the 32-lane

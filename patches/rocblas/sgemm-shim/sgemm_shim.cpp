@@ -11,7 +11,7 @@
 // the real rocBLAS symbol via dlsym(RTLD_NEXT, ...), so this only affects
 // the path it has actually replaced and verified.
 //
-// NOTE 1: tools/rocblas_sweep.cpp's overnight matrix scan (see KERNEL_BUGS.md)
+// NOTE 1: tools/repros/rocblas_sweep.cpp's overnight matrix scan (see KERNEL_BUGS.md)
 // found that every explicitly-selected Tensile solution (via
 // rocblas_gemm_algo_solution_index) came back clean for shapes with
 // min(M,K,N) >= 256. This looked like grounds to narrow the shim's scope to

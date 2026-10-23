@@ -3,7 +3,7 @@
 ## PCIe ASPM disable
 
 See "PCIe ASPM" under "Host-side caveats" in
-[`rocm6.4.4/README.md`](../../rocm6.4.4/README.md) for why this matters. Short version: on at least one gfx803 host (a
+[`docs/STACK.md`](../../docs/STACK.md) for why this matters. Short version: on at least one gfx803 host (a
 Supermicro board whose ACPI FADT declares `the system doesn't support PCIe
 ASPM` and never hands OS-level ASPM control to Linux), enabled ASPM caused
 rare, extremely hard-to-diagnose multi-minute stalls under GPU load.

@@ -54,7 +54,7 @@ set -eu
 # exactly that and produced ~14 phantom "Attention regressions" that were really
 # just rejected calls.
 #
-# See ../../KERNEL_BUGS.md for the full investigation.
+# See docs/KERNEL_BUGS.md for the full investigation.
 
 SRC="${1:-/rocblas-src}"
 SELF_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"

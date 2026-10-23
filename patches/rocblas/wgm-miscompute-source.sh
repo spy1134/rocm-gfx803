@@ -1,12 +1,12 @@
 #!/bin/sh
 # Apply wgm-miscompute-source.patch (see that file for the full WHY/WHAT).
-# NOT currently wired into rocm6.4.4/Dockerfile -- wgm-miscompute.sh (the
+# NOT currently wired into Dockerfile -- wgm-miscompute.sh (the
 # sed patch) remains the one actually applied. Kept here, self-verifying
 # like every other driver in this repo, ready to swap in once the
-# same-mechanism equivalence check run against this line's own Tensile
+# same-mechanism equivalence check run against this stack's own Tensile
 # pin confirms it (see the patch header).
 #
-# Unlike the rocm7 line, Tensile isn't vendored in rocBLAS's own checkout
+# Unlike Schaka/rocm-gfx803's ROCm 7.14 build, Tensile isn't vendored in rocBLAS's own checkout
 # here -- rocBLAS pip-installs it from ROCmSoftwarePlatform/Tensile at
 # CMake configure time. This script clones the exact pinned Tensile
 # commit into its own directory and patches THAT, so the Dockerfile can

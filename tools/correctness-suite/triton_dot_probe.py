@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Canary for the one triton code path vLLM cannot run without on gfx803.
+"""Canary for the triton fp16 dot that triton-compiled attention (vLLM's ROCm backend, for one) cannot run without on gfx803.
 
     python3 triton_dot_probe.py --dtype fp16
 

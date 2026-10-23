@@ -1,4 +1,4 @@
-# The ROCm 6.4.4 line for Polaris / gfx803
+# The ROCm 6.4.4 stack for Polaris / gfx803: images, patches and services
 
 > New here? The [Quick Start on the front page](../README.md#quick-start) gets you running with
 > `./setup.sh`; this file is the detailed reference.
@@ -15,16 +15,15 @@ plus the R9 Fury/Nano generation that shares the gfx803 ISA:
 - `Dockerfile-Ollama` -> Ollama with llama.cpp for gfx803
   ([below](#ollama-local-llms)).
 
-The repository's [front page](../README.md) says where this line comes from and
-what this fork changed; [`docs/FINDINGS.md`](../docs/FINDINGS.md) has the
-detail behind each fix. This file is the reference for building and using the
-images.
+The repository's [front page](../README.md) gives the results and where the
+project comes from; [`FINDINGS.md`](FINDINGS.md) has the detail behind each
+fix. This file is the reference for building and using the images.
 
 > **gfx803 is not a supported ROCm target.** AMD supports gfx900 and newer; on
 > gfx803 everything here is best-effort and slow by construction (see
-> [Expectations](#expectations)). This line is validated on an RX 590 8 GB:
+> [Expectations](#expectations)). The stack is validated on an RX 590 8 GB:
 > fp32 PyTorch (op by op and whole SD 1.5 UNet against a CPU reference), SD 1.5
-> LoRA training, ComfyUI txt2img and Ollama. Upstream originally verified the
+> LoRA training, ComfyUI txt2img and Ollama. Schaka originally verified the
 > base on a Sapphire RX 470 8GB with [`verify.py`](#verifying-on-hardware)
 > (MIGraphX EP inference, rocBLAS GEMM, MIOpen convolution); its kernel-level
 > fixes are described in [`KERNEL_BUGS.md`](KERNEL_BUGS.md), and the [fused-conv
@@ -49,7 +48,7 @@ dispatch convolutions to.
 
 ROCm 6.x has no doorbell check at all. A stock `rocm/dev-ubuntu-24.04:6.4.x`
 image enumerates a Polaris card as shipped, no runtime patch required, and
-MIOpen still works. So this line pins the last ROCm 6 release rather than
+MIOpen still works. So this stack pins the last ROCm 6 release rather than
 carrying a patched runtime forward. ([Schaka/rocm-gfx803](https://github.com/Schaka/rocm-gfx803)'s
 ROCm 10 line took the other road: it rebuilds the whole stack from source with
 the doorbell and other runtime patches.)
@@ -62,14 +61,14 @@ the doorbell and other runtime patches.)
 | MIGraphX | `release/rocm-rel-6.4` | Prebuilt for gfx900+ only. |
 | PyTorch | `ROCm/pytorch` `release/2.8` | No gfx803 wheel has ever been published. torchvision and torchaudio are built alongside it. `patches/pytorch/` routes int8 matmul to rocBLAS (its default hipBLASLt path has no gfx803 kernels) and fixes five kernels that mix the 64-lane hardware wavefront with PyTorch's 32-lane `C10_WARP_SIZE` on gfx803 (layer_norm, top-k's scan, index_put, embedding backward) or lose their launch to a rocSPARSE symbol clash (rocPRIM: nonzero, masked indexing, unique, large sorts). Each header gives the cause and the check. |
 | ONNX Runtime | `v1.22.2` | Built against the MIGraphX above. |
-| rocSOLVER | `ROCm/rocSOLVER`, ROCm 6.4.4 | The prebuilt library has device code for gfx908 and newer only; its launches for gfx803 do nothing and report no error, so `torch.linalg` returned unmodified input and then faulted. Built from source for gfx803 ([`patches/rocsolver/`](patches/rocsolver/)). |
-| rocSPARSE | `ROCm/rocSPARSE`, ROCm 6.4.4 | Same cause: no gfx803 code, so `torch.sparse.mm` returned wrong values. Built for gfx803 ([`patches/rocsparse/`](patches/rocsparse/)). |
-| HIP runtime (`libamdhip64`) | `ROCm/clr` `rocm-6.4.4` | The command processor of gfx803 does not invalidate the per-CU vector L1 between kernel dispatches, so a kernel can read the old contents of a recycled buffer. The patch in [`patches/clr/`](patches/clr/) publishes a cache-invalidate packet before every dispatch; only this one library is replaced. |
-| Device library `ockl.bc` | `ROCm/llvm-project` `rocm-6.4.4` (`amd/device-libs`) | gfx803 runs a no-return atomic on fine-grained host memory as a plain store of its operand, so ockl's signal updates never change a signal and device `printf` and `assert()` hang. The patch in [`patches/device-libs/`](patches/device-libs/) keeps the old value on gfx8, which selects the atomic instruction; only `ockl.bc` is replaced. |
-| Compiler (`clang-19`, `libamd_comgr`) | `ROCm/llvm-project` `rocm-6.4.4` | On gfx8 a function that is not inlined reads the queue pointer and the aperture bases from address 0 instead of from the kernel's implicit arguments, which made PyTorch's mixed fp16/fp32 elementwise ops fault and a failed `assert()` fault at its trap; and generic-pointer accesses that land in LDS run with M0 unset, which drops them. [`patches/llvm/`](patches/llvm/) fixes both. PyTorch is built with the patched `clang-19`; the image ships it for `hipcc`, and `libamd_comgr` (hipRTC, MIOpen's run-time kernels) built from the same tree. The libraries built before it keep AMD's compiler: a scan of their gfx803 code objects finds no null-base load; whether any of them makes a generic-pointer access to LDS is not checked. |
+| rocSOLVER | `ROCm/rocSOLVER`, ROCm 6.4.4 | The prebuilt library has device code for gfx908 and newer only; its launches for gfx803 do nothing and report no error, so `torch.linalg` returned unmodified input and then faulted. Built from source for gfx803 ([`patches/rocsolver/`](../patches/rocsolver/)). |
+| rocSPARSE | `ROCm/rocSPARSE`, ROCm 6.4.4 | Same cause: no gfx803 code, so `torch.sparse.mm` returned wrong values. Built for gfx803 ([`patches/rocsparse/`](../patches/rocsparse/)). |
+| HIP runtime (`libamdhip64`) | `ROCm/clr` `rocm-6.4.4` | The command processor of gfx803 does not invalidate the per-CU vector L1 between kernel dispatches, so a kernel can read the old contents of a recycled buffer. The patch in [`patches/clr/`](../patches/clr/) publishes a cache-invalidate packet before every dispatch; only this one library is replaced. |
+| Device library `ockl.bc` | `ROCm/llvm-project` `rocm-6.4.4` (`amd/device-libs`) | gfx803 runs a no-return atomic on fine-grained host memory as a plain store of its operand, so ockl's signal updates never change a signal and device `printf` and `assert()` hang. The patch in [`patches/device-libs/`](../patches/device-libs/) keeps the old value on gfx8, which selects the atomic instruction; only `ockl.bc` is replaced. |
+| Compiler (`clang-19`, `libamd_comgr`) | `ROCm/llvm-project` `rocm-6.4.4` | On gfx8 a function that is not inlined reads the queue pointer and the aperture bases from address 0 instead of from the kernel's implicit arguments, which made PyTorch's mixed fp16/fp32 elementwise ops fault and a failed `assert()` fault at its trap; and generic-pointer accesses that land in LDS run with M0 unset, which drops them. [`patches/llvm/`](../patches/llvm/) fixes both. PyTorch is built with the patched `clang-19`; the image ships it for `hipcc`, and `libamd_comgr` (hipRTC, MIOpen's run-time kernels) built from the same tree. The libraries built before it keep AMD's compiler: a scan of their gfx803 code objects finds no null-base load; whether any of them makes a generic-pointer access to LDS is not checked. |
 
 **MIOpen is built from source** at tag `rocm-6.4.4` with the patches in
-[`patches/miopen/`](patches/miopen/). It still carries its
+[`patches/miopen/`](../patches/miopen/). It still carries its
 `Ellesmere`/`Baffin`/`Polaris10`/`Polaris11` → `gfx803` device map and its gfx803
 solvers, which is the single thing that is dead on ROCm 7 and alive here, and
 why the 6.x route is viable at all. It has no gfx803 `.kdb` (tuning database),
@@ -79,11 +78,11 @@ Not every gfx803 solver it carries is usable. Its two binary Winograd solvers,
 `ConvBinWinogradRxS` and `ConvBinWinograd3x3U`, are MIOpen's first choice for
 nearly every fp32 3x3 convolution, and on gfx803 they corrupt memory the
 convolution wrote and are the stuck dispatch in GPU hangs under sustained load.
-[`patches/miopen/winograd-bin-gfx803-disable.patch`](patches/miopen/winograd-bin-gfx803-disable.patch)
+[`patches/miopen/winograd-bin-gfx803-disable.patch`](../patches/miopen/winograd-bin-gfx803-disable.patch)
 makes both not applicable on gfx803, so those convolutions run on MIOpen's GEMM
 solvers; its header has the measurements and a reproduction.
 
-[`patches/miopen/winograd-f2x3-hip-gfx803.patch`](patches/miopen/winograd-f2x3-hip-gfx803.patch)
+[`patches/miopen/winograd-f2x3-hip-gfx803.patch`](../patches/miopen/winograd-f2x3-hip-gfx803.patch)
 adds a Winograd solver back for gfx8: `ConvHipWinogradF2x3`, F(2x2,3x3) for 3x3,
 stride-1, pad-1 fp32 and fp16 convolutions, forward and backward data. It runs three
 small HIP transform kernels around one strided-batched GEMM, which the SGEMM
@@ -97,7 +96,7 @@ delete the user `*.ufdb.txt` files once after installing a build with it
 ## The SGEMM shim
 
 rocBLAS/Tensile's fp32 GEMMs return wrong results on gfx803. The image builds
-[`patches/sgemm-shim-batched/`](patches/sgemm-shim-batched/) in its own stage
+[`patches/sgemm-shim-batched/`](../patches/sgemm-shim-batched/) in its own stage
 and preloads it for every process (`LD_PRELOAD` in the final stage), so every
 image built on this one inherits it. It replaces `rocblas_sgemm`,
 `rocblas_gemm_ex` and their strided-batched forms (which attention uses) for
@@ -105,7 +104,7 @@ standard-algo fp32 calls, with register-tiled kernels that return correct
 results and run large GEMMs at 3.9-4.8 TFLOPS on an RX 590, 3-4x stock
 rocBLAS's speed. MIOpen's GEMM-based convolutions and the GEMM inside its gfx803 Winograd
 solver also run through it. The original shim in
-[`patches/rocblas/sgemm-shim/`](patches/rocblas/sgemm-shim/) is still built, at
+[`patches/rocblas/sgemm-shim/`](../patches/rocblas/sgemm-shim/) is still built, at
 `/opt/rocm/lib/libgfx803_sgemm_shim.so`, for comparisons only: it does not
 replace the strided-batched calls, so attention gradients are wrong with it.
 `GFX803_SGEMM_SHIM_DISABLE=1` passes every call to stock rocBLAS.
@@ -155,7 +154,7 @@ for anything large, measure before believing.
 
 > **PyTorch 2.8 vs 2.6.** The [gfx803_rocm](https://github.com/robertrosenbusch/gfx803_rocm)
 > project validated torch `release/2.6` + torchvision `v0.21.0` + torchaudio
-> `v2.6.0` on Polaris. This line ships 2.8, validated here for fp32 work (see
+> `v2.6.0` on Polaris. This stack ships 2.8, validated here for fp32 work (see
 > [Verifying on hardware](#verifying-on-hardware)). The 2.6 triple remains a
 > fallback through the `PYTORCH_REF`, `TORCHVISION_REF` and `TORCHAUDIO_REF`
 > build args.
@@ -168,15 +167,15 @@ parts to build, builds them in order with a log per image in `setup-logs/`,
 and confirms that a container can see the GPU. `./setup.sh --check` only runs
 the checks; `./setup.sh --all --yes` builds everything without questions.
 
-Underneath, everything builds locally with plain `docker build`, from this
-directory, and the commands below do the same by hand. No prebuilt images are
-published for this line. (Upstream's GHCR packages, such as
-`rocm-migraphx-ort-torch-builder:latest-gfx803`, come from its own pipeline and
-are not built from this fork.)
+Underneath, everything builds locally with plain `docker build`, from the
+repository root, and the commands below do the same by hand. No prebuilt images
+are published. (The GHCR packages from Schaka/rocm-gfx803, such as
+`rocm-migraphx-ort-torch-builder:latest-gfx803`, come from that project's ROCm
+10 pipeline, not from this one.)
 
 ```
 docker build -t rocm-gfx803:rocm6.4.4 -f Dockerfile .
-docker build --build-context tools=../tools -t rocm-gfx803-comfyui:latest -f Dockerfile-ComfyUI .
+docker build --build-context tools=tools -t rocm-gfx803-comfyui:latest -f Dockerfile-ComfyUI .
 docker build -t rocm-gfx803-ollama:latest -f Dockerfile-Ollama .
 ```
 
@@ -225,7 +224,7 @@ docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video \
     python3 /verify.py
 ```
 
-Upstream confirmed all four checks (provider list, MIGraphX EP inference,
+Schaka confirmed all four checks (provider list, MIGraphX EP inference,
 rocBLAS GEMM, MIOpen convolution) on a Sapphire RX 470 8GB Mining UEFI. For the
 PyTorch side, `training/gfx803_unet_check.py` (in the ComfyUI image at
 `/opt/gfx803-training/`) compares fp32 attention, linear, convolution and
@@ -245,10 +244,10 @@ directory:
 
 ```
 docker build -t rocm-gfx803:rocm6.4.4 -f Dockerfile .
-docker build --build-context tools=../tools -t rocm-gfx803-comfyui:latest -f Dockerfile-ComfyUI .
+docker build --build-context tools=tools -t rocm-gfx803-comfyui:latest -f Dockerfile-ComfyUI .
 ```
 
-Optional: `../tools/ComfyUI-gfx803-attention/install.sh` adds a custom node
+Optional: `tools/ComfyUI-gfx803-attention/install.sh` adds a custom node
 with gfx803 kernels for attention, GroupNorm and GEGLU, which makes an SD 1.5
 fp16 step about 13% faster (392 -> 342 ms at 512 px) and avoids the 2.3 GB
 score matrix PyTorch's attention allocates. Its GroupNorm and GEGLU kernels
@@ -380,7 +379,7 @@ repository root records what it was running.
 (pinned to its release commit) on the base image. Ollama fetches llama.cpp
 b11232 at configure time; its HIP backend is compiled for gfx803 only, against
 the base image's ROCm, and Ollama's bundled ROCm copies are left out (they
-would add 4.6 GB and are never loaded). Build, from this directory:
+would add 4.6 GB and are never loaded). Build, from the repository root:
 
 ```
 docker build -t rocm-gfx803:rocm6.4.4 -f Dockerfile .
@@ -793,7 +792,7 @@ running:
 - **Full-precision output tensors.** Some uploads keep `output.weight` in bf16,
   and with a large vocabulary it can be a third of the model (2 GB of 6.4 for
   that Qwen3.5 9B). Every generated token reads it.
-  [`ollama-tools/requant-output-head.py`](ollama-tools/requant-output-head.py)
+  [`ollama-tools/requant-output-head.py`](../ollama-tools/requant-output-head.py)
   converts just that tensor to q8_0 and copies the rest unchanged: 0.95 GB
   less VRAM, generation +11%, the same top token as the original 98% of the
   time. Import the result with a Modelfile whose `FROM` is the new file.
@@ -881,7 +880,7 @@ path. Two separate bugs caused it, both fixed and documented in full in
    puts the fault address exactly on the end of the arena chunk that holds the
    weights, and `dmesg` shows a read from `TC` (a compute kernel, not a copy
    engine).
-   [`patches/miopen/conv-direct-fwd-grouped-oob.sh`](patches/miopen/conv-direct-fwd-grouped-oob.sh)
+   [`patches/miopen/conv-direct-fwd-grouped-oob.sh`](../patches/miopen/conv-direct-fwd-grouped-oob.sh)
    makes the solver's applicability check reject grouped convolutions. With
    `ConvActivationFusion` left enabled, 40 session churns ran clean.
 
@@ -955,15 +954,8 @@ software bug.
 
 ## Credit
 
-The ROCm-6.x-plus-rebuilt-rocBLAS approach, and the specific knowledge of which
-knobs Polaris needs, comes from two community projects:
-
-- [robertrosenbusch/gfx803_rocm](https://github.com/robertrosenbusch/gfx803_rocm)
-  -- actively maintained, ROCm 6.4, the source of the torch 2.6 hardware
-  validation and the kernel-version warning
-- [woodrex83/ROCm-For-RX580](https://github.com/woodrex83/ROCm-For-RX580) --
-  the earlier ROCm 6.1.2 take
-
-Neither builds MIGraphX or ONNX Runtime; that part is new here, and has since
-been verified on real hardware (a Sapphire RX 470 8GB Mining UEFI) with
-[`verify.py`](#verifying-on-hardware).
+The approach (ROCm 6.x with the libraries rebuilt for gfx803) and much of the
+knowledge of which settings Polaris needs come from Schaka's original setup and
+the community projects named under "Credit" on the [front page](../README.md#credit).
+MIGraphX and ONNX Runtime for gfx803 were new in Schaka's setup and verified on
+a Sapphire RX 470 8GB Mining UEFI with [`verify.py`](#verifying-on-hardware).

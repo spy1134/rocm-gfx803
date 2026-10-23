@@ -7,7 +7,7 @@
 # kernel dispatch, inside releaseGpuMemoryFence() before copy-engine work, and ahead of an
 # event-record barrier.
 #
-# Uses patch -p1: the 6.4.4 line builds CLR from a tarball, not a git checkout.
+# Uses patch -p1: this stack builds CLR from a tarball, not a git checkout.
 set -eu
 
 SRC="${1:-/clr-src}"

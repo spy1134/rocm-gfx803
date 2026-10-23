@@ -2,13 +2,13 @@
 # install.sh
 # Installs or links the gfx803 ComfyUI custom node into the target custom_nodes folder.
 # Usage: ./install.sh [target_custom_nodes_path]
-# Default target: rocm6.4.4/ComfyUI/custom_nodes (relative to repository root)
+# Default target: ComfyUI/custom_nodes (relative to repository root)
 
 set -euo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TOOLS_DIR="$(cd "${SELF_DIR}/.." && pwd)"
-DEFAULT_TARGET="${TOOLS_DIR}/../rocm6.4.4/ComfyUI/custom_nodes"
+DEFAULT_TARGET="${TOOLS_DIR}/../ComfyUI/custom_nodes"
 TARGET="${1:-$DEFAULT_TARGET}"
 NODE_DEST="${TARGET}/ComfyUI-gfx803-attention"
 

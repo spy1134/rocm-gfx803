@@ -23,7 +23,7 @@
 # its default exhaustive search added 20 s to a 6 s sentence, the fast mode 4 s. The fast
 # mode is set here, and MIOpen's databases persist in miopen/ so a length is tuned only once.
 script_dir=$(cd "$(dirname "$0")" && pwd)
-here=$(cd "${CHATTERBOX_DIR:-$script_dir/../../Chatterbox}" && pwd) || exit 1
+here=$(cd "${CHATTERBOX_DIR:-$script_dir/../Chatterbox}" && pwd) || exit 1
 . "$script_dir/container-args.sh"
 name=chatterbox
 case "${1:-}" in

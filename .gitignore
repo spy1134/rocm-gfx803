@@ -1,51 +1,14 @@
-HELP.md
-.gradle
-# Root-anchored: an unanchored "build/" also matches scripts/build/, which is
-# source, not build output.
-/build/
-.kotlin
-!gradle/wrapper/gradle-wrapper.jar
-!**/src/main/**/build/
-!**/src/test/**/build/
-!buildpacks/
-!buildpacks/**/bin/
+# Everything the launchers mount into their containers: models, ComfyUI
+# outputs and custom nodes, MIOpen's per-machine databases and caches, the
+# workspace (datasets, training runs, LoRA output) and Ollama's models. All of
+# it is per-user, large, or both.
+/ComfyUI/
+/ollama/
+/miopen/
+/workspace/
 
-### IntelliJ IDEA ###
-.idea
-*.iws
-*.iml
-*.ipr
-out/
-!**/src/main/**/out/
-!**/src/test/**/out/
-
-### VS Code ###
-.vscode/
-
-### MacOS crap ###
-.DS_Store
-**/.DS_Store
-
-### Frontend ###
-node_modules/
-node/
-.frontend-gradle-plugin/
-dist/
-.quasar/
-.vite/
-
-# Local
-logs
-database
-
-# AI bullshit
-.claude
-.tokensave
-.scratch
-
-# graft's local graph cache — regenerable, not committed (run `graft build`).
-graft/
-.mcp.json
+# Build logs written by setup.sh
+/setup-logs/
 
 # Model weights, latent caches and other per-user data, wherever they land
 *.safetensors
@@ -59,6 +22,10 @@ __pycache__/
 .venv/
 venv/
 
-# Per-machine output of the host tools and local notes
+# Editor and agent state, per-machine output of the host tools, local notes
+.vscode/
+.idea/
+.DS_Store
+.claude/
 /gpu_monitor.log
 /CLAUDE.local.md

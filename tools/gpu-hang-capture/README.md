@@ -13,7 +13,7 @@ tools record the card's state continuously and, at the moment a queue stops
 making progress, save the queue registers and the dispatch packets that were in
 flight, so the stuck kernel can be identified afterwards. That is how the binary
 Winograd convolution kernels behind
-[`rocm6.4.4/patches/miopen/winograd-bin-gfx803-disable.patch`](../../rocm6.4.4/patches/miopen/winograd-bin-gfx803-disable.patch)
+[`patches/miopen/winograd-bin-gfx803-disable.patch`](../../patches/miopen/winograd-bin-gfx803-disable.patch)
 were found.
 
 ## The tools

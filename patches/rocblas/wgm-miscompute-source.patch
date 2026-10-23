@@ -12,7 +12,7 @@ WHY
 Same finding, different mechanism -- see
 patches/rocblas/wgm-miscompute.sh's own header for the hardware
 measurements (RX 470, ROCm 6.4.4) this is based on; not a
-re-investigation. Unlike the root repo's rocm7 line, where Tensile is
+re-investigation. Unlike Schaka/rocm-gfx803's ROCm 7.14 build, where Tensile is
 vendored directly in the rocm-libraries monorepo checkout
 (shared/tensile/), 6.4.4-era rocBLAS pip-installs Tensile from its own
 standalone repo at CMake configure time (CMakeLists.txt's
@@ -28,21 +28,21 @@ the pip-fetch when Tensile_TEST_LOCAL_PATH is set, so no change to
 rocBLAS's own build files is needed.
 
 NOT YET RE-VERIFIED as behaviorally equivalent to wgm-miscompute.sh on
-real hardware for THIS line -- the equivalence check (identical generated
-kernel names, zero *_WGM8 symbols) was run against the rocm7 line's pinned
+real hardware for THIS stack -- the equivalence check (identical generated
+kernel names, zero *_WGM8 symbols) was run against that ROCm 7.14 build's pinned
 Tensile source (rocm-libraries @ cd9574023093742434e8c992d13b89ab9a6c1cf8,
 confirmed identical between the two mechanisms there), not re-run against
-this line's separately-pinned Tensile commit. The anchor text this patch
+this stack's separately-pinned Tensile commit. The anchor text this patch
 targets (the `if state["WorkGroupMapping"] == -1: ... = 1` block) is
 byte-for-byte identical between the two Tensile sources at their
 respective pins, confirmed by direct comparison, so this is expected to
 behave the same way -- but "expected" is not "verified" per this repo's
 own standard. wgm-miscompute.sh remains the one actually wired into
-rocm6.4.4/Dockerfile pending that confirmation.
+Dockerfile pending that confirmation.
 
 Also NOT YET established whether the underlying WGM!=1 assembly-codegen
 defect is gfx803-specific or shared with other GCN-family architectures
--- see wgm-miscompute-source.patch's counterpart in the root repo's
+-- see wgm-miscompute-source.patch's counterpart in Schaka/rocm-gfx803's
 patches/rocblas/ for the same open question and the working assumption
 (gfx803-specific is more likely, per Schaka, since more heavily-used
 architectures would plausibly have already surfaced a bug this blunt) --
@@ -50,8 +50,8 @@ not repeated here.
 
 WHAT
 ----
-Identical transformation to the rocm7 line's patch of the same name,
-applied against this line's separately-pinned Tensile source (same
+Identical transformation to the patch of the same name in Schaka/rocm-gfx803's
+ROCm 7.14 build, applied against this stack's separately-pinned Tensile source (same
 anchor text, different line number: 3186 here vs. 3210 in the
 rocm-libraries monorepo copy -- confirmed by direct comparison, not
 assumed identical).

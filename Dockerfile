@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # Polaris / gfx803 base image: MIGraphX + ONNX Runtime + PyTorch on ROCm 6.4.4,
 # with rocBLAS, rocSOLVER, rocSPARSE, MIOpen and the HIP runtime rebuilt for gfx803. User-facing docs
-# (versions, building, caveats): README.md in this directory.
+# (versions, building, caveats): docs/STACK.md.
 #
 # Why ROCm 6.4.4 for gfx803 (RX 460/470/480/550/560/570/580/590):
 #
@@ -59,7 +59,7 @@
 # Expect this to be slow: untuned MIOpen, no packed-fp16, no dot instructions.
 # It is meant to make a 20-euro card usable, not competitive.
 #
-# Build, from this directory: docker build -t rocm-gfx803:rocm6.4.4 -f Dockerfile .
+# Build, from the repository root: docker build -t rocm-gfx803:rocm6.4.4 -f Dockerfile .
 # Pinned by digest as well as tag: AMD can re-push a tag, and a moved base
 # changes every stage below.
 ARG BASE_IMAGE=rocm/dev-ubuntu-24.04:6.4.4-complete@sha256:31418ac10a3769a71eaef330c07280d1d999d7074621339b8f93c484c35f6078
@@ -169,7 +169,7 @@ RUN git clone --branch "rocm-${ROCM_VERSION}" --depth 1 \
 # with it left 518 WGM8 kernel symbols in the TensileLibrary_Type_*_fallback_
 # gfx803 libraries, which don't route through the SolutionStructs.py hook that
 # patch targets. Not swapped in until that gap is closed and re-verified
-# against a real build of this line.
+# against a real build of this stack.
 COPY patches/rocblas/wgm-miscompute.sh patches/rocblas/small-gemm-assembly-miscompute.patch patches/rocblas/small-gemm-assembly-miscompute.sh /rocblas-patches/
 RUN sh /rocblas-patches/wgm-miscompute.sh /rocblas-src
 

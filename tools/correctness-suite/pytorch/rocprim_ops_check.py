@@ -1,6 +1,6 @@
 """Torch ops built on rocPRIM (select, scan, radix/merge sort, unique, reduce-by-key) on the GPU against the CPU.
 
-Without rocm6.4.4/patches/pytorch/gfx803-rocprim-private-namespace.patch most of these fail to launch on gfx803
+Without patches/pytorch/gfx803-rocprim-private-namespace.patch most of these fail to launch on gfx803
 ("invalid device function"); with it every case must launch and match.
 """
 import torch

@@ -1,9 +1,9 @@
-# Findings: what breaks on gfx803, why, and what this fork does about it
+# Findings: what breaks on gfx803, why, and what this project does about it
 
 AMD removed gfx803 (Polaris: RX 470, 480, 570, 580, 590) from ROCm after 6.0.
 The code still compiles for it, but much of the stack no longer produces
 correct results, or runs far below what the hardware can do. This document
-collects what this fork found while making SD 1.5 and SDXL LoRA training,
+collects what this project found while making SD 1.5 and SDXL LoRA training,
 ComfyUI and Ollama work on a Polaris card, and what it did about each problem.
 
 ## How to read this document
@@ -27,8 +27,7 @@ as read.
   that explains it, and the file that holds the fix. Status words are fixed
   (see the legend), and a patch or tool is always named in backticks with its
   path, so `grep` finds both the finding and its code.
-- Paths are relative to `rocm6.4.4/` unless they start with `tools/`, `docs/`
-  or `../`.
+- Paths are relative to the repository root.
 - Treat a finding as a lead, not as a fact about your tree. Read the pinned
   source before trusting "broken" or "fixed": upstream may have changed the
   code, and a patch that applies cleanly proves nothing about correctness. The
@@ -48,12 +47,12 @@ as read.
 
 **Where the numbers come from.** All measurements are from one RX 590 8 GB
 (Polaris 30, 36 CUs) on a Ryzen 7 2700X host, Arch Linux with the LTS kernel,
-and the ROCm 6.4.4 images built from `rocm6.4.4/`. Other Polaris cards share
+and the ROCm 6.4.4 images built from this repository. Other Polaris cards share
 the chip design and should behave alike; their clocks, memory and firmware
-differ, and none has been tested. Upstream's earlier findings (the rocBLAS
+differ, and none has been tested. Schaka's earlier findings (the rocBLAS
 Tensile bugs, MIOpen's grouped-convolution out-of-bounds read, the ROCr
-allocator patch, which this fork does not build (section 4), and more) are in
-[`rocm6.4.4/KERNEL_BUGS.md`](../rocm6.4.4/KERNEL_BUGS.md) and not repeated here.
+allocator patch, which this project does not build (section 4), and more) are in
+[`docs/KERNEL_BUGS.md`](KERNEL_BUGS.md) and not repeated here.
 
 **Status legend.**
 
@@ -85,7 +84,7 @@ run with wrong numbers, not a crash. "It runs" was never taken as evidence.
 | rocBLAS fp16 N/T GEMMs 15-25x slow | Fixed (shim fp16 route) | 8 | `patches/sgemm-shim-batched/` |
 | rocBLAS fp16 GEMMs in the other layouts 1.3-1.9x slower than the fp32 shim at equal arithmetic | Fixed (fp16 operands on the shim's fast tiles); fp16 SD1.5 UNet step 602 -> 483 ms | 8 | same |
 | bf16 reported as supported (no bf16 hardware) | Checked: correct; convs 1.7x slower than fp16 | 8 | none needed |
-| PyTorch int8 matmul fails on every call | Fixed (port of upstream's fix) | 5 | `patches/pytorch/` |
+| PyTorch int8 matmul fails on every call | Fixed (port of Schaka's ROCm 10 fix) | 5 | `patches/pytorch/` |
 | PyTorch layer_norm wrong (warp-size mismatch) | Fixed | 5 | `patches/pytorch/` |
 | PyTorch top-k hangs the GPU (warp-size mismatch in its scan) | Fixed | 5 | `patches/pytorch/` |
 | PyTorch nonzero, masked indexing, unique, large sorts fail to launch (rocPRIM symbol clash with rocSPARSE) | Fixed | 5 | `patches/pytorch/` |
@@ -99,7 +98,7 @@ run with wrong numbers, not a crash. "It runs" was never taken as evidence.
 | MIGraphX fp16 matrix products accumulate in fp16 (error 0.7-1% instead of 0.02%) | Fixed | 5 | `patches/migraphx/rocblas-compute-fp32-gfx803.patch` |
 | ONNX Runtime TopK with sorted = 0 fails above K of about 7,800 | Fixed | 5 | `patches/onnxruntime/topk-safe-small-k-smem-bound.patch` |
 | No fused attention in PyTorch on gfx803 | ComfyUI node (inference; its GroupNorm and GEGLU are fp32 only) | 6 | `tools/ComfyUI-gfx803-attention/` |
-| Upstream's patched HSA runtime (va-reuse-defer) page-faults on gfx803 | Not built: the images run AMD's stock runtime, and the bug it targeted is the stale vector L1 below | 4 | `patches/rocr/` |
+| Schaka's patched HSA runtime (va-reuse-defer) page-faults on gfx803 | Not built: the images run AMD's stock runtime, and the bug it targeted is the stale vector L1 below | 4 | `patches/rocr/` |
 | Kernels read stale data from the per-CU vector L1 after a freed address is reused (silent wrong results in rocBLAS, rocSOLVER, torch.linalg) | Fixed (libamdhip64 rebuilt); decode costs about 2.6% | 4 | `patches/clr/` |
 | Device printf and assert() hang (hostcall's doorbell signal never changes) | Fixed (ockl.bc rebuilt) | 4 | `patches/device-libs/` |
 | No-return atomics on fine-grained host memory store their operand instead (user kernels) | Open (hardware; use the returned value) | 4 | none |
@@ -124,8 +123,6 @@ run with wrong numbers, not a crash. "It runs" was never taken as evidence.
 | llama.cpp reserves a vision projector's memory on the wrong device | Fixed (all GPUs) | 9 | `patches/ollama/llama-cpp-server/` |
 | Ollama keeps stale free-memory figures on slow-starting GPUs | Fixed (all GPUs) | 9 | `patches/ollama/ollama/` |
 | Ollama fills VRAM beside a desktop | Mitigated (margin from amdgpu's counter) | 9 | `start-ollama.sh` |
-
-Paths in the table are relative to `rocm6.4.4/`.
 
 ## Glossary
 
@@ -167,7 +164,7 @@ Paths in the table are relative to `rocm6.4.4/`.
 ## 1. fp32 GEMM: the SGEMM shim and its gaps
 
 **Background.** rocBLAS's Tensile fp32 GEMM kernels return wrong results on
-gfx803 (upstream's finding, see `KERNEL_BUGS.md`). Upstream's fix is an
+gfx803 (Schaka's finding, see `docs/KERNEL_BUGS.md`). Schaka's fix is an
 `LD_PRELOAD` shim that replaces `rocblas_sgemm` and `rocblas_gemm_ex` with a
 plain, correct kernel.
 
@@ -269,12 +266,12 @@ nothing; every MIOpen gfx8 assembly kernel uses the same descriptor format, so
 the persistent launch is what sets these two apart. The kernel-level root cause
 is unknown.
 
-**Fix.** [`winograd-bin-gfx803-disable.patch`](../rocm6.4.4/patches/miopen/winograd-bin-gfx803-disable.patch)
+**Fix.** [`winograd-bin-gfx803-disable.patch`](../patches/miopen/winograd-bin-gfx803-disable.patch)
 makes both solvers not applicable on gfx803, so MIOpen uses its GEMM solvers
 (which run on the shim). That alone cost speed: with Winograd off every 3x3
 convolution is a GEMM.
 
-[`winograd-f2x3-hip-gfx803.patch`](../rocm6.4.4/patches/miopen/winograd-f2x3-hip-gfx803.patch)
+[`winograd-f2x3-hip-gfx803.patch`](../patches/miopen/winograd-f2x3-hip-gfx803.patch)
 adds `ConvHipWinogradF2x3`: F(2x2,3x3) for 3x3 stride-1 pad-1 fp32
 convolutions, forward and backward-data, as three small HIP transform kernels
 around one strided-batched GEMM. MIOpen's Find picks it where it is faster
@@ -301,7 +298,7 @@ reports "verification passed", because its tolerance is loose. The bug is
 in the kernels' index arithmetic, not gfx803-specific, and is unchanged on
 upstream's `release/rocm-rel-7.1` and `release/rocm-rel-7.2`; `develop` has
 fixed the backward kernel only.
-[`bn-spatial-variant1-unaligned-hw.patch`](../rocm6.4.4/patches/miopen/bn-spatial-variant1-unaligned-hw.patch)
+[`bn-spatial-variant1-unaligned-hw.patch`](../patches/miopen/bn-spatial-variant1-unaligned-hw.patch)
 uses scalar reads for those shapes; aligned shapes and NHWC compile to the
 same code as before. It also corrects the vector remainder of the backward
 kernel for recomputed statistics (`MIOpenDriver -s 0`; PyTorch always passes
@@ -503,7 +500,7 @@ and `journalctl -k` should show no `qcm fence` line after the trap.
 ## 4. The HSA runtime: AMD's stock build
 
 The images run AMD's stock `libhsa-runtime64` (`.so.1.15.60404`) from the ROCm
-base image. Upstream's gfx803 tree patches it with a "va-reuse-defer" change
+base image. Schaka's gfx803 tree patches it with a "va-reuse-defer" change
 to how freed GPU virtual addresses are reused (`patches/rocr/va-reuse-defer.patch`,
 investigation in `KERNEL_BUGS.md`), written for MIOpen's CK reduction kernels
 reading stale data when a freed address is reused at once (ONNX Runtime's
@@ -576,7 +573,7 @@ Measured on the RX 590 with the stock HSA runtime, the same binary and only
 | --- | --- | --- |
 | rocBLAS probe, 511 free-and-reallocate cases | stops at case 225 | passes |
 | `torch.linalg` through the rebuilt rocSOLVER, 204 cases up to n=257 | wrong | 204 of 204 |
-| MIOpen reduce kernels, 52 shapes (`rocm6.4.4/tools/reduce-harness`) | 12 fail | 0 fail |
+| MIOpen reduce kernels, 52 shapes (`tools/reduce-harness`) | 12 fail | 0 fail |
 | same, with every call on one recycled address | 12 fail | 0 fail |
 | stock rocBLAS sgemm, fixed buffers, 40x72x800, 500 iterations | 499 iterations corrupt (about 6,000 wrong elements each) | 0 |
 | same, 32x32x32 | 499 iterations corrupt | 0 |
@@ -663,7 +660,7 @@ it never looks at the packet. Read from the process while it hangs, the
 hostcall buffer shows the packet on the ready stack with its ready bit set and
 the doorbell still at its initial value.
 
-[`ockl-gfx8-signal-returning-atomics-6.4.4.patch`](../rocm6.4.4/patches/device-libs/ockl-gfx8-signal-returning-atomics-6.4.4.patch)
+[`ockl-gfx8-signal-returning-atomics-6.4.4.patch`](../patches/device-libs/ockl-gfx8-signal-returning-atomics-6.4.4.patch)
 makes ockl's signal updates keep the old value on ISA versions below 9, which
 selects the returning instruction. A Dockerfile stage builds `ockl.bc` from
 the device-libs source at the commit the image's compiler was built from and
@@ -772,9 +769,9 @@ quantizes linear layers to int8, such as ComfyUI's int8 backends) failed on
 every call with `HIPBLAS_STATUS_INVALID_VALUE`: on ROCm, PyTorch sends it to
 hipBLASLt unconditionally, and hipBLASLt has no gfx803 kernels.
 `TORCH_BLAS_PREFER_HIPBLASLT=0` does not help, because this one path never
-checks it. [`rocm6.4.4/patches/pytorch/`](../rocm6.4.4/patches/pytorch/) routes
+checks it. [`patches/pytorch/`](../patches/pytorch/) routes
 it to rocBLAS whenever hipBLASLt is not the preferred backend, as PyTorch's
-floating-point GEMMs already do. The fix comes from upstream's ROCm 10 line
+floating-point GEMMs already do. The fix comes from Schaka's ROCm 10 line
 (Schaka/rocm-gfx803 commit 5061404), adapted to torch 2.8. Check: 18 of 18
 shapes and transpose layouts bit-exact against an int64 CPU product; 4 TOPS at
 2048^3.
@@ -793,7 +790,7 @@ reached the cross-warp reduction, so the mean and variance left out half of
 each row, and the backward kernel allocated shared memory for 4 warps where
 its block reduction writes 8.
 
-[`gfx803-layer-norm-warp-size.patch`](../rocm6.4.4/patches/pytorch/gfx803-layer-norm-warp-size.patch)
+[`gfx803-layer-norm-warp-size.patch`](../patches/pytorch/gfx803-layer-norm-warp-size.patch)
 makes layer_norm's launchers use the warp size the device code was compiled
 with (32 on a 64-lane GPU that is not gfx9). Every kernel in the file is
 correct with 32-wide blocks, because its shuffles stay within 32 lanes. After
@@ -826,7 +823,7 @@ as written gets 100 of 100 random blocks wrong on the card, and 0 with the
 hardware's warp width
 ([`tools/correctness-suite/pytorch/`](../tools/correctness-suite/pytorch/)
 holds this reproduction and the checks quoted below).
-[`gfx803-topk-scan-warp-size.patch`](../rocm6.4.4/patches/pytorch/gfx803-topk-scan-warp-size.patch)
+[`gfx803-topk-scan-warp-size.patch`](../patches/pytorch/gfx803-topk-scan-warp-size.patch)
 numbers the scan's warps by the hardware wavefront on ROCm. After it, top-k
 matches the CPU in 798 of 798 cases (sizes up to 1M and 152k vocabularies,
 fp32, fp16 and int64, largest and smallest, sorted and unsorted, heavy ties),
@@ -847,7 +844,7 @@ rocSPARSE has no gfx803 code object, so the launch finds no kernel. On GPUs
 rocSPARSE supports, its identical copy runs and nothing is visibly wrong.
 The same kernels work in a standalone gfx803 program, and rocPRIM kernels
 that rocSPARSE does not export work inside torch.
-[`gfx803-rocprim-private-namespace.patch`](../rocm6.4.4/patches/pytorch/gfx803-rocprim-private-namespace.patch)
+[`gfx803-rocprim-private-namespace.patch`](../patches/pytorch/gfx803-rocprim-private-namespace.patch)
 compiles torch's HIP code with `-Drocprim=at_hip_rocprim`, the ROCm
 counterpart of the `CUB_WRAPPED_NAMESPACE` that PyTorch uses against the same
 clash with CUDA's CUB; libtorch_hip then exports no rocPRIM symbol and shares
@@ -862,7 +859,7 @@ indices into 1000 slots and by 175 with 3 million, against a CPU error below
 blocks and grids by `at::cuda::warp_size()` (64) while its kernels index in
 `C10_WARP_SIZE` (32) warps, so half of each block's sorted indices are never
 summed and lanes 32-63 repeat lanes 0-31.
-[`gfx803-index-put-warp-size.patch`](../rocm6.4.4/patches/pytorch/gfx803-index-put-warp-size.patch)
+[`gfx803-index-put-warp-size.patch`](../patches/pytorch/gfx803-index-put-warp-size.patch)
 launches both index_put kernels (plain and quantized) with the compiled warp
 size, as the layer_norm patch does. After it the GPU matches the CPU; at 3
 million indices it is closer to a float64 reference than the CPU is (4e-5
@@ -880,7 +877,7 @@ indices it reads its destination rows from. The kernel elects a leader among
 rows with a ballot whose lane bits stand for row numbers, so each row must be
 one hardware wavefront and the index_put-style fix (a 32-wide launch) would
 break it;
-[`gfx803-embedding-backward-row-width.patch`](../rocm6.4.4/patches/pytorch/gfx803-embedding-backward-row-width.patch)
+[`gfx803-embedding-backward-row-width.patch`](../patches/pytorch/gfx803-embedding-backward-row-width.patch)
 lays the rows out by the launched width, `blockDim.x`, instead. After it the
 GPU matches the CPU (largest difference 5.1e-6, as on an NVIDIA T4).
 
@@ -917,7 +914,7 @@ Four more kernel bugs, each reproduced on the card before the fix and clean afte
   sends those requests to the radix kernel (`ort_topk_smem_bound_check.py`: 20 of 20 cases pass).
 
 The workarounds below are loaded into every Python process through `sitecustomize` in the base
-image; the modules are in [`rocm6.4.4/runtime/python/`](../rocm6.4.4/runtime/python/).
+image; the modules are in [`runtime/python/`](../runtime/python/).
 They are workarounds with their source fixes still to do.
 
 - **accelerate on a build without torch.distributed.** accelerate 1.15 imports
@@ -977,7 +974,7 @@ realistic magnitudes every head size stays within 3e-6.
 
 The node is not built into the images. `tools/ComfyUI-gfx803-attention/install.sh`
 compiles the three libraries (with the base image's `hipcc` when the host has
-none) and copies the node into `rocm6.4.4/ComfyUI/custom_nodes/`.
+none) and copies the node into `ComfyUI/custom_nodes/`.
 
 ## 7. VRAM on an 8 GB card that also drives a display
 
@@ -1147,9 +1144,9 @@ run at 768 px in fp16 completed with loss 0.20 and a 7.9 GB card peak.
 and other tools may choose bf16 on their own. On this stack that is safe:
 casts, elementwise math, reductions, softmax, matmuls (plain, batched,
 linear), 3x3 convolution, group and layer norm and attention all match the CPU
-to bf16's own rounding (about 2e-3), with no faults or hangs. Upstream's
+to bf16's own rounding (about 2e-3), with no faults or hangs. Schaka's
 ROCm 10 line reported bf16 hanging the card under vLLM (Schaka/rocm-gfx803,
-`vllm/NOTES.md`); that does not reproduce here. bf16 matmuls run at fp16/fp32
+`vllm/NOTES.md` there); that does not reproduce here. bf16 matmuls run at fp16/fp32
 speed, but 3x3 convolutions take about 1.7x as long (2.54 ms against 1.43 ms
 fp16 for 320 channels at 64x64), because the Winograd solver above covers fp32
 and fp16 only. Prefer fp16 for half precision on this card.
@@ -1344,7 +1341,7 @@ bullets are the original findings (patches 100-105); the rest build on them.
   before that build (`patches/ollama/llama-cpp-sched/`) and the build checks
   the installed library for it. In the image, through Ollama with its own
   batch choice (from the context length and free VRAM, 512 to 2,048 tokens;
-  see rocm6.4.4/README.md), a 3,100-token prompt reads 165 -> 196 tok/s and a
+  see docs/STACK.md), a 3,100-token prompt reads 165 -> 196 tok/s and a
   11,900-token prompt 174 -> 193 tok/s, with no GPU fault. On a short prompt
   the greedy text with prefetch on follows the text with it off for 295
   characters and then diverges at a near-tie; with prefetch off the text is
@@ -1473,7 +1470,7 @@ Qwen3.5 9B (one full-attention layer in four) runs a 64k context fully on the
 GPU beside a desktop; and some uploads keep the output tensor in bf16, which
 for a 248k-token vocabulary is 2 GB of a 6.4 GB model, read for every token.
 Converting only that tensor to q8_0
-([`rocm6.4.4/ollama-tools/requant-output-head.py`](../rocm6.4.4/ollama-tools/requant-output-head.py))
+([`ollama-tools/requant-output-head.py`](../ollama-tools/requant-output-head.py))
 freed 0.95 GB and made generation 11% faster, with the same top token as the
 original 98% of the time (KL divergence 0.0014).
 
@@ -1529,7 +1526,7 @@ does that for prompt batches as one grouped GEMM per call, 1.56-2.65x per call,
 pp2048 450 -> 547 tok/s, mean KL divergence against CPU logits 0.0097 against
 mmq's 0.0107. Chips with a native dot instruction keep mmq.
 
-Each patch header in `rocm6.4.4/patches/ollama/` has the full measurements and
+Each patch header in `patches/ollama/` has the full measurements and
 a reproduction.
 
 ## 10. Open questions
@@ -1611,5 +1608,5 @@ a reproduction.
 - [`tools/correctness-suite/`](../tools/correctness-suite/): the operation
   checks, including the BatchNorm and activation backward sweeps and
   `pytorch/linalg_check.py`.
-- [`rocm6.4.4/training/gfx803_unet_check.py`](../rocm6.4.4/training/gfx803_unet_check.py):
+- [`training/gfx803_unet_check.py`](../training/gfx803_unet_check.py):
   the op-by-op and whole-UNet check against a float64 CPU reference.

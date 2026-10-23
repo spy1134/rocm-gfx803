@@ -117,8 +117,8 @@ done
 echo "F16SWEEP-NOSHIM pass=$pass2 fail=$fail2 (want 27/0)"
 
 echo "--- triton dot canary: one process per dtype, because a compiler abort kills the process"
-# Nothing else in this gate compiles a triton kernel, and vLLM cannot start
-# without an fp16 dot, so a silent triton/fdot2 regression reaches a published
+# Nothing else in this gate compiles a triton kernel, and triton-compiled
+# attention (vLLM's ROCm backend, for one) cannot run without an fp16 dot, so a silent triton/fdot2 regression reaches a published
 # image otherwise. Missing output is the abort, not a skip.
 for dt in fp16 bf16 fp32 i8; do
   cleanup

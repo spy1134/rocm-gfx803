@@ -6,7 +6,7 @@ command processor ignores the AQL acquire and release fence scopes, which are
 ROCm's only expression of cross-dispatch coherence. A kernel that reads a page a
 copy kernel has just refilled, at a virtual address the allocator recycled, can be
 served the page's old contents, silently.
-`rocm6.4.4/patches/clr/clr-gfx8-tc-invalidate-6.4.4.patch` rebuilds `libamdhip64`
+`patches/clr/clr-gfx8-tc-invalidate-6.4.4.patch` rebuilds `libamdhip64`
 with a PM4 `ACQUIRE_MEM` (vector L1 and scalar cache) ahead of each kernel
 dispatch; `CLR_GFX8_TC_INVALIDATE=0` switches it off in the same binary. The patch
 header holds the mechanism, the evidence, the cost and which cache bits matter.

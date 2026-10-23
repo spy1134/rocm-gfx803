@@ -1,6 +1,6 @@
 """torch.topk on the GPU against the CPU, plus the samplers built on it.
 
-Run only on an image with rocm6.4.4/patches/pytorch/gfx803-topk-scan-warp-size.patch: without it the first
+Run only on an image with patches/pytorch/gfx803-topk-scan-warp-size.patch: without it the first
 case traps a wave and the driver resets the GPU.
 Values must match exactly; indices must point at elements with the returned values (ties may pick
 different, equally valid, indices).
