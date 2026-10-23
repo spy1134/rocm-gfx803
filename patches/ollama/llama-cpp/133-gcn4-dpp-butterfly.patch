@@ -1,0 +1,253 @@
+llama.cpp (as fetched by Ollama v0.35.1, llama.cpp b11232, applied after
+132): on gfx803, the xor butterflies in ggml's warp reductions, the MoE
+top-k and the q8_1 quantizers take their cross-lane steps from DPP row
+rotations and quad permutations instead of ds_bpermute, with one swizzle
+for the step that crosses DPP rows. The results are the same bits.
+gfx803-specific: the new path is compiled only for GCN4 (__gfx803__).
+
+WHY
+---
+HIP turns __shfl_xor_sync into ds_bpermute_b32 on GCN. Each one computes a
+byte address, goes out to the LDS unit and back, and the next step of a
+reduction waits for it, so a 32-lane reduction is five such round trips in
+a row. Single-token decode is made of small kernels whose time is mostly
+this kind of latency. The MoE top-k of Qwen3.6 35B-A3B picks 8 of 256
+experts in 8 rounds of a 5-step argmax: 15 us a call, 40 calls a token, on
+the path from the router to the CPU experts. rms_norm, the q8_1 quantizer,
+the mmvq epilogues and the DeltaNet recurrence reduce the same way.
+
+DPP reads another lane's register inside a VALU instruction. gfx803's DPP
+rotates within a row of 16 lanes and permutes within a quad; it has no xor
+pattern beyond the quad. In a butterfly that runs from the widest offset
+down, the wider steps have already made each lane equal to every lane whose
+index differs from its own only in higher bits, so at offsets 8, 4, 2 and 1
+the lane that a rotation of the row reaches holds exactly the value of the
+xor partner. Each step combines the same two values in the same order as
+before, and every lane ends with the same bits. Offset 16 crosses rows and
+uses ds_swizzle, which needs no address register; offset 32 (a reduction
+over the whole 64-lane wave) stays a shuffle.
+Butterflies over groups narrower than 16 lanes take the swizzle at offset
+4, where no rotation lines up.
+
+WHAT
+----
+common.cuh: ggml_cuda_butterfly_xor<group>(x, offset) for int, float and
+half2, used by warp_reduce_sum, warp_reduce_max, warp_reduce_all and
+warp_reduce_any. topk-moe.cu and quantize.cu use it in their own
+butterflies. The Hadamard transform in fwht keeps its shuffles: its
+partners hold different values, so no rotation can stand in for them.
+
+Result on an RX 590 (Qwen3.6 35B-A3B Q4_K_M, experts in system RAM, q8_0
+KV cache, flash attention):
+
+    logits, llama-perplexity over 1,024 tokens as one-token decodes
+    and as 512-token batches; Qwen3 8B decodes; Qwen3.5 9B decodes
+    with 134 as well                                               byte-identical
+    GPU kernel time per token (rocprof, trimmed means)             11.13 -> 10.81 ms
+      topk_moe                                                     14.9 -> 12.2 us
+    ds_bpermute_b32 in libggml-hip.so                              50,474 -> 5,798
+    llama-bench tg256, four interleaved pairs (tok/s)
+      without   26.43  26.49  26.69  26.82
+      with      27.09  26.89  26.95  28.08
+
+Verified on an RX 590: test-backend-ops test -b ROCm0 passes all 16,460
+cases with this patch and 134.
+
+To reproduce, build llama.cpp b11232 with GGML_HIP=ON and
+AMDGPU_TARGETS=gfx803, then with and without the patch:
+
+    llama-perplexity -m <model> -ngl 99 -ncmoe 99 -fa on -ctk q8_0 -ctv q8_0
+        -f <text> -c 512 --chunks 2 -b 512 -ub 1 --kl-divergence-base <file>
+        (GGML_CUDA_DISABLE_GRAPHS=1; the two files compare equal)
+    llama-bench -m <model> -ngl 99 -ncmoe 99 -lm none -fa 1 -ctk q8_0
+        -ctv q8_0 -p 0 -n 256
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -451,6 +451,54 @@
+     }
+ };
+ 
++// One step of an xor butterfly over groups of `group` lanes that runs from offset group/2 down to 1.
++// On GCN __shfl_xor becomes ds_bpermute, which goes through the LDS unit and puts its latency on every
++// step of a reduction. When a step with offset 8 or less runs, the wider steps before it have given every
++// lane the same value as the lanes whose index differs from it only in higher bits, so the lane `offset`
++// places along a rotation of its 16-lane DPP row holds exactly what the xor partner holds, and the VALU
++// reads it with a row rotation: the result has the same bits as the shuffle's. Offset 16 crosses DPP rows
++// and is a swizzle within 32 lanes, which needs no address register; offset 32 stays a shuffle.
++template <int group>
++static __device__ __forceinline__ int ggml_cuda_butterfly_xor(int x, int offset) {
++#if defined(GGML_USE_HIP) && defined(GCN4)
++    if (offset == 16) {
++        return __builtin_amdgcn_ds_swizzle(x, 0x401F);
++    }
++    if (offset == 8) {
++        return __builtin_amdgcn_mov_dpp(x, 0x128, 0xF, 0xF, false); // row_ror:8
++    }
++    if (offset == 4) {
++        return group >= 16 ? __builtin_amdgcn_mov_dpp(x, 0x124, 0xF, 0xF, false) // row_ror:4
++                           : __builtin_amdgcn_ds_swizzle(x, 0x101F);
++    }
++    if (offset == 2) {
++        return __builtin_amdgcn_mov_dpp(x, 0x4E, 0xF, 0xF, false); // quad_perm:[2,3,0,1]
++    }
++    if (offset == 1) {
++        return __builtin_amdgcn_mov_dpp(x, 0xB1, 0xF, 0xF, false); // quad_perm:[1,0,3,2]
++    }
++#endif // defined(GGML_USE_HIP) && defined(GCN4)
++    return __shfl_xor_sync(0xffffffff, x, offset, group);
++}
++
++template <int group>
++static __device__ __forceinline__ float ggml_cuda_butterfly_xor(float x, int offset) {
++#if defined(GGML_USE_HIP) && defined(GCN4)
++    return __int_as_float(ggml_cuda_butterfly_xor<group>(__float_as_int(x), offset));
++#else
++    return __shfl_xor_sync(0xffffffff, x, offset, group);
++#endif // defined(GGML_USE_HIP) && defined(GCN4)
++}
++
++template <int group>
++static __device__ __forceinline__ half2 ggml_cuda_butterfly_xor(half2 x, int offset) {
++#if defined(GGML_USE_HIP) && defined(GCN4)
++    return __builtin_bit_cast(half2, ggml_cuda_butterfly_xor<group>(__builtin_bit_cast(int, x), offset));
++#else
++    return __shfl_xor_sync(0xffffffff, x, offset, group);
++#endif // defined(GGML_USE_HIP) && defined(GCN4)
++}
++
+ template<int width = WARP_SIZE>
+ static __device__ __forceinline__ int warp_reduce_sum(int x) {
+ #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+@@ -458,7 +506,7 @@
+ #else
+ #pragma unroll
+     for (int offset = width/2; offset > 0; offset >>= 1) {
+-        x += __shfl_xor_sync(0xffffffff, x, offset, width);
++        x += ggml_cuda_butterfly_xor<width>(x, offset);
+     }
+     return x;
+ #endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+@@ -468,7 +516,7 @@
+ static __device__ __forceinline__ float warp_reduce_sum(float x) {
+ #pragma unroll
+     for (int offset = width/2; offset > 0; offset >>= 1) {
+-        x += __shfl_xor_sync(0xffffffff, x, offset, width);
++        x += ggml_cuda_butterfly_xor<width>(x, offset);
+     }
+     return x;
+ }
+@@ -477,8 +525,8 @@
+ static __device__ __forceinline__ float2 warp_reduce_sum(float2 a) {
+ #pragma unroll
+     for (int offset = width/2; offset > 0; offset >>= 1) {
+-        a.x += __shfl_xor_sync(0xffffffff, a.x, offset, width);
+-        a.y += __shfl_xor_sync(0xffffffff, a.y, offset, width);
++        a.x += ggml_cuda_butterfly_xor<width>(a.x, offset);
++        a.y += ggml_cuda_butterfly_xor<width>(a.y, offset);
+     }
+     return a;
+ }
+@@ -488,7 +536,7 @@
+ #ifdef FP16_AVAILABLE
+ #pragma unroll
+     for (int offset = width/2; offset > 0; offset >>= 1) {
+-        a = __hadd2(a, __shfl_xor_sync(0xffffffff, a, offset, width));
++        a = __hadd2(a, ggml_cuda_butterfly_xor<width>(a, offset));
+     }
+     return a;
+ 
+@@ -505,7 +553,7 @@
+     } else {
+ #pragma unroll
+         for (int offset = width/2; offset > 0; offset >>= 1) {
+-            x = __shfl_xor_sync(0xffffffff, x, offset, width) && x;
++            x = ggml_cuda_butterfly_xor<width>(x, offset) && x;
+         }
+         return x;
+     }
+@@ -518,7 +566,7 @@
+     } else {
+ #pragma unroll
+         for (int offset = width/2; offset > 0; offset >>= 1) {
+-            x = __shfl_xor_sync(0xffffffff, x, offset, width) || x;
++            x = ggml_cuda_butterfly_xor<width>(x, offset) || x;
+         }
+         return x;
+     }
+@@ -528,7 +576,7 @@
+ static __device__ __forceinline__ float warp_reduce_max(float x) {
+ #pragma unroll
+     for (int offset = width/2; offset > 0; offset >>= 1) {
+-        x = fmaxf(x, __shfl_xor_sync(0xffffffff, x, offset, width));
++        x = fmaxf(x, ggml_cuda_butterfly_xor<width>(x, offset));
+     }
+     return x;
+ }
+@@ -694,7 +742,7 @@
+ static __device__ __forceinline__ half2 warp_reduce_max(half2 x) {
+ #pragma unroll
+    for (int offset = width/2; offset > 0; offset >>= 1) {
+-       x = ggml_cuda_hmax2(x, __shfl_xor_sync(0xffffffff, x, offset, width));
++       x = ggml_cuda_hmax2(x, ggml_cuda_butterfly_xor<width>(x, offset));
+    }
+    return x;
+ }
+diff --git a/ggml/src/ggml-cuda/topk-moe.cu b/ggml/src/ggml-cuda/topk-moe.cu
+--- a/ggml/src/ggml-cuda/topk-moe.cu
++++ b/ggml/src/ggml-cuda/topk-moe.cu
+@@ -204,9 +204,9 @@
+ 
+ #pragma unroll
+             for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
+-                const float val    = __shfl_xor_sync(0xFFFFFFFF, max_val, mask, WARP_SIZE);
+-                const float val_s  = __shfl_xor_sync(0xFFFFFFFF, max_val_s, mask, WARP_SIZE);
+-                const int   expert = __shfl_xor_sync(0xFFFFFFFF, max_expert, mask, WARP_SIZE);
++                const float val    = ggml_cuda_butterfly_xor<WARP_SIZE>(max_val, mask);
++                const float val_s  = ggml_cuda_butterfly_xor<WARP_SIZE>(max_val_s, mask);
++                const int   expert = ggml_cuda_butterfly_xor<WARP_SIZE>(max_expert, mask);
+                 if (val_s > max_val_s || (val_s == max_val_s && expert < max_expert)) {
+                     max_val    = val;
+                     max_val_s  = val_s;
+@@ -229,8 +229,8 @@
+ 
+ #pragma unroll
+             for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
+-                const float val    = __shfl_xor_sync(0xFFFFFFFF, max_val, mask, WARP_SIZE);
+-                const int   expert = __shfl_xor_sync(0xFFFFFFFF, max_expert, mask, WARP_SIZE);
++                const float val    = ggml_cuda_butterfly_xor<WARP_SIZE>(max_val, mask);
++                const int   expert = ggml_cuda_butterfly_xor<WARP_SIZE>(max_expert, mask);
+                 if (val > max_val || (val == max_val && expert < max_expert)) {
+                     max_val    = val;
+                     max_expert = expert;
+diff --git a/ggml/src/ggml-cuda/quantize.cu b/ggml/src/ggml-cuda/quantize.cu
+--- a/ggml/src/ggml-cuda/quantize.cu
++++ b/ggml/src/ggml-cuda/quantize.cu
+@@ -390,7 +390,7 @@
+         float amax = fabsf(xi);
+ #pragma unroll
+         for (int mask = 16; mask > 0; mask >>= 1) {
+-            amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, mask, WARP_SIZE));
++            amax = fmaxf(amax, ggml_cuda_butterfly_xor<32>(amax, mask));
+         }
+ 
+         const uint8_t e = compute_e8m0_scale(amax);
+@@ -498,7 +498,7 @@
+     // Exchange max. abs. value between vals_per_scale/4 threads.
+ #pragma unroll
+     for (int offset = vals_per_scale/8; offset > 0; offset >>= 1) {
+-        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
++        amax = fmaxf(amax, ggml_cuda_butterfly_xor<vals_per_scale/4>(amax, offset));
+     }
+ 
+     float sum;
+@@ -508,7 +508,7 @@
+         // Calculate sums across vals_per_sum/4 threads.
+ #pragma unroll
+         for (int offset = vals_per_sum/8; offset > 0; offset >>= 1) {
+-            sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, WARP_SIZE);
++            sum += ggml_cuda_butterfly_xor<vals_per_sum/4>(sum, offset);
+         }
+     }
+ 

@@ -453,8 +453,13 @@ kernel and the gated norm with its q8_1 quantize (+0.9% together), and one
 launch for the projections that share a quantized input (+2.0%). Patches
 123-125 remove 90 more: the two L2 norms as one launch, the q8_0 KV cache's
 Hadamard transforms folded into rope, set_rows and the output gate, and the
-gate read in place (+0.7%). Still open: RMS norm with the multi-section rope
-(a fusion built for it found no matching node chain on the card).
+gate read in place (+0.7%). Patches 133-135 take about 0.8 ms of GPU time
+out of the token with the same bits out: reductions through DPP instead of
+`ds_bpermute` (top-k 14.9 -> 12.2 us), four DeltaNet state columns per wave
+(34.6 -> 23.4 us per layer) and the fp32 router's loop unrolled (20.5 ->
+17.6 us); through Ollama, generation medians 28.4 -> 29.2 tok/s. Still open:
+RMS norm with the multi-section rope (a fusion built for it found no
+matching node chain on the card).
 
 Placement and threads, measured (llama-bench, all shipped patches): keeping
 6 layers' experts in VRAM (`-ncmoe 34`) gives 28.3 tok/s against 25.9-26.0

@@ -1,0 +1,53 @@
+llama.cpp (as fetched by Ollama v0.35.1, llama.cpp b11232, applied after
+134): on gfx803, the fp32 loop of mul_mat_vec_f is unrolled by 8. The
+results are the same bits.
+gfx803-specific: the pragma is compiled only for GCN4 (__gfx803__).
+
+WHY
+---
+mul_mat_vec_f gives each output row one block of 128 threads, and with fp32
+weights each thread walks its columns as float2 loads in a loop whose trip
+count is known only at run time. Rolled, the loop body is two loads, a wait
+for both, and two multiply-adds, so every iteration waits out a full memory
+latency before the next load issues. At one token that is the whole cost:
+the router of Qwen3.6 35B-A3B (256 x 2048 fp32, one call per layer, on the
+path to the MoE top-k) took 20.5 us for 2 MiB, about 100 GB/s, and the
+shared expert's 1 x 2048 gate 5.3 us.
+
+WHAT
+----
+#pragma unroll 8 on the fp32 column loop, under GCN4. The unrolled body
+issues the loads of eight iterations before the first multiply-add, and the
+multiply-adds keep their order, so every sum is the same bits.
+
+Result on an RX 590 (Qwen3.6 35B-A3B Q4_K_M, experts in system RAM, q8_0
+KV cache, flash attention, rocprof medians per call):
+
+    router  256 x 2048 fp32          20.5 -> 17.6 us
+    shared expert gate 1 x 2048       5.3 ->  4.2 us
+    per token (80 calls)                   -163 us
+    logits, llama-perplexity over 1,024 tokens as one-token decodes
+                                      byte-identical
+
+Verified on an RX 590: test-backend-ops test -b ROCm0 -o MUL_MAT and
+-o MUL_MAT_ID pass.
+
+To reproduce, run the llama-perplexity identity check of patch 133 with
+and without this patch, and rocprof --hip-trace --stats around llama-bench
+-p 0 -n 32 (GGML_CUDA_DISABLE_GRAPHS=1) for the per-call times.
+
+diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
+--- a/ggml/src/ggml-cuda/mmvf.cu
++++ b/ggml/src/ggml-cuda/mmvf.cu
+@@ -135,6 +135,11 @@
+             }
+         }
+ 
++        // A block per row leaves gfx803 few waves to hide memory latency with, and the rolled loop waits for each
++        // load before it issues the next; unrolled, the loads of several iterations are in flight together.
++#if defined(GGML_USE_HIP) && defined(GCN4)
++#pragma unroll 8
++#endif // defined(GGML_USE_HIP) && defined(GCN4)
+         for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+             const float2 tmpx = x2[col2];
+             float2 tmpx_gate = make_float2(0.0f, 0.0f);

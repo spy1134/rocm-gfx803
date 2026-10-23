@@ -173,6 +173,15 @@ RUN CC=/opt/rocm/llvm/bin/clang CXX=/opt/rocm/llvm/bin/clang++ \
     && { grep -qF 'cc == GGML_CUDA_CC_GCN4 && !prefer_f32_output' \
              build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/ggml-cuda.cu \
          || { echo "132-gcn4-cublas-fp16-f32-compute.patch was not applied" >&2; exit 1; }; } \
+    && { grep -qF ggml_cuda_butterfly_xor \
+             build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/common.cuh \
+         || { echo "133-gcn4-dpp-butterfly.patch was not applied" >&2; exit 1; }; } \
+    && { grep -qF cols_per_wave \
+             build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/gated_delta_net.cu \
+         || { echo "134-gdn-decode-cols-per-wave.patch was not applied" >&2; exit 1; }; } \
+    && { grep -qF "#pragma unroll 8" \
+             build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/mmvf.cu \
+         || { echo "135-gcn4-mmvf-f32-unroll.patch was not applied" >&2; exit 1; }; } \
     && { grep -q ggml_backend_sched_prefetch_split \
              build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-backend.cpp \
          || { echo "108-moe-expert-prefetch.patch was not applied" >&2; exit 1; }; } \

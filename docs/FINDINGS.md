@@ -1453,6 +1453,26 @@ bullets are the original findings (patches 100-105); the rest build on them.
   Arithmetic is unchanged: greedy output byte-identical on four models, and
   llama-perplexity at 1-token batches gives the same PPL in every digit with
   KL divergence 0.
+- **Decode kernels waited on latency, not bandwidth.** After those fusions a
+  Qwen3.6 35B-A3B token runs ~730 kernels with ~10.2 ms of GPU time, and the
+  small ones between the GPU splits and the CPU experts mostly wait. Every
+  warp reduction in ggml (the norms, the q8_1 quantizer, the matrix-vector
+  epilogues, the DeltaNet recurrence) and the MoE top-k's argmax did its
+  xor-butterfly steps with `ds_bpermute`, a round trip to the LDS unit per
+  step. `133-gcn4-dpp-butterfly.patch` takes them from DPP row rotations and
+  quad permutations instead, which is exact because in a butterfly that
+  starts at the widest offset the rotated lane already holds the xor
+  partner's value (top-k 14.9 -> 12.2 us a call). The one-token DeltaNet
+  recurrence kept two loads of its 2 MiB state in flight per wave and then
+  waited out two reductions; with four columns per wave (`134`) a call takes
+  23.4 us instead of 34.6 (about 180 GB/s). The fp32 router's matrix-vector
+  loop waited for each load before issuing the next; unrolled on gfx803
+  (`135`) the router takes 17.6 us instead of 20.5. Together about 0.8 ms of
+  GPU time per token, all bit-identical: llama-perplexity's logits files
+  compare equal on the MoE model, Qwen3 8B and Qwen3.5 9B, and Ollama's
+  greedy output is byte-identical on three models. Generation through
+  Ollama: medians 28.4 -> 29.2 tok/s over six generations each (the CPU
+  expert split makes single runs vary by about 2 tok/s on a desktop).
 - **The DeltaNet recurrence spent a wave per state column on prompts.** In a
   2048-token prompt batch of Qwen3.6 35B-A3B, GATED_DELTA_NET took about 44
   ms per call, 30 calls and 1.71 s of about 6.6 s of GPU kernel time (26%),

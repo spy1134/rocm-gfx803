@@ -633,6 +633,27 @@ measurements and a reproduction. In short:
   the base image's SGEMM shim runs on its fp16 tiles: error down to the fp16
   rounding of the product, the encoder's projections 1.3-1.6x faster, a
   1080p image prompt on Qwen3.5 9B 14.19 -> 13.61 s.
+- **133-135: decode kernels that waited on latency.** At one token most
+  kernels move little data and spend their time waiting: on cross-lane steps
+  that go through the LDS unit, or with too few loads in flight. Three
+  changes take about 0.8 ms of GPU time out of a Qwen3.6 35B-A3B token, on
+  the path between the GPU and the CPU experts, each with the same bits out
+  (logits files of the same llama-perplexity run compare equal; Ollama's
+  greedy output byte-identical on three models). Through Ollama, generation
+  medians 28.4 -> 29.2 tok/s.
+  - **133-gcn4-dpp-butterfly.patch**: ggml's warp reductions, the MoE top-k
+    and the q8_1 quantizers do their xor-butterfly steps with DPP row
+    rotations and quad permutations, which read another lane inside the ALU
+    instruction, instead of `ds_bpermute`; one swizzle remains for the step
+    between DPP rows. GPU time per token 11.13 -> 10.81 ms, top-k 14.9 ->
+    12.2 us per call. gfx803 only.
+  - **134-gdn-decode-cols-per-wave.patch**: the one-token DeltaNet
+    recurrence gives each wave four state columns instead of one, so the
+    columns' loads and reductions overlap: 34.6 -> 23.4 us per layer (2 MiB
+    of state each way, about 180 GB/s).
+  - **135-gcn4-mmvf-f32-unroll.patch**: the fp32 matrix-vector loop (the
+    MoE router, the shared expert's gate) is unrolled by 8 on gfx803, so its
+    loads no longer issue one at a time: router 20.5 -> 17.6 us per call.
 - **113-116: fewer dispatches per generated token.** On gfx803 every GPU
   dispatch costs about 4.3 us of command-processor time however small the
   kernel, and a Qwen3.6 35B-A3B token issues about 1,425 of them. Four
