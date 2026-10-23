@@ -1058,6 +1058,15 @@ SDXL UNets in fp16 match fp32 to about 1e-3.
   of 32 KiB apart all hit one DRAM channel (8192x2048x2048 19.0 ms against
   17.6 on the 64x64 tile), so such fp32 calls keep the 64x64 tile, and
   llama.cpp patch 127 gives its 8192-row outputs padded columns (14.7 ms).
+  Calls with too few 64x128 tiles run that kernel at 64x64, and at fp32 that
+  form is slow (8-deep slices give it half the multiply-adds per barrier,
+  and it fetches each row of A twice as often): 2.9-4.0 TFLOPS on
+  llama.cpp's prompt matmuls where 64x128 reached 4.3-5.0 (4096x512x12288,
+  a 512-token batch's down projection, 17.5 -> 10.3 ms). fp32 calls with
+  whole 64x128 tiles take 64x128 there instead (bit-identical): Qwen3.5 9B's
+  13,513-token prompt 63.1 -> 54.8 s, Qwen2.5-Coder 7B's 65.7 -> 59.1 s at
+  512-token batches. fp16 keeps 64x64 there; its 16-deep slices ran within
+  4% of 64x128.
 - The node's fused attention runs one wave per SIMD, so every instruction
   besides its multiply-adds costs it time, and fetching the softmax
   probabilities from other lanes with `ds_bpermute` (128 per 32-key tile)

@@ -1873,6 +1873,13 @@ inline long gfx803_sgemm_cus() {
 // fall in one or two DRAM channels, and the call ran 4-68% slower than the
 // 64x64 tile there (SDXL's K = 5120, 10 KiB rows: 6.2 -> 10.2 ms), against
 // 4-23% faster at the same shapes with the rows 16 elements further apart.
+// fp32 calls that qualify for 64x64 and have whole 64x128 tiles take 64x128
+// anyway: an fp32 64x64 tile multiplies 8-deep slices, half the
+// multiply-adds per barrier, and fetches each row of A twice as often per
+// output, and it ran llama.cpp's prompt matmuls at 2.9-4.0 TFLOPS where
+// 64x128 ran them at 4.3-5.0 (4096x512x12288, the down projection of a
+// 512-token batch: 17.5 -> 10.3 ms) and SD's fp32 linears 3-8% slower. fp16
+// keeps 64x64 there: its slices are 16 deep, and it ran within 4% of 64x128.
 // Returns the tile width, 128 or 64, or 0 for the older tiles.
 // GFX803_SGEMM_W2_BN64_MIN overrides the tile count from which 64x64 is taken
 // (0 = never); GFX803_SGEMM_W2=2 takes 64x64 on every call it supports.
@@ -1891,7 +1898,9 @@ inline int gfx803_w2_pick_bn(int M, int N, int K, int batch, bool transA, bool t
         return 128;
     if ((int64_t)lda * (int64_t)elem % 1024 == 0 || (int64_t)ldb * (int64_t)elem % 1024 == 0)
         return 0;
-    return min64 > 0 && (long)(M / 64) * (N / 64) * batch >= min64 ? 64 : 0;
+    if (min64 <= 0 || (long)(M / 64) * (N / 64) * batch < min64)
+        return 0;
+    return elem == 4 && wide ? 128 : 64;
 }
 
 // Tile width for gfx803_w_kernel: 64x64 tiles unless 64x32 tiles fill the

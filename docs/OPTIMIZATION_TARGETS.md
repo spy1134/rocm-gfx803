@@ -1177,6 +1177,15 @@ next to the model ended in a GPU memory fault.
   MUL_MAT_ID 931/931, FLASH_ATTN_EXT 3982/3982.
 - MoE models gain only through their dense layers (+4-5% on Qwen3.6
   35B-A3B); their experts keep mmq (LLM-6).
+- At Ollama's 512-token batches, half of a dense model's prompt GEMMs
+  (4096-row outputs: attention projections, the FFN down projection) had too
+  few 64x128 tiles for the shim's two-wavefront tile and ran on its 64x64
+  form, whose fp32 slices are 8 deep: 2.9-4.0 TFLOPS against 4.3-5.0 for the
+  64x128 tile at the same shapes. The shim takes 64x128 for those fp32 calls
+  now (bit-identical): a 13,513-token prompt with llama-server, Qwen3.5 9B
+  63.1 -> 54.8 s, Qwen2.5-Coder 7B 65.7 -> 59.1 s. With 1024-token batches,
+  where every call already had enough tiles, the same prompts take 53.0 and
+  57.3 s (compute buffer +72 MiB); Ollama's default batch stays 512.
 
 ### LLM-7: DeltaNet conv-input concat
 
