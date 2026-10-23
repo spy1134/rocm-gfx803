@@ -1,80 +1,35 @@
 # rocm-gfx803: ROCm 6.4.4 for AMD Polaris (gfx803)
 
-Stable Diffusion, LoRA training and local LLMs on Radeon RX 470, 480, 570, 580
-and 590 cards, with results checked against a CPU reference.
+Run Stable Diffusion, LoRA training and local language models on Radeon RX 470,
+480, 570, 580 and 590 cards, with results you can trust.
 
-AMD removed gfx803 GPUs from ROCm after version 6.0. The software still builds
-for them, but much of the stack either returns wrong results or runs far below
-what the hardware can do. This project maintains a ROCm 6.4.4 stack for these
-cards, rebuilt from source with the fixes below, and packages ComfyUI (Stable
-Diffusion 1.5 and SDXL), LoRA training with sd-scripts, and Ollama on top of it.
-
+AMD dropped these cards (gfx803, "Polaris") from ROCm after version 6.0. The
+software still builds for them, but much of it returns wrong numbers or runs far
+below what the hardware can do. This project rebuilds a ROCm 6.4.4 stack for
+Polaris with those problems fixed, and packages ready-to-run tools on top of it.
 Every fix is checked against a CPU reference, because the usual failure on this
-hardware is a program that completes and returns wrong numbers.
+hardware is a program that finishes and returns wrong results.
 
-## Results
+## What you get
 
-Measured on an RX 590 8 GB. For images and training, "before" is an early setup
-that already computed correct results (the original stack was faster in places,
-but its results were wrong). For language models, "before" is the same
-llama.cpp version without this project's patches, or, where a row names a
-change, the stack just before it.
+- **ComfyUI** for Stable Diffusion 1.5 and SDXL image generation, with an
+  optional gfx803 attention node that makes it faster.
+- **LoRA training** for SD 1.5 and SDXL with sd-scripts, in 8 GB of VRAM.
+- **Ollama** for local language models: dense and mixture-of-experts (MoE)
+  models, long prompts, and image input, with the MoE experts in system RAM
+  when the model does not fit on the card.
+- **The base image** (`rocm-gfx803:rocm6.4.4`): PyTorch 2.8, MIGraphX and ONNX
+  Runtime for gfx803, for your own projects.
 
-**Images and training**
+## Requirements
 
-| Workload | Before | Now | Speedup |
-| --- | --- | --- | --- |
-| SD 1.5 image, 20 steps at 512 px (ComfyUI, fp32) | 35 s | 10.5 s | 3.3x |
-| SD 1.5 LoRA training step (4 images, 512 px; fp16 mixed precision now, fp32 before) | 12.1 s | 2.5 s | 4.8x |
-| SD 1.5 UNet step in fp16 (ComfyUI default, 512 px, batch of 2, with the node), before the fp16 GEMM tiles and now | 602 ms | 342 ms | 1.76x |
-
-**Language models** (Ollama and its llama.cpp)
-
-| Workload | Before | Now | Speedup |
-| --- | --- | --- | --- |
-| Prompt processing, 512 tokens (Qwen3 8B, Q4_K_M, llama-bench) | 14 tokens/s | 223 tokens/s | 16x |
-| A coding agent's first request (12,000-token prompt) | 18 min | 71 s | 15x |
-| Text generation (Qwen3 8B, short context, llama-bench) | 27 tokens/s | 30.5 tokens/s | 1.1x |
-| A 13,500-token prompt, before and after the head-size 256 attention kernel and the GEMM tile fix (Qwen3.5 9B) | 65.2 s | 54.6 s | 1.19x |
-| A 13,000-token prompt, before and after the head-size 128 attention kernel (Qwen2.5-Coder 7B, llama-server) | 97.4 s | 65.8 s | 1.5x |
-| MoE prompt with experts in system RAM, before and after the fp32 expert GEMM (Qwen3.6 35B-A3B, 2,800 tokens) | 395 tokens/s | 483 tokens/s | 1.22x |
-| MoE text generation with experts in system RAM, before and after the dispatch fusions (Qwen3.6 35B-A3B) | 22.7 tokens/s | 24.2 tokens/s | 1.07x |
-| A 1080p image prompt, before and after the vision-encoder attention fixes (Qwen3.6 35B-A3B) | 51.7 s | 9.4 s | 5.5x |
-
-The largest gains come from replacing the code paths that were slowest on this
-architecture:
-
-- **GEMM.** A correct replacement for rocBLAS's fp32 matrix multiply, with
-  register-tiled and pipelined kernels, reaches 3.9-5 TFLOPS on large
-  matrices, up from 2.8-3.3. fp16 matrix multiplies in the layouts where rocBLAS
-  is 15-25x slower, and fp16-weight matmuls that rocBLAS would accumulate in
-  fp16, run on the same kernels with fp32 sums.
-- **Convolution.** A new Winograd F(2x2, 3x3) kernel replaces MIOpen's binary
-  Winograd kernels, which corrupt memory on gfx803. It runs about 2x faster than
-  the GEMM path for most SD 1.5 convolutions, in fp32 and fp16.
-- **Attention.** An optional ComfyUI node fuses attention (and, at fp32,
-  GroupNorm and GEGLU), avoids a 2.3 GB score matrix, and takes a 512 px fp16
-  denoising step from 392 to 342 ms (attention 129 -> 79 ms; SDXL
-  self-attention 3.3x faster).
-- **Language models.** Prompt processing uses fp32 GEMMs on the shim instead of
-  emulated int8 dot products, and generation kernels were rewritten to avoid
-  register spills. MoE prompts prefetch experts over the card's DMA engines
-  while the GPU computes, and MoE generation with the experts in system RAM
-  runs the shared expert on the GPU while the CPU computes the routed ones.
-  Qwen3.5/3.6 prompts run the DeltaNet recurrence on a kernel that keeps its
-  state in registers, and MoE prompts run the expert matmuls as grouped fp32
-  GEMMs. Prompt attention at head sizes 40-256 runs on gfx803 kernels that
-  compute from registers in fp32, at up to 3.8 TFLOPS.
-
-Text generation is limited mainly by memory bandwidth, so it had the least room
-to improve. Its gain grows with context length (20.9 to 26.5 tokens/s at 8,000
-tokens). Some changes show up as capacity rather than speed: fp16 training, the
-default, uses 2.2 GB less VRAM than fp32, which lets SD 1.5 training run beside a
-desktop and makes SDXL LoRA training fit on 8 GB, and an 8-bit KV
-cache keeps a 16k-context Qwen3 8B entirely on the card.
-[`docs/FINDINGS.md`](docs/FINDINGS.md) has the measurements behind each number,
-and [`docs/OPTIMIZATION_TARGETS.md`](docs/OPTIMIZATION_TARGETS.md) lists what
-could still get faster.
+- A gfx803 card: RX 470, 480, 570, 580 or 590. The smaller RX 460, 550 and 560
+  and the R9 Fury/Nano generation share the instruction set but are untested.
+  8 GB of VRAM is recommended; training needs it.
+- Linux with Docker and the buildx plugin, and your user in the `docker` group
+  (`sudo usermod -aG docker $USER`, then log in again).
+- About 100 GB of free disk space during the build. The finished images take
+  about 31 GB.
 
 ## Quick start
 
@@ -87,19 +42,59 @@ cd rocm-gfx803
 ```
 
 `setup.sh` reports anything that is missing, asks which components to build,
-and can be interrupted and resumed. The first run takes several hours because
-the main libraries are compiled for gfx803. [`docs/STACK.md`](docs/STACK.md)
-documents each component: the images, LoRA training, ComfyUI and Ollama.
+and can be interrupted and resumed. The first build takes several hours, because
+the main libraries are compiled for gfx803; later rebuilds reuse that work.
+[`docs/STACK.md`](docs/STACK.md) covers each component in detail: building,
+running, training, models that fit in 8 GB, and troubleshooting.
 
-## Requirements
+## What to expect
 
-- A gfx803 card. 8 GB of VRAM is recommended; training needs it.
-- Linux with Docker and the buildx plugin, and your user in the `docker` group
-  (`sudo usermod -aG docker $USER`, then log in again).
-- About 100 GB of free disk space during the build. The finished images take
-  about 31 GB.
+Measured on an RX 590 8 GB with the current images.
 
-## What was broken
+| Task | Time or speed |
+| --- | --- |
+| SD 1.5 image, 512 px, 20 steps (ComfyUI, fp32) | 10.5 s |
+| SDXL, 1024 px (fp16) | about 2.7 s per step |
+| SD 1.5 LoRA training, 4 images at 512 px (fp16) | 2.5 s per step |
+| Qwen3 8B, 13,300-token prompt, then generation (Ollama) | 66 s, then 25 tokens/s |
+| Qwen2.5-Coder 7B, 13,300-token prompt, then generation | 56 s, then 29 tokens/s |
+| Qwen3.5 9B, 13,500-token prompt, then generation | 55 s, then 31 tokens/s |
+| Qwen3.6 35B-A3B (MoE, experts in system RAM), 13,500-token prompt, then generation | 26 s, then 25 tokens/s |
+| A 1080p image as a prompt (Qwen3.5 9B / Qwen3.6 35B-A3B) | 13.4 s / 9.4 s |
+
+Against the same software without this project's fixes:
+
+| Workload | Before | Now | Speedup |
+| --- | --- | --- | --- |
+| SD 1.5 image, 20 steps at 512 px (ComfyUI, fp32) | 35 s | 10.5 s | 3.3x |
+| SD 1.5 LoRA training step (fp16 now, fp32 before) | 12.1 s | 2.5 s | 4.8x |
+| Prompt processing, 512 tokens (Qwen3 8B, Q4_K_M) | 14 tokens/s | 223 tokens/s | 16x |
+| A coding agent's first request (12,000-token prompt) | 18 min | 71 s | 15x |
+| A 1080p image as a prompt (Qwen3.6 35B-A3B) | 51.7 s | 9.4 s | 5.5x |
+| Text generation (Qwen3 8B, short context) | 27 tokens/s | 30.5 tokens/s | 1.1x |
+
+For images and training, "before" is an early setup that already computed
+correct results; the original stack was faster in places, but its results were
+wrong. Text generation is limited mainly by memory bandwidth, so it had the
+least room to improve. [`docs/OPTIMIZATION_TARGETS.md`](docs/OPTIMIZATION_TARGETS.md)
+has the measurements behind each change and what could still get faster.
+
+### Where the speed comes from
+
+- **Matrix multiply.** A correct replacement for rocBLAS's fp32 GEMM, with
+  register-tiled and pipelined kernels, reaches 3.9-5 TFLOPS on large matrices.
+  fp16 GEMMs that rocBLAS runs slowly, or would sum in fp16, run on the same
+  kernels with fp32 sums.
+- **Convolution.** A new Winograd kernel replaces MIOpen's, which corrupts
+  memory on gfx803, and runs about 2x faster than the GEMM path for most SD 1.5
+  convolutions.
+- **Attention.** Fused attention kernels for ComfyUI, training and llama.cpp
+  compute from registers in fp32, without the large score matrices.
+- **Language models.** Prompts use fp32 GEMMs instead of emulated int8 dot
+  products; MoE models copy their experts to the card in the background while
+  it computes; generation kernels were rewritten to avoid register spills.
+
+## What this fixes
 
 Without this project's changes, on these cards:
 
@@ -135,39 +130,50 @@ gives each problem's symptom, cause, fix and how to reproduce the check.
   for whole models (the SD 1.5 UNet, Ollama's language models).
 - Training was stress-tested for 45 minutes at full load, a run that previously
   crashed in five attempts out of five.
+- `tools/imgvalidate.sh <image>` checks a built image on the card in about 15
+  minutes, including a control run that must reproduce a known bug with its fix
+  switched off.
 - All measurements are from one RX 590. Other Polaris cards share the chip
   design and should behave alike, but their clocks, memory and firmware differ,
   and none has been tested.
 
 ## Known issues
 
-- Keep the driver's compute-wave save and restore on (`amdgpu.cwsr_enable`,
-  default 1; check `/sys/module/amdgpu/parameters/cwsr_enable`). With it off,
-  a device-side assert does not just end the program that hit it: the driver
-  cannot preempt the halted wave and resets the GPU, which clears VRAM for every
-  program using the card (see "A device-side trap resets the GPU" in
-  [`docs/FINDINGS.md`](docs/FINDINGS.md)).
-- An atomic on fine-grained host memory (a plain `hipHostMalloc`, or
-  `hipHostMallocCoherent`) whose result a kernel does not use stores its
-  operand instead of updating the value: `atomicAdd()` of 5 to 1 leaves 5. Use
-  the returned value or keep such counters in device memory. The image's
-  patched `ockl.bc` does this for HSA signals, which is what makes device
-  `printf` and `assert()` messages work.
-- Mining-edition cards often ship with memory clocked above its rating, which
-  causes random faults and freezes. Check the memory clock first (see
-  "Mining-tuned VRAM clocks" in [`docs/STACK.md`](docs/STACK.md)).
-- Linux kernels 6.12 and 6.13 have been reported to crash with these cards.
+- **Mining-edition cards** often ship with memory clocked above its rating,
+  which causes random faults and freezes that look like software bugs. Check
+  the memory clock first (see "Mining-tuned VRAM clocks" in
+  [`docs/STACK.md`](docs/STACK.md)).
+- **Linux kernels 6.12 and 6.13** have been reported to crash with these cards.
+- **Keep the driver's compute-wave save and restore on** (`amdgpu.cwsr_enable`,
+  default 1; check `/sys/module/amdgpu/parameters/cwsr_enable`). With it off, a
+  device-side assert does not just end the program that hit it: the driver
+  resets the GPU, which clears VRAM for every program using the card (see "A
+  device-side trap resets the GPU" in [`docs/FINDINGS.md`](docs/FINDINGS.md)).
+- **If you write your own HIP code:** an atomic on fine-grained host memory (a
+  plain `hipHostMalloc`, or `hipHostMallocCoherent`) whose result the kernel
+  does not use stores its operand instead of updating the value (`atomicAdd()`
+  of 5 to 1 leaves 5). Use the returned value, or keep such counters in device
+  memory.
 
-## Repository layout
+## Documentation
+
+- [`docs/STACK.md`](docs/STACK.md): building and running the images, ComfyUI,
+  LoRA training, Ollama and fitting models into 8 GB, every patch in the
+  images, and host-side caveats.
+- [`docs/FINDINGS.md`](docs/FINDINGS.md): what breaks on gfx803, why, and how
+  each fix was checked, with steps to reproduce.
+- [`docs/OPTIMIZATION_TARGETS.md`](docs/OPTIMIZATION_TARGETS.md): where the
+  time goes, what has been measured, and what could still get faster.
+- [`docs/KERNEL_BUGS.md`](docs/KERNEL_BUGS.md): the earlier kernel-level
+  investigations, and a method for finding more.
 
 | Path | What it holds |
 | --- | --- |
 | `Dockerfile`, `Dockerfile-ComfyUI`, `Dockerfile-Ollama` | the base image (ROCm 6.4.4 with the gfx803 libraries, PyTorch and the SGEMM shim), ComfyUI with training, and Ollama |
-| `setup.sh`, `start-*.sh`, `container-args.sh` | the host-side setup check and launchers |
+| `setup.sh`, `start-*.sh`, `container-args.sh` | the setup check and the launchers |
 | `patches/` | every source patch the images apply, each with a header that says why |
 | `runtime/`, `training/` | Python workarounds installed into the base image; the training tools in the ComfyUI image |
 | `tools/` | correctness suite, the ComfyUI attention node, host setup, hang capture and repro tools |
-| `docs/` | [`STACK.md`](docs/STACK.md) (building and using the images), [`FINDINGS.md`](docs/FINDINGS.md), [`OPTIMIZATION_TARGETS.md`](docs/OPTIMIZATION_TARGETS.md), [`KERNEL_BUGS.md`](docs/KERNEL_BUGS.md) |
 | `wip_patches/` | runtime patches that were investigated and not shipped, kept for their history |
 
 ## Origin

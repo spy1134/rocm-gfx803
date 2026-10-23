@@ -19,6 +19,8 @@ The repository's [front page](../README.md) gives the results and where the
 project comes from; [`FINDINGS.md`](FINDINGS.md) has the detail behind each
 fix. This file is the reference for building and using the images.
 
+**Contents:** [Why ROCm 6.4.4](#why-rocm-644) · [What gets rebuilt, and why](#what-gets-rebuilt-and-why) · [The SGEMM shim](#the-sgemm-shim) · [What is switched off](#what-is-switched-off) · [Expectations](#expectations) · [Versions](#versions) · [Building](#building) · [Running](#running) · [Verifying on hardware](#verifying-on-hardware) · [ComfyUI and SD 1.5 LoRA training](#comfyui-and-sd-15-lora-training) · [Ollama (local LLMs)](#ollama-local-llms) · [Case study: ROCMExecutionProvider fused-conv crash (musicnn-class models)](#case-study-rocmexecutionprovider-fused-conv-crash-musicnn-class-models) · [Host-side caveats](#host-side-caveats) · [Credit](#credit)
+
 > **gfx803 is not a supported ROCm target.** AMD supports gfx900 and newer; on
 > gfx803 everything here is best-effort and slow by construction (see
 > [Expectations](#expectations)). The stack is validated on an RX 590 8 GB:
@@ -136,6 +138,13 @@ unconditionally in `cmake/Dependencies.cmake` -- so the final image sets
 `TORCH_BLAS_PREFER_HIPBLASLT=0` to keep GEMMs off a library with no gfx803
 kernels.
 
+**Triton is not built**, so `torch.compile` with its default inductor backend
+is not available: PyTorch runs in eager mode, which is what ComfyUI, sd-scripts
+and the training tools use. A triton build for gfx803 also has to lower fp16
+dot products without `v_dot` instructions, which gfx803 lacks;
+`tools/correctness-suite/triton_dot_probe.py` checks that on an image that
+adds triton.
+
 ## Expectations
 
 Untuned MIOpen convolutions, no kernel fusion (no CK, no MLIR), on hardware
@@ -234,6 +243,13 @@ float64 CPU reference; it passes on an RX 590 (see
 
 If it hangs or the process dies without a Python traceback, check `dmesg` on
 the host before suspecting the image -- see the kernel-version caveat below.
+
+`tools/imgvalidate.sh <image>` runs the fuller gate in about 15 minutes:
+`verify.py`, the cache-coherence probes from `tools/tc-staleness/`, a control
+run with the vector-L1 invalidate switched off that must reproduce a wrong
+rocBLAS result, the fp16 GEMM and convolution sweep with and without the SGEMM
+shim, and the PyTorch op suite against the CPU. Logs go to `workspace/imgval/`
+(`IMGVAL_DIR` changes that). Run it on a new build before relying on it.
 
 ## ComfyUI and SD 1.5 LoRA training
 
