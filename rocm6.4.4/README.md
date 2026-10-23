@@ -608,7 +608,7 @@ measurements and a reproduction. In short:
   KB of shared memory there; each set of query rows gets a whole 16-lane row
   instead, with 16-key tiles. 3.0-3.5 TFLOPS. A 13,513-token prompt:
   Qwen3.5 9B 65.7 -> 62.5 s with llama-server, Qwen3.6 35B-A3B through
-  Ollama 83.0 -> 80.3 s. Error against an fp32 reference the fp16 rounding
+  Ollama 29.8 -> 27.0 s. Error against an fp32 reference the fp16 rounding
   of K and V (the tile kernel's up to 1000x higher); FLASH_ATTN_EXT tests
   pass (3982/3982, plus 513 added head-256 cases).
 - **132-gcn4-cublas-fp16-f32-compute.patch**: matmuls with fp16 weights (a

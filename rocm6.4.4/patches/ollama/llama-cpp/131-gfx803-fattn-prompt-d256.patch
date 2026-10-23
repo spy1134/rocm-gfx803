@@ -65,8 +65,8 @@ Result on an RX 590, 13,513-token prompt, 16k context, q8_0 KV cache:
     Qwen3.5 9B IQ4_XS, llama-server     65.7 -> 62.5 s
                                          (attention 6.16 -> 3.57 s, rocprof)
     Qwen3.5 9B through Ollama           65.2 -> 63.2 s
-    Qwen3.6 35B-A3B through Ollama      83.0 -> 80.3 s
-    (experts in system RAM)
+    Qwen3.6 35B-A3B through Ollama      29.8 -> 27.0 s
+    (experts in system RAM, 2048-token batches)
 
 Generation is unchanged; Qwen3.5 9B's greedy answer is identical.
 

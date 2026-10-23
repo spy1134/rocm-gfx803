@@ -171,7 +171,7 @@ Open targets in recommended order, then the done ones.
 
 | Target | Area | Expected gain | Status |
 | --- | --- | --- | --- |
-| LLM-6 | MoE prompts: expert copies, MUL_MAT_ID, dense parts | copies overlap compute since patch 108 (pp2048 295 -> 367 tok/s, against 376 with no copies at all); DeltaNet recurrence (patch 117: pp2048 361 -> 455 tok/s); expert matmuls, 62% of GPU time after 117, as a grouped fp32 GEMM (patch 118: pp2048 450 -> 547, pp512 234 -> 275); expert reduction (patch 119: +2.6%); a third prefetch slot (patch 126: pp2048 565 -> 599, pp512 282 -> 331). The copies run at the link limit (13.3 GB/s, 18.2 GiB per 2048-token batch) and with three slots they are hidden: skipping them altogether (timing-only build) gives 630 against 593 tok/s, so a prompt batch is bound by GPU compute, three quarters of it the dense fp32 GEMMs (gfx803 SGEMM) and the expert GEMMs. The fp32 two-wavefront tile (BLAS-7) and padded output rows for 8192-row matmuls (patch 127) take the dense GEMMs from about 4.0 to 4.6-5.3 TFLOPS: pp2048 about 599 -> 615; through Ollama (2,800-token prompt, a 2048- and a 752-token batch) 516 -> 519. 4096-token batches add 4% on 4096- and 8192-token prompts with three slots (8% with two), too little for an Ollama batch-size patch and a compute buffer about 1 GiB larger | Open: dense GEMM efficiency; the expert GEMM is bound by its staging (options below) |
+| LLM-6 | MoE prompts: expert copies, MUL_MAT_ID, dense parts | copies overlap compute since patch 108 (pp2048 295 -> 367 tok/s, against 376 with no copies at all); DeltaNet recurrence (patch 117: pp2048 361 -> 455 tok/s); expert matmuls, 62% of GPU time after 117, as a grouped fp32 GEMM (patch 118: pp2048 450 -> 547, pp512 234 -> 275); expert reduction (patch 119: +2.6%); a third prefetch slot (patch 126: pp2048 565 -> 599, pp512 282 -> 331). The copies run at the link limit (13.3 GB/s, 18.2 GiB per 2048-token batch) and with three slots they are hidden: skipping them altogether (timing-only build) gives 630 against 593 tok/s, so a prompt batch is bound by GPU compute, three quarters of it the dense fp32 GEMMs (gfx803 SGEMM) and the expert GEMMs. The fp32 two-wavefront tile (BLAS-7) and padded output rows for 8192-row matmuls (patch 127) take the dense GEMMs from about 4.0 to 4.6-5.3 TFLOPS: pp2048 about 599 -> 615; through Ollama (2,800-token prompt, a 2048- and a 752-token batch) 516 -> 519. 4096-token batches add 4% on 4096- and 8192-token prompts with three slots (8% with two), too little for an Ollama batch-size patch and a compute buffer about 1 GiB larger ; a 13,513-token prompt at 2048-token batches (29.0 s): expert GEMMs 32% of GPU time, dense GEMMs 33% at 4.37 TFLOPS on average, head-256 attention 17% (patch 131) | Open: dense GEMM efficiency (BLAS-7's main tile); the expert GEMM is bound by its staging (options below) |
 | RT-1 | Cost of the vector-L1 invalidate before every dispatch | 1.65 us per dispatch: ~2.4 ms of an MoE token (~6%), 2.3-2.7% of dense decode, ~2.4 ms of an SD 1.5 step. The cost is the extra ring slot, not the cache work: an empty-kernel dispatch costs 4.27-4.30 us with the shipped packet, with only the L1 bit, with poll interval 1, and with the L1 action moved onto the slot's RELEASE_MEM (no ACQUIRE_MEM), against 2.65 us without the slot | Measured, no cheaper packet; only fewer slots would help, and skipping the invalidate between kernels is not provably correct |
 | LLM-5 | Dense decode above the bandwidth bound | per 36 ms token: K-quant kernels ~2.9 ms, flash-attention decode ~2.6 ms at 5k depth, F16 `attn_v` ~1 ms, launches ~1 ms by fusion; the same kernels make up MoE generation's GPU part | Open, measured before the stale-L1 fix and patch 111 |
 | LLM-8 | MoE generation with experts in system RAM | Qwen3.6 35B-A3B, 39 ms per token before patches 113-116 (25.6 tok/s, llama-bench with a cold page cache): CPU experts ~16.7 ms, GPU kernels ~12 ms, ~1,425 dispatches at ~4.3 us each (~6 ms), hand-offs ~3 ms; 113-116 remove up to 300 dispatches per token (25.60 -> 27.51 tok/s), 120-125 another 320 (+0.9%, +2.0%, +0.7%); CPU experts run at ~91% of practical DDR4 bandwidth (36.5 GB/s): strict thread pinning lost 21%, the AVX2 repacked layout gained nothing; 6-8 expert layers resident in VRAM give +9% (llama.cpp's fit does this by itself when the VRAM is free) | Open: RMS norm + multi-section rope fusion (did not fire) |
@@ -185,7 +185,7 @@ Open targets in recommended order, then the done ones.
 | LLM-10 | Image prompts | a 1080p image (2061 tokens) took 50.4 s against 8.8 s for 2028 text tokens (Qwen3.5 9B), 38.7 s of it the vision encoder's attention at 0.21 TFLOPS; patch 128 (narrower, non-spilling one-head-per-K/V tiles): 18.7 s; patch 129 (gfx803 attention kernel for head sizes 40-80, 3.5 TFLOPS): 14.2 s; Qwen3.6 35B-A3B through Ollama 51.7 -> 14.0 -> 9.6 s. patch 132 (the encoder's fp16 projections in fp32 compute, on the shim, which also removes their fp16-accumulation error of about 1% RMS): 13.6 s (13.4 s through Ollama). What is left (9B, rocprof): the image tokens' own prefill (~6.6 s, the same rate as text), the encoder's attention (~2.4 s) | Open: the rest is text-rate prefill (LLM-6) and the encoder's attention |
 | SD-7 | Fused Winograd F(2x2, 3x3) | fp16 SD at most ~9 ms per step (2%); fp32 and training unmeasured | Open, low |
 | SD-1 | Winograd weight gradients | full fine-tuning and LoCon only | Open |
-| LLM-11 | Prompt attention at head sizes 96-256 | head size 128 on a gfx803 kernel (patch 130, Q in registers, 3.4-3.8 TFLOPS against 0.9-2.5): a 13,316-token prompt, Qwen2.5-Coder 7B 97.4 -> 65.8 s (attention 42.6 -> 10.7 s), Qwen3 8B 78.3 -> 74.6 s (21.1 -> 17.1 s). Head size 256, the full-attention layers of Qwen3.5/3.6 and Qwen3-Coder-Next (patch 131, Q split over 16 lanes, 16-key tiles): 1.5-2.1 -> 3.0-3.5 TFLOPS, 6-15x where the GQA ratio is 1 or odd; a 13,513-token prompt, Qwen3.5 9B 65.7 -> 62.5 s (attention 6.16 -> 3.57 s), Qwen3.6 35B-A3B through Ollama 83.0 -> 80.3 s | Open: the cost of split-K/V partial results |
+| LLM-11 | Prompt attention at head sizes 96-256 | head size 128 on a gfx803 kernel (patch 130, Q in registers, 3.4-3.8 TFLOPS against 0.9-2.5): a 13,316-token prompt, Qwen2.5-Coder 7B 97.4 -> 65.8 s (attention 42.6 -> 10.7 s), Qwen3 8B 78.3 -> 74.6 s (21.1 -> 17.1 s). Head size 256, the full-attention layers of Qwen3.5/3.6 and Qwen3-Coder-Next (patch 131, Q split over 16 lanes, 16-key tiles): 1.5-2.1 -> 3.0-3.5 TFLOPS, 6-15x where the GQA ratio is 1 or odd; a 13,513-token prompt, Qwen3.5 9B 65.7 -> 62.5 s (attention 6.16 -> 3.57 s), Qwen3.6 35B-A3B through Ollama 29.8 -> 27.0 s | Open: the cost of split-K/V partial results |
 | LLM-3 | mmvq vs mmq for 9-16 tokens | speculative/parallel decoding | Open |
 | LLM-1b | SDWA dot product losses (2-token decode) | 1-11% on 2-token decode | Open, minor |
 | TRAIN-1 | fp16 LoRA training against fp32 | 2.87 -> 2.47 s/step, 5.8 -> 3.6 GB; without checkpointing 2.07 -> 1.73 s/step, 7.1 -> 4.9 GB | Done (fp16 is `gfx803-train`'s default) |
@@ -218,21 +218,26 @@ sees about batch x top-k / experts tokens (64 at a 2048-token batch), below
 the 128 where fp32 cuBLAS beats mmq.
 
 **Where the time goes.** A batch copies every layer's experts (about 20 GB)
-over PCIe, once per batch, so a larger batch amortizes the copy. At
-2048-token batches patch 108 hides nearly all of it (367 tok/s against 376
-with no copies at all), so what is left there is compute. rocprof of one
-2048-token batch of Qwen3.6 35B-A3B (experts in system RAM, before patch
-117) splits about 6.6 s of GPU kernel time into:
+over PCIe, once per batch, so a larger batch amortizes the copy; with
+2048-token batches patches 108 and 126 hide it, so what is left is compute.
+rocprof of a 13,513-token prompt of Qwen3.6 35B-A3B (experts in system RAM,
+2048-token batches, llama-server, patches up to 132; 29.0 s, 26.2 s of GPU
+kernel time):
 
 | Part | Time | Share | Rate |
 | --- | --- | --- | --- |
-| Expert matmuls (mmq MUL_MAT_ID) | 2.79 s | 42% | ~2.1 TFLOPS, the emulated-int8 rate |
-| DeltaNet recurrence (GATED_DELTA_NET, 30 calls of ~44 ms) | 1.71 s | 26% | ~225 GFLOP in all, under 2% of the fp32 rate |
-| Dense fp32 GEMMs on the shim (patch 106) | 1.33 s | 20% | ~4.4 TFLOPS |
-| Everything else | ~0.8 s | 12% | |
+| Expert matmuls (patch 118's grouped fp32 GEMM, Q4_K and Q6_K) | 8.30 s | 32% | ~3.9 (Q4_K) and ~3.2 TFLOPS (Q6_K) |
+| Dense fp32 GEMMs on the shim (patch 106), 2,670 calls | 8.63 s | 33% | 4.37 TFLOPS on average (37.7 TFLOP) |
+| Prompt attention, head size 256 (patch 131) | 4.35 s | 17% | ~3.4 TFLOPS |
+| DeltaNet recurrence (patch 117) | 0.83 s | 3% | |
+| Copies, dequantization, everything else | ~4.1 s | 16% | |
 
-Patch 117 removes most of the DeltaNet part (first option below); the
-expert matmuls are now the largest part by far.
+The dense GEMMs at a 2048-token batch: projections with 8192, 4096 and 2048
+rows (about 6 s) run at 4.2-4.4 TFLOPS each including their dequantization
+and padded copies, near the shim's best tile; the 32-, 256- and 512-row ones
+(about 0.9 s) at 0.5-3.2 TFLOPS. Nothing left here is a lever of more than
+a few percent on its own: a faster main GEMM tile (BLAS-7) would move the
+dense third, and the expert GEMM is bound by its staging (options below).
 
 **Options.**
 - Done: patch 117 runs GATED_DELTA_NET for prompt batches with head size
@@ -297,7 +302,10 @@ expert matmuls are now the largest part by far.
   numbers; switching transparent huge pages off for the process changed
   nothing.
 - Done for the Qwen3.6 35B text entries: `num_batch` 2048 with patch 108
-  (2k-token prompt 142 -> 198 tok/s, about 2% slower generation). The vision
+  (2k-token prompt 142 -> 198 tok/s, about 2% slower generation). A
+  13,511-token prompt takes 27.0 s with the 256k entry and 78.7 s with the
+  library's `qwen3.6:35b` tag, which keeps Ollama's 512-token batches and so
+  copies every layer's experts four times as often. The vision
   entry stays at 1024 (short image prompts gained nothing; generation 13.4 ->
   12.2). Qwen3-Coder-Next is unmeasured: it pins 51.5 GiB of RAM and does not
   fit beside Chatterbox, Open WebUI and a desktop on 64 GB.
@@ -837,7 +845,7 @@ model shapes, 1.7-1.8x the tile kernel per call and 6-15x where it served
 one head per tile; against an fp32 reference its error is the fp16 rounding
 of K and V (3-4.5e-8 NMSE, the tile kernel up to 4.8e-5). Qwen3.5 9B's
 13,513-token prompt 65.7 -> 62.5 s (attention 6.16 -> 3.57 s), through
-Ollama 65.2 -> 63.2 s; Qwen3.6 35B-A3B through Ollama 83.0 -> 80.3 s. Four
+Ollama 65.2 -> 63.2 s; Qwen3.6 35B-A3B through Ollama 29.8 -> 27.0 s. Four
 rows per lane spill, or run 3.5% slower with K and V read one float4 at a
 time.
 
