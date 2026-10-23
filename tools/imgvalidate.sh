@@ -6,29 +6,31 @@
 # It runs the on-card gate (verify.py), the cross-dispatch coherence probes with a
 # control arm that must reproduce the corruption, and the fp16 GEMM/convolution sweep
 # for the SGEMM shim's takeover routes. Every arm reaps leftover in-container processes
-# first: `timeout` on `podman exec` kills the client and leaves the process running
+# first: `timeout` on `docker exec` kills the client and leaves the process running
 # inside the container holding its GPU context, and a second GPU tenant invalidates
 # everything the probes measure.
 #
-# The probes are copied out of this repo into /data each run, so the run tests this
-# tree's harnesses and not whatever was on the box last week.
+# The probes are copied out of this repo into the work folder each run
+# (IMGVAL_DIR, default workspace/imgval/), so the run tests this tree's harnesses
+# and not an older copy.
 set -u
 IMG="${1:?image tag required}"
 START="$(date '+%Y-%m-%d %H:%M:%S')"
 NAME=imgval
-D=/data/s6/imgval
-PROBES=/data/s6/imgval-probes
 REPO="${REPO_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
+WORK="${IMGVAL_DIR:-$REPO/workspace/imgval}"
+D="$WORK/logs"
+PROBES="$WORK/probes"
 
 mkdir -p "$D"
 rm -rf "$PROBES"
 mkdir -p "$PROBES"
 cp "$REPO/verify.py" "$PROBES/"
-cp "$REPO"/tools/tc-staleness/{ms3,ms4,multistream2,conbrace3,xprobe2,pinnedhost,graphprobe}.py "$PROBES/"
+cp "$REPO"/tools/tc-staleness/{_hip,probe_rocblas,ms3,ms4,multistream2,conbrace3,xprobe2,pinnedhost,graphprobe}.py "$PROBES/"
 cp "$REPO"/tools/correctness-suite/{torch_op_suite,fp16_gemm_sweep,triton_dot_probe}.py "$PROBES/"
 
 cleanup() {
-  podman exec "$NAME" bash -lc "pkill -9 -f '[p]ython3' >/dev/null 2>&1; true" 2>/dev/null
+  docker exec "$NAME" bash -lc "pkill -9 -f '[p]ython3' >/dev/null 2>&1; true" 2>/dev/null
   sleep 2
 }
 
@@ -36,38 +38,37 @@ cleanup() {
 arm() { # name, seconds, script, extra env...
   cleanup
   local name=$1 secs=$2 script=$3; shift 3
-  timeout "$secs" podman exec "$@" -e TRIALS="${TRIALS_OVERRIDE:-60}" "$NAME" \
-      python3 "/data/s6/imgval-probes/$script" > "$D/$name.log" 2>&1
+  timeout "$secs" docker exec "$@" -e TRIALS="${TRIALS_OVERRIDE:-60}" "$NAME" \
+      python3 "/probes/$script" > "$D/$name.log" 2>&1
   local rc=$?
   echo "--- $name rc=$rc :: $(grep -ahoE 'MS3.*|MS4.*|MS2.*|STATS.*|PINNEDHOST.*|XREADER.*|GRAPHPROBE.*|CONVPROBE.*|F16SWEEP.*|All checks passed.*|^BAD *:.*|^PASS *:.*|NONFINITE.*' "$D/$name.log" | tail -2 | tr '\n' ' ')"
 }
 
 echo "=== image: $IMG"
-podman rm -f "$NAME" >/dev/null 2>&1
-# label=disable: on an SELinux-enforcing host, the files under /data carry no
-# container label, so the container gets "Permission denied" on every probe.
-# Relabeling with :z would rewrite the label of everything under /data,
-# including podman's own storage, so the container skips SELinux confinement.
-podman run -d --name "$NAME" --device=/dev/kfd --device=/dev/dri --group-add video \
+docker rm -f "$NAME" >/dev/null 2>&1
+# label=disable: on an SELinux-enforcing host the probe folder carries no
+# container label, and the container would get "Permission denied" on every
+# probe; relabeling with :z would rewrite the host's own labels.
+docker run -d --name "$NAME" --device=/dev/kfd --device=/dev/dri --group-add video \
     --security-opt seccomp=unconfined --security-opt label=disable \
-    -v /data:/data "$IMG" sleep infinity >/dev/null || {
+    -v "$PROBES:/probes:ro" "$IMG" sleep infinity >/dev/null || {
     echo "FATAL: container start failed"; exit 1; }
 sleep 10
 
-K=$(podman exec "$NAME" bash -lc "rocminfo 2>/dev/null | grep -c KERNEL_DISPATCH")
+K=$(docker exec "$NAME" bash -lc "rocminfo 2>/dev/null | grep -c KERNEL_DISPATCH")
 echo "KERNEL_DISPATCH agents: $K (want 2)"
-[ "$K" = "2" ] || { echo "FATAL: card is not a dispatch agent; reload amdgpu (README box section)."; exit 1; }
+[ "$K" = "2" ] || { echo "FATAL: card is not a dispatch agent; check that amdgpu is loaded and the card is not in a fault state."; exit 1; }
 
 echo "--- provenance of the shipped libraries"
-podman exec "$NAME" bash -lc '
+docker exec "$NAME" bash -lc '
   L=$(readlink -f /opt/rocm/lib/libamdhip64.so)
   echo "  libamdhip64: $(basename "$L") $(md5sum "$L" | cut -c1-12)"
   for f in CLR_GFX8_TC_INVALIDATE CLR_GFX8_TC_RECORD_FENCE; do
     printf "  %-26s %s\n" "$f" "$(strings "$L" | grep -c "$f")"
   done
-  S=/opt/rocm/lib/libgfx803_sgemm_shim.so
-  echo "  sgemm shim: $(md5sum "$S" | cut -c1-12)"
-  for m in f16-takeover f16-map-nm sb-takeover-no-algo-gate; do
+  S=/opt/rocm/lib/libgfx803_sgemm_shim_batched.so
+  echo "  sgemm shim (preloaded): $(md5sum "$S" | cut -c1-12)"
+  for m in "shim kernel (fp16)" gemm_strided_batched_ex GFX803_SGEMM_W2; do
     printf "  %-26s %s\n" "shim marker $m" "$(strings "$S" | grep -c "$m")"
   done
   objcopy -O binary --only-section=.hip_fatbin /opt/rocm/lib/librocsolver.so.0 /tmp/fb 2>/dev/null
@@ -83,17 +84,22 @@ arm xprobe   1800 xprobe2.py
 arm pinned   1800 pinnedhost.py
 arm graph    1800 graphprobe.py
 
-echo "--- control: coherence site off (must reproduce)"
-cleanup
-timeout 1800 podman exec -e TRIALS=60 -e CLR_GFX8_TC_RECORD_FENCE=0 "$NAME" \
-    python3 /data/s6/imgval-probes/ms3.py > "$D/ms3off.log" 2>&1
-echo "--- ms3off rc=$? :: $(grep -ahoE 'MS3.*' "$D/ms3off.log")"
+# On ROCm 6.4.4 the rocBLAS probe is the one that fails with the vector-L1
+# invalidate off (the cross-stream probes stay clean either way), so it is the
+# arm that proves the fix is what makes the others pass.
+echo "--- rocBLAS staleness probe, invalidate on and off (off must reproduce)"
+for knob in 1 0; do
+  cleanup
+  timeout 1800 docker exec -e CLR_GFX8_TC_INVALIDATE=$knob "$NAME" \
+      python3 /probes/probe_rocblas.py > "$D/l1-$knob.log" 2>&1
+  echo "--- l1 invalidate=$knob rc=$? :: $(grep -aE '^WRONG|^ALL OK|PREFLIGHT' "$D/l1-$knob.log" | head -1) (want $([ $knob = 1 ] && echo 'ALL OK' || echo WRONG))"
+done
 
 echo "--- fp16 GEMM and conv sweep, one case per process (a fault kills the context)"
 cleanup
 pass=0; fail=0
 for i in $(seq 0 26); do
-  r=$(timeout 200 podman exec "$NAME" python3 /data/s6/imgval-probes/fp16_gemm_sweep.py --case "$i" 2>/dev/null \
+  r=$(timeout 200 docker exec "$NAME" python3 /probes/fp16_gemm_sweep.py --case "$i" 2>/dev/null \
       | grep -aoE '\{"i".*' | tail -1)
   case "$r" in
     *'"ok": true'*)  pass=$((pass+1));;
@@ -106,8 +112,8 @@ echo "--- control: same sweep with the shim's takeover disabled (real rocBLAS ag
 cleanup
 pass2=0; fail2=0
 for i in $(seq 0 26); do
-  r=$(timeout 200 podman exec -e GFX803_SGEMM_SHIM_DISABLE=1 "$NAME" \
-      python3 /data/s6/imgval-probes/fp16_gemm_sweep.py --case "$i" 2>/dev/null \
+  r=$(timeout 200 docker exec -e GFX803_SGEMM_SHIM_DISABLE=1 "$NAME" \
+      python3 /probes/fp16_gemm_sweep.py --case "$i" 2>/dev/null \
       | grep -aoE '\{"i".*' | tail -1)
   case "$r" in
     *'"ok": true'*)  pass2=$((pass2+1));;
@@ -118,21 +124,26 @@ echo "F16SWEEP-NOSHIM pass=$pass2 fail=$fail2 (want 27/0)"
 
 echo "--- triton dot canary: one process per dtype, because a compiler abort kills the process"
 # Nothing else in this gate compiles a triton kernel, and triton-compiled
-# attention (vLLM's ROCm backend, for one) cannot run without an fp16 dot, so a silent triton/fdot2 regression reaches a published
-# image otherwise. Missing output is the abort, not a skip.
-for dt in fp16 bf16 fp32 i8; do
-  cleanup
-  r=$(timeout 600 podman exec "$NAME" python3 /data/s6/imgval-probes/triton_dot_probe.py --dtype "$dt" 2>&1 \
-      | grep -aoE 'TRITONDOT .*' | tail -1)
-  case "$r" in
-    *'"ok": true'*) echo "   triton dot $dt OK: $r";;
-    *)              echo "   triton dot $dt FAILED: ${r:-<no output: the triton compiler aborted>}";;
-  esac
-done
+# attention (vLLM's ROCm backend, for one) cannot run without an fp16 dot, so a
+# silent triton/fdot2 regression would reach a published image otherwise.
+# Missing output is the abort, not a skip.
+if docker exec "$NAME" python3 -c "import triton" >/dev/null 2>&1; then
+  for dt in fp16 bf16 fp32 i8; do
+    cleanup
+    r=$(timeout 600 docker exec "$NAME" python3 /probes/triton_dot_probe.py --dtype "$dt" 2>&1 \
+        | grep -aoE 'TRITONDOT .*' | tail -1)
+    case "$r" in
+      *'"ok": true'*) echo "   triton dot $dt OK: $r";;
+      *)              echo "   triton dot $dt FAILED: ${r:-<no output: the triton compiler aborted>}";;
+    esac
+  done
+else
+  echo "   SKIPPED: the image has no triton (torch.compile is unavailable in it)"
+fi
 
 echo "--- op suite (long)"
 cleanup
-timeout 4200 podman exec "$NAME" python3 /data/s6/imgval-probes/torch_op_suite.py > "$D/opsuite.log" 2>&1
+timeout 4200 docker exec "$NAME" python3 /probes/torch_op_suite.py > "$D/opsuite.log" 2>&1
 echo "opsuite rc=$? :: $(grep -aE '^(CHECKS|BAD|NONFINITE|ERROR|PASS)' "$D/opsuite.log" | tr '\n' ' ')"
 
 echo "--- kernel log: GPU resets or ring timeouts during this run"

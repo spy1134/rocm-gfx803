@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import importlib.util
 import torch
 import traceback
 
@@ -9,7 +10,10 @@ DEVICE = torch.device("cuda")
 
 print("=" * 90)
 print("gfx803 TORCH OP CORRECTNESS BENCHMARK")
-print("CPU REFERENCE vs GPU EAGER vs GPU INDUCTOR")
+# torch.compile's inductor backend generates triton kernels; in an image without
+# triton every inductor case fails the same way, so only eager mode is checked.
+HAS_TRITON = importlib.util.find_spec("triton") is not None
+print("CPU REFERENCE vs GPU EAGER" + (" vs GPU INDUCTOR" if HAS_TRITON else " (inductor skipped: no triton)"))
 print("=" * 90)
 
 print("Torch :", torch.__version__)
@@ -169,7 +173,7 @@ def run_test(
     # GPU INDUCTOR
     # -------------------------------------------------------------
 
-    if inductor_fn is not None:
+    if inductor_fn is not None and HAS_TRITON:
 
         try:
 
