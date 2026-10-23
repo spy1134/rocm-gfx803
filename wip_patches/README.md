@@ -22,11 +22,9 @@ Gates referenced below:
   present", exit 134, mid-suite around `ReduceSum_batch_by_seq_by_128`).
   Stock lib: 0 faults in 40 runs.
 
-Binaries of every built lib are on the gfx803 box in
-`/data/rocr644-ring16/libs/` (see hashes below; `active` in ortrun =
-`/opt/rocm-6.4.4/lib/libhsa-runtime64.so.1.15.0`, verify via
-`sha256sum $(readlink -f .../libhsa-runtime64.so.1)` — the soname file, not
-the versioned one!).
+When checking which runtime a test loaded, hash the file the
+`libhsa-runtime64.so.1` soname resolves to (`sha256sum $(readlink -f
+.../libhsa-runtime64.so.1)`), not the versioned file next to it.
 
 ## Version table
 
@@ -129,29 +127,15 @@ defer-FIFO in upstream fmm.c).
   allocator default OFF. Harness 0/52, ORT 20/20 × 315 OK, 0 faults. Lib:
   `v13-park-alive-busy-flush/libhsa-runtime64.so.1.15.0.v13`
   (sha256 f5a934ff4a09dd982ac0aaf0bf96718b401798541c943b75d375fdaa4a5f87b8).
-  Binaries staged as `libhsa-runtime64.so.1.15.0.r16v13` in
-  gfx803:/data/rocr644-ring16/libs/.
 - v1/v2 and v5-v8 sources were incremental edits and were not individually
   preserved; their exact semantics are described in the table above and
-  reconstructible from v4/v13. Binaries for all are on the gfx803 box:
-  - `.ba` = stock baseline (94e627b5…)
-  - `.r16` = v2 length-bounded FIFO, no scratch bypass (9de93dd4…)
-  - `.r16v2` = v3 scratch fix, free-BO-immediately (pre-debug-strip)
-  - `.r16v3dbg` = v3 + FMM_DEBUG trace prints
-  - `.r16v4` = v4 hardened (c1ba87bf…)
-  - `.r16v5` = v5 BO-alive-until-flush (cfb37e79…)
-  - `.r16final` = v3/v4-lineage cleaned build (81c521cf…)
-  - v6/v7dbg/v7/v8/v9 binaries staged in gfx803:/tmp/libhsa-*.so
-  - `.r16v10`/`.r16v11` = dead-end probes (see table)
+  reconstructible from v4/v13.
 
-## Infra notes
+## Regenerating the shipped patch
 
-- Remote: `ssh gfx803` (192.168.1.214), container `ortrun`, harness bundle +
-  run scripts in `/data/rocr644-ring16/` (`run_harness.sh`,
-  `run_ort_faultprobe.sh`, `run_ort_serial.sh`).
-- Local quick-iteration build: `/tmp/opencode/Dockerfile.rocr644-ring16` →
-  `docker build --no-cache` (plain builds have served a STALE patch from
-  cache despite content change — always `--no-cache` or verify the lib hash).
+- Rebuild a runtime variant with `docker build --no-cache`, or verify the
+  built library's hash: plain builds have served a stale patch from cache
+  despite a content change.
 - `patches/rocr/va-reuse-defer.patch` is regenerated from v13. To
   change the mechanism, update the wip patch, rebuild + re-validate both
   gates through `tools/reduce-harness/`, then regenerate the

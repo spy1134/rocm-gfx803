@@ -2,8 +2,8 @@
 
 Read `README.md` first for the layout and the results, and `docs/STACK.md` for
 how the images are built and run. This file gives the process rules and the
-judgment calls. You cannot get either one
-from the code or from a patch header alone.
+judgment calls. You cannot get either one from the code or from a patch header
+alone.
 
 ## Scope
 
@@ -18,21 +18,17 @@ version goes on its own branch.
 
 ## Standing philosophy
 
-### Build locally. Never push.
+### Build locally. Push only on the user's word.
 
-All work in this repo builds locally. You build on the host or on the box at
-192.168.1.214. Do not trigger remote CI. Do not push. Do not commit. Do these
-only when the user asks for that one commit or push. Committing and pushing are
-the user's jobs. A remote workflow builds whatever the remote branch holds at
-that moment, so a push is a prerequisite for it anyway. The rule is
-shorter than that: do not. Build locally, test locally, and give the user the
-diff or the local build. Then they decide. This rule also covers
-`gh workflow run`. Starting a remote run without being asked is the same
-violation as a push.
+All work here builds and is tested on the local host and its gfx803 card. There
+is no CI and no remote build. Commit locally once a change is built and
+verified; push only when the user says so, each time. A push publishes the
+work, and the user decides when it is ready. Give the user the diff, the
+measurements and the local build, and let them decide.
 
-On the one commit the user does ask for, write it as a human alone wrote it.
-Never add a `Co-Authored-By: Claude ...` trailer or any other AI-attribution
-line, in this repo or any other.
+Write every commit as a human alone wrote it. Never add a
+`Co-Authored-By: Claude ...` trailer or any other AI-attribution line, in this
+repo or any other.
 
 ### Fix at the source. Do not use workarounds.
 
@@ -166,8 +162,9 @@ These steps worked many times in this repo's history.
    in favor of a layer above it, and the other way around, more than once.
 3. Compare against another architecture before you call a bug gfx803-specific.
    A failure that also happens on a newer arch (gfx900+ or gfx12x) with the same
-   source pin is an upstream bug, and it is not gfx803's to fix here. Report it
-   upstream. A failure only on gfx803 with identical source is a fair target for
+   source pin is an upstream bug, and it is not gfx803's to fix here. Draft the
+   upstream report for the user to file; do not file it yourself. A failure only
+   on gfx803 with identical source is a fair target for
    a local patch. Make this distinction before you write the patch, not after. A
    gfx803-only patch for a generic bug helps nobody else who hits the same code
    path, and that work is not this repo's job.
@@ -190,10 +187,12 @@ These steps worked many times in this repo's history.
   like, and the hardware measurements where they apply. If you cannot write a
   convincing WHY, your investigation is not finished.
 - Two apply styles exist on purpose. Use `git apply` for a tree that is a real
-  git repo, such as `rocm-systems`. Use `patch -p1` for a sparse checkout of a
-  monorepo subdirectory, because `git apply --check` there reports success and
-  changes nothing ("Skipped patch", exit 0) on this box's git version. Match the
-  style that the other patches in that directory already use.
+  git checkout (MIOpen, MIGraphX, ONNX Runtime, PyTorch, llama.cpp). Use
+  `patch -p1` for a source tarball or a sparse checkout of a monorepo
+  subdirectory (CLR, the standalone Tensile clone), because `git apply --check`
+  outside a git repository reports success and changes nothing ("Skipped
+  patch", exit 0). Match the style that the other patches in that directory
+  already use.
 - Every `.sh` driver makes sure that its own apply worked. It greps for a marker
   string, and it stops with `exit 1` when the marker is absent. Do not add a driver
   that trusts only the exit code of the patch tool.
@@ -212,9 +211,15 @@ another GPU will not do. If you do not have one, say so. Do not report a patch a
 the container, `rocminfo` must list the card as a `KERNEL_DISPATCH` agent before
 you trust anything else it reports.
 
+The card may also drive the host's display. A GPU fault or a test that fills
+VRAM can then freeze the desktop: cap the memory a test may use, stop at the
+first fault, and do not repeat a faulting test with the desktop up.
+
 Known traps when you add instrumentation on real hardware:
 
-- Device-side `printf` can hang the kernel instead of only slowing it down.
+- Device-side `printf` and `assert()` messages work only with the images'
+  patched `ockl.bc` (`patches/device-libs/`); with a stock device library the
+  kernel hangs in the hostcall instead.
 - Any extra device-side write for debugging changes timing, and it can hide the
   race you are looking for.
 - Always make sure that you run against the patched binary you think you are

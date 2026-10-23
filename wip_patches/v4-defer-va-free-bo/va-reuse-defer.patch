@@ -91,7 +91,7 @@ Two changes:
      option: with it on, the harness fails 10/52 even with the fmm defer
      active (3/3 runs).
 
-GATES (all run on the gfx803 box, ROCm 6.4.4, against this patched lib)
+GATES (all run on an RX 470, ROCm 6.4.4, against this patched lib)
 -----------------------------------------------------------------------
   * harness_exp, HAR_MODE=reuse, 52-shape sweep, 5 consecutive runs:
     0/52 failed every run, ~0.7s wall each (baseline stock: 6-10/52).

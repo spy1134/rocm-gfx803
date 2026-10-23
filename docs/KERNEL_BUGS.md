@@ -1082,13 +1082,10 @@ small-ring version.
 5. If a runtime fix is applied, ALSO pass real ORT `ReductionOpTest` -- the two
    gates are independent (standalone has passed while ORT failed before).
 
-### Experiment files (on the box)
-- `harness_exp.cpp` (env: `HAR_MODE=reuse|fresh|reuse-in|reuse-out|copyin|copyin-rec|ring`,
+### Experiment harness
+- `tools/reduce-harness/harness_exp.cpp` (env: `HAR_MODE=reuse|fresh|reuse-in|reuse-out|copyin|copyin-rec|ring`,
   `HAR_RING=N`, `HAR_LOGADDR=0|1`, `HAR_BENCH="m,n[,m,n]"`, `HAR_BENCH_REPS=N`,
-  `HAR_PRELOAD=1`) + `run_copyin.sh`, `run_bench.sh`, `/scratch/ckbuild*/`.
-- Local copies: `/tmp/opencode/harness_exp.cpp` and the padded-variant
-  experiment files (tmpfs -- may not persist across reboot; the important
-  knowledge is recorded here).
+  `HAR_PRELOAD=1`).
 
 ## FIXED (runtime): ROCR va-reuse-defer patch, both gates green
 
@@ -1140,7 +1137,7 @@ forever: 100% user-CPU after main() completes, stack = `hsa_shut_down ->
 ~GpuAgent -> hsakmt_fmm_release -> fmm_release_scratch`. First patch version
 shipped without the bypass and exhibited exactly that.
 
-### Gates (gfx803 box, ROCm 6.4.4, patched lib)
+### Gates (RX 470, ROCm 6.4.4, patched lib)
 - `harness_exp`, `HAR_MODE=reuse`, 52-shape sweep, 5 consecutive runs:
   **0/52 failed, ~0.7s wall each** (stock baseline: 6-10/52).
 - ORT `onnxruntime_test_all --gtest_filter=*ReductionOpTest*` (317 tests),
@@ -1153,12 +1150,8 @@ shipped without the bypass and exhibited exactly that.
   `HAR_MODE` etc.; builds like the committed harness:
   `hipcc -O2 harness_exp.cpp -o harness_exp -L<rocm>/lib -Wl,-rpath,<rocm>/lib`,
   run with `REDUCE_HSACO_DIR=/tools/reduce-harness/codeobj`).
-- gfx803 box (persistent ext4): `/data/rocr644-ring16/` -- harness binary +
-  source, `libs/` (libhsa variants: `.ba` baseline, `.r16final` shipped fix,
-  `.vanoreuse`/`.leak` rejected experiments, `.orig` stock), `run_harness.sh`
-  and `run_ort_reduce.sh` (exact invocations, incl. LD_PRELOAD sgemm shim,
-  HSA_OVERRIDE_GFX_VERSION=8.0.3). Working copy in the `ortrun` container at
-  `/scratch` (bind of `/data/claude-scratch`).
+- Runs need the SGEMM shim preloaded and `HSA_OVERRIDE_GFX_VERSION=8.0.3`,
+  as in the images.
 
 ### Debugging lessons (cost us hours; don't relearn)
 - **Check the soname file, not the versioned file.** libhsa loads via the
@@ -1205,8 +1198,6 @@ ReductionOpTest **10/10 runs: 315 OK / 0 FAILED / 0 GPU faults** (previously
 ~7.5% fault rate; 0/10 is consistent with fixed but not yet statistically
 conclusive -- rerun the soak after any further fmm change).
 
-Tooling for this: `run_ort_faultprobe.sh` on the gfx803 box
-(`/data/rocr644-ring16/`), counts per-run `Memory access fault` occurrences.
 The `deferred` flag this fix added carried forward into the
 later v13 mechanism (see the "FIXED (runtime)" section above) -- v13's
 park-alive approach eliminates the fault class further still, per
