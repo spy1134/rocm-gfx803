@@ -186,6 +186,7 @@ Open targets in recommended order, then the done ones.
 | SD-7 | Fused Winograd F(2x2, 3x3) | fp16 SD at most ~9 ms per step (2%); fp32 and training unmeasured | Open, low |
 | SD-1 | Winograd weight gradients | full fine-tuning and LoCon only | Open |
 | LLM-11 | Prompt attention at head sizes 96-256 | head size 128 on a gfx803 kernel (patch 130, Q in registers, 3.4-3.8 TFLOPS against 0.9-2.5): a 13,316-token prompt, Qwen2.5-Coder 7B 97.4 -> 65.8 s (attention 42.6 -> 10.7 s), Qwen3 8B 78.3 -> 74.6 s (21.1 -> 17.1 s). Head size 256, the full-attention layers of Qwen3.5/3.6 and Qwen3-Coder-Next (patch 131, Q split over 16 lanes, 16-key tiles): 1.5-2.1 -> 3.0-3.5 TFLOPS, 6-15x where the GQA ratio is 1 or odd; a 13,513-token prompt, Qwen3.5 9B 65.7 -> 62.5 s (attention 6.16 -> 3.57 s), Qwen3.6 35B-A3B through Ollama 29.8 -> 27.0 s | Open: the cost of split-K/V partial results |
+| PT-3 | Triton for gfx803: `torch.compile`, then vLLM | a capability rather than a speedup: `torch.compile` (inductor), Triton-based libraries (Unsloth, Liger, SageAttention, FlashAttention's AMD Triton backend) and vLLM need Triton, which the images do not build. Schaka/rocm-gfx803's ROCm 10 line has four hardware-verified Triton patches for a newer Triton; PyTorch 2.8 needs Triton 3.4, so three have to be ported and one is probably unneeded there. A plain Triton GEMM reached 0.59 TFLOPS there (the shim: 4-5), so tuning is most of the work | Open, not started |
 | LLM-3 | mmvq vs mmq for 9-16 tokens | speculative/parallel decoding | Open |
 | LLM-1b | SDWA dot product losses (2-token decode) | 1-11% on 2-token decode | Open, minor |
 | TRAIN-1 | fp16 LoRA training against fp32 | 2.87 -> 2.47 s/step, 5.8 -> 3.6 GB; without checkpointing 2.07 -> 1.73 s/step, 7.1 -> 4.9 GB | Done (fp16 is `gfx803-train`'s default) |
@@ -864,6 +865,74 @@ time.
   (8 heads at 1024 queries: 18.1 against 20.6 ms). Qwen3 8B and
   Qwen2.5-Coder 7B, with 32 and 28 query heads, give enough blocks that the
   rule does not split there.
+
+### PT-3: Triton for gfx803
+
+**Why.** The images run PyTorch in eager mode, which covers ComfyUI,
+sd-scripts, the training tools and Chatterbox. Triton is what generates
+`torch.compile`'s kernels (its default inductor backend), and several
+libraries are written in it: Unsloth and Liger Kernel (LLM fine-tuning),
+SageAttention and FlashAttention's AMD Triton backend, some GPTQ/AWQ kernels,
+and vLLM's ROCm attention and fused kernels. None of them run on these images.
+vLLM is the largest of these: serving many requests at once, which Ollama is
+not built for.
+
+**What exists.** Schaka/rocm-gfx803's ROCm 10 line built Triton for gfx803
+(`docker/triton.Dockerfile`, `scripts/build/triton.sh` and `patches/triton/` in
+that repository, and in this repository's history before the ROCm 10 line was
+removed), verified on an RX 470 and an RX 570:
+
+- `gfx803-isa-family`: Triton's AMD backend rejects an unknown ISA family and
+  defaults to 32-lane waves; the patch adds a GCN family for gfx8 with 64-lane
+  waves.
+- `gfx803-dpp-broadcast-warpreduce`: reductions take the DPP `row_bcast` path
+  instead of a `v_permlanex16` that only GFX10+ has.
+- `gfx803-vdot-gate`: an fp16 dot with fp32 accumulation must not lower to
+  `llvm.amdgcn.fdot2` on a target without `v_dot`, where LLVM aborts the
+  compile. The patch restores two `supportsVDot()` guards (in the FMA dot
+  lowering and in `isLegalFMAForm`) that a Triton refactor,
+  triton-lang/triton#10142, had dropped.
+- `fold-true-cmpi-while-nested-in-for-hang`: a `while` loop inside a one-trip
+  `for` loop had its exit test folded to a constant and hung the GPU.
+- The build recipe: Triton's own pinned LLVM (`cmake/llvm-info.json`, not
+  `llvm-build-info.json`) built from source with RTTI on, ABI-breaking checks
+  forced off and the NVPTX target included, which Triton's core library links
+  unconditionally.
+
+Those patches target the Triton commit PyTorch 2.14 pins. PyTorch 2.8 (this
+stack) pins Triton 3.4 (`0cace8d2336a9dc399effbb11522eea7f7b8c0b2`, from
+`.ci/docker/ci_commit_pins/triton.txt`), where the patched code lives in other
+files (`TritonAMDGPUToLLVM/TargetUtils.cpp` and `TargetInfo.cpp`, no
+`TargetFeatures`). Read at that commit:
+
+- There is no gfx8 family, and `TargetInfo::getWarpSize()` returns
+  `isCDNA() ? 64 : 32`, so gfx803 would get 32-lane waves: the family patch is
+  needed.
+- `AMDFMAVectorMultiplier::chooseIntrinsic` still asks `supportsVDot()`,
+  which is false for an unknown family: 3.4 predates the refactor the
+  vdot-gate patch undoes, so that patch is probably not needed there (to be
+  confirmed with `triton_dot_probe.py`, and against the `isLegalFMAForm` guard
+  in `AccelerateAMDMatmul.cpp`).
+- `FoldTrueCmpIOp` is present in `RangeAnalysis.cpp`; whether it has the same
+  fault is unknown until the patch's reproduction runs against it.
+
+**Plan.**
+1. Port the four patches to Triton 3.4 and build it with the recipe above, as
+   its own Dockerfile stage producing a wheel (LLVM from source is the long
+   part).
+2. On the card: Schaka's tests from the patch headers and
+   `tools/correctness-suite/triton_dot_probe.py` for fp16, bf16, fp32 and int8.
+3. `torch.compile` against the CPU: `tools/imgvalidate.sh` and
+   `torch_op_suite.py` run their triton and inductor arms once the image has
+   Triton.
+4. Kernel speed: tile sizes and wave64-aware configurations for gfx803, measured
+   against the shim on the same shapes.
+5. vLLM: a release that supports PyTorch 2.8, with the findings in Schaka's
+   `vllm/NOTES.md` applied where they still hold.
+
+**Verify.** Every Triton kernel and every inductor case against a float64 CPU
+reference, a soak with no GPU fault, and the existing regression set unchanged,
+since a Triton wheel must not change what eager mode computes.
 
 ### SD-7: fused Winograd F(2x2, 3x3)
 
