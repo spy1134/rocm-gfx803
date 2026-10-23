@@ -169,6 +169,9 @@ RUN CC=/opt/rocm/llvm/bin/clang CXX=/opt/rocm/llvm/bin/clang++ \
     && { grep -qF flash_attn_gcn4_prompt_qreg16 \
              build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/fattn-gcn4-prompt.cuh \
          || { echo "131-gfx803-fattn-prompt-d256.patch was not applied" >&2; exit 1; }; } \
+    && { grep -qF 'cc == GGML_CUDA_CC_GCN4 && !prefer_f32_output' \
+             build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/ggml-cuda.cu \
+         || { echo "132-gcn4-cublas-fp16-f32-compute.patch was not applied" >&2; exit 1; }; } \
     && { grep -q ggml_backend_sched_prefetch_split \
              build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-backend.cpp \
          || { echo "108-moe-expert-prefetch.patch was not applied" >&2; exit 1; }; } \

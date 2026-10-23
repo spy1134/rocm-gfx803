@@ -1,0 +1,78 @@
+llama.cpp (as fetched by Ollama v0.35.1, llama.cpp b11232, applied after
+131): on gfx803, matmuls with fp16 weights that go to cuBLAS (hipBLAS) ask
+for fp32 compute instead of fp16.
+gfx803-specific: engages only for cc == GGML_CUDA_CC_GCN4.
+
+WHY
+---
+ggml_cuda_mul_mat_cublas() runs a matmul with fp16 weights (the vision
+projector of an image model, any F16 GGUF) in fp16 compute on every AMD GPU
+except CDNA and RDNA4, because fast_fp16_hardware_available() is true for
+all of them. hipBLAS passes that to rocBLAS as gemm_ex with an fp16 compute
+type, which the base image's SGEMM shim does not take, and rocBLAS runs it
+on Tensile kernels that accumulate in fp16 (Cijk_Alik_Bljk_HB_*). Against the
+CPU backend these products carry a normalized squared error of 2-9e-5 (about
+1% RMS) at K = 1152-4304, the shapes of Qwen3.5's and Qwen3-VL's vision
+encoder, against 4e-8 for the same product accumulated in fp32 and stored as
+fp16. They also run at about 3.3 TFLOPS. gfx803 has no packed fp16 math, so
+fp16 accumulation buys it no speed: a 1080p image's 112 encoder projections
+took 2.0 s of Qwen3.5 9B's 16 s of GPU time on those kernels.
+
+WHAT
+----
+On GCN4 the call keeps fp16 operands and an fp16 product but asks for fp32
+compute, with fp32 alpha and beta. The base image's SGEMM shim takes
+all-fp16 gemm_ex and gemm_strided_batched_ex calls with fp32 compute and runs
+them on its fp16 tiles, which accumulate in fp32. Without the shim, rocBLAS
+computes the call with the same accuracy, but more slowly than either
+(3456 x 8160 x 1152: 24.7 ms, against 20.0 on the fp16-compute kernels and
+15.5 on the shim). The product is still stored as fp16 and widened to fp32
+afterwards, as before.
+
+Result on an RX 590, test-backend-ops (f16 weights, f32 activations):
+
+    MUL_MAT f16 cases (229)    NMSE against the CPU geometric mean 0.008x
+                               on the 114 that take this path, largest
+                               9.2e-5 -> 4.3e-8; all pass before and after
+
+    ms per call                       n = 512          n = 8160
+    3456 x 1152 (qkv)              1.49 -> 0.94     19.95 -> 15.51
+    1152 x 1152 (out)              0.55 -> 0.36      6.90 ->  5.34
+    4304 x 1152 (fc1)              1.93 -> 1.29     27.04 -> 19.38
+    1152 x 4304 (fc2)              1.95 -> 1.27     28.00 -> 19.17
+
+A 1080p image prompt (2,061 tokens) on Qwen3.5 9B with its vision
+projector, llama-server: 14.19 -> 13.61 s.
+
+Verified on an RX 590: test-backend-ops test -b ROCm0 -o MUL_MAT and
+-o MUL_MAT_ID pass, with the image's shim preloaded; only the fp16-weight
+cases change. To reproduce, build llama.cpp b11232 with GGML_HIP=ON and
+AMDGPU_TARGETS=gfx803, then with and without the patch:
+
+    test-backend-ops test -b ROCm0 -o MUL_MAT -p type_a=f16
+        (largest NMSE against the CPU per case)
+    llama-server -m <Qwen3.5 9B> --mmproj <its F16 projector> -c 16384
+        -ngl 99 -fa on
+        (send a 1080p image; the response's timings give the prompt time)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index b8be34b..b07d408 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1541,6 +1541,16 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+         prefer_f32_output = !GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_CDNA(cc);
+     }
+ 
++    // gfx803 has no packed fp16 math, so fp16 accumulation buys no speed, and rocBLAS's fp16-compute
++    // kernels (Tensile HB) lose precision over long sums and run at about 3.3 TFLOPS. With fp32
++    // compute the same fp16 GEMM runs on the gfx803 SGEMM that the image preloads, which accumulates
++    // in fp32. The product is still stored as fp16 and widened below.
++    if (compute_type == GGML_TYPE_F16 && cc == GGML_CUDA_CC_GCN4 && !prefer_f32_output) {
++        cu_compute_type = batched_mul_mat_traits<GGML_TYPE_F32>::compute_type;
++        alpha = batched_mul_mat_traits<GGML_TYPE_F32>::get_alpha();
++        beta  = batched_mul_mat_traits<GGML_TYPE_F32>::get_beta();
++    }
++
+     if (prefer_f32_output) {
+         dst_ptr = (char *) dst_ddf;
+         cu_compute_type = batched_mul_mat_traits<GGML_TYPE_F32>::compute_type;

@@ -1219,6 +1219,16 @@ bullets are the original findings (patches 100-105); the rest build on them.
   (3-4.5e-8 NMSE), the tile kernel's up to 4.8e-5. Checks against the CPU
   backend with f16 K and V measure distance to a reference that itself
   accumulates the output in fp16 and rounds Q to fp16.
+- **fp16-weight matmuls accumulated in fp16** (the vision encoder of an
+  image model, any F16 GGUF). llama.cpp runs a matmul with fp16 weights
+  through cuBLAS in fp16 compute on every AMD GPU but CDNA and RDNA4;
+  rocBLAS takes that on Tensile kernels that accumulate in fp16
+  (`Cijk_Alik_Bljk_HB`): 2-9e-5 NMSE against the CPU at K = 1152-4304 (about
+  1% RMS), against 4e-8 accumulated in fp32, at ~3.3 TFLOPS. gfx803 has no
+  packed fp16 math, so fp16 accumulation gains it nothing. Patch 132 asks for
+  fp32 compute on gfx803, which the base image's SGEMM shim runs on its fp16
+  tiles: Qwen3.5 9B's vision encoder projections 1.3-1.6x faster, a 1080p
+  image prompt 14.19 -> 13.61 s.
 - **Generation with an 8-bit KV cache slowed with context** (27.9 tok/s empty,
   20.9 at 8k). The vec kernel that generates with a quantized cache needs 229
   VGPRs on gfx803, so one wave runs per SIMD and its memory latency goes

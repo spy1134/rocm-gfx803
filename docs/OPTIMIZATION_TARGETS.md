@@ -182,7 +182,7 @@ Open targets in recommended order, then the done ones.
 | TRAIN-3 | Where a training step goes | unmeasured; fp16 NT GEMMs still run on the older tiles | Open, profile first |
 | BLAS-7 | Shim GEMM efficiency at SD 1.5 / SDXL shapes | fp16 dispatch fixes, fp16 widening, a one-wavefront tile for batched NN and a two-wavefront TN tile took the SD 1.5 step 415 -> 355 ms, SDXL 3.34 -> 2.84 s; the two-wavefront tile also takes fp32 TN (8-23% faster at llama.cpp's prompt shapes and SD's fp32 linears); its 64x64 form for TN calls with few tiles and a padded copy of operands whose rows camp on one DRAM channel took the SDXL step 2.77 -> 2.67 s, bit-identical; left: a faster main tile | Open, measured |
 | SD-9 | SDXL attention | P now moves between lanes inside the multiply-adds (DPP): SDXL step attention 0.50 -> 0.42 s (step 2.84 -> 2.75 s), SD 1.5 91 -> 79 ms (step 355 -> 342 ms); self-attention at ~4 TFLOPS against ~5.4 for its instruction mix | Open, measured |
-| LLM-10 | Image prompts | a 1080p image (2061 tokens) took 50.4 s against 8.8 s for 2028 text tokens (Qwen3.5 9B), 38.7 s of it the vision encoder's attention at 0.21 TFLOPS; patch 128 (narrower, non-spilling one-head-per-K/V tiles): 18.7 s; patch 129 (gfx803 attention kernel for head sizes 40-80, 3.5 TFLOPS): 14.2 s; Qwen3.6 35B-A3B through Ollama 51.7 -> 14.0 -> 9.6 s. What is left (9B, rocprof): the image tokens' own prefill (~6.6 s, the same rate as text), the encoder's projections on rocBLAS fp16 (~2.0 s at ~3.3 TFLOPS), its attention (~2.4 s) | Open: encoder projections on the shim; the rest is text-rate prefill |
+| LLM-10 | Image prompts | a 1080p image (2061 tokens) took 50.4 s against 8.8 s for 2028 text tokens (Qwen3.5 9B), 38.7 s of it the vision encoder's attention at 0.21 TFLOPS; patch 128 (narrower, non-spilling one-head-per-K/V tiles): 18.7 s; patch 129 (gfx803 attention kernel for head sizes 40-80, 3.5 TFLOPS): 14.2 s; Qwen3.6 35B-A3B through Ollama 51.7 -> 14.0 -> 9.6 s. patch 132 (the encoder's fp16 projections in fp32 compute, on the shim, which also removes their fp16-accumulation error of about 1% RMS): 13.6 s (13.4 s through Ollama). What is left (9B, rocprof): the image tokens' own prefill (~6.6 s, the same rate as text), the encoder's attention (~2.4 s) | Open: the rest is text-rate prefill (LLM-6) and the encoder's attention |
 | SD-7 | Fused Winograd F(2x2, 3x3) | fp16 SD at most ~9 ms per step (2%); fp32 and training unmeasured | Open, low |
 | SD-1 | Winograd weight gradients | full fine-tuning and LoCon only | Open |
 | LLM-11 | Prompt attention at head sizes 96-256 | head size 128 on a gfx803 kernel (patch 130, Q in registers, 3.4-3.8 TFLOPS against 0.9-2.5): a 13,316-token prompt, Qwen2.5-Coder 7B 97.4 -> 65.8 s (attention 42.6 -> 10.7 s), Qwen3 8B 78.3 -> 74.6 s (21.1 -> 17.1 s). Head size 256, the full-attention layers of Qwen3.5/3.6 and Qwen3-Coder-Next (patch 131, Q split over 16 lanes, 16-key tiles): 1.5-2.1 -> 3.0-3.5 TFLOPS, 6-15x where the GQA ratio is 1 or odd; a 13,513-token prompt, Qwen3.5 9B 65.7 -> 62.5 s (attention 6.16 -> 3.57 s), Qwen3.6 35B-A3B through Ollama 83.0 -> 80.3 s | Open: the cost of split-K/V partial results |
@@ -789,22 +789,26 @@ of the tile kernel at head size 72, one query head per K/V head, 8160 x 8160
 positions, 0.21 TFLOPS. Those tiles spilled hundreds of VGPRs at 64 columns
 (llama.cpp patch 128 and FINDINGS section 9).
 
-**Now.** 14.2 s with patches 128 and 129. Patch 129 runs the encoder's
+**Now.** 13.6 s with patches 128, 129 and 132. Patch 129 runs the encoder's
 attention on a gfx803 kernel with the layout of the SD attention kernel in
 `tools/` (128 query rows per block, a 4x4 block of scores per lane from
 registers, fp32): 3.5 TFLOPS, 88 ms per call, ~2.4 s per image. Under
 rocprof the rest is the image tokens' prefill in the language model (~6.6 s,
-the same rate as text, LLM-4 and LLM-6), the encoder's projections, which
-run as fp16 GEMMs on rocBLAS's Tensile kernels (`Cijk_Alik_Bljk_HB`, 112
-calls, ~2.0 s at ~3.3 TFLOPS), and small kernels. Through Ollama the image
-takes 50.7 -> 14.1 s with Qwen3.5 9B and 51.7 -> 9.6 s with Qwen3.6
-35B-A3B (experts in system RAM).
+the same rate as text, LLM-4 and LLM-6), the encoder's 112 projections
+(fp16 weights, 1152 and 4304 wide, over 8160 patches) and small kernels.
+llama.cpp ran the projections in fp16 compute, which on rocBLAS's Tensile
+kernels (`Cijk_Alik_Bljk_HB`) accumulates in fp16: ~2.0 s at ~3.3 TFLOPS,
+and an error of 2-9e-5 NMSE against the CPU (about 1% RMS). Patch 132 asks
+for fp32 compute on gfx803, which the shim's fp16 tiles take: 4.2 TFLOPS,
+error 4e-8 (the fp16 rounding of the product), the image 14.19 -> 13.61 s.
+Through Ollama the image takes 50.7 -> 13.4 s with Qwen3.5 9B and 51.7 ->
+9.4 s with Qwen3.6 35B-A3B (experts in system RAM), whose projector is BF16:
+llama.cpp already runs BF16 weights in fp32 compute here, so patch 132 leaves
+it unchanged.
 
-**Next.** The projections are TN fp16 GEMMs that the shim's two-wavefront
-tile runs at 4.2-5 TFLOPS: routing them there would save ~0.5 s per image.
-Encoders with head size 96 or 128 (InternViT-6B's, for one) run on patch
-130's kernel (LLM-11). Measure: rocprof on the image prompt
-(`Cijk_Alik_Bljk_HB` against the shim's kernels).
+**Next.** The image tokens' prefill runs at the text rate (LLM-6). Encoders
+with head size 96 or 128 (InternViT-6B's, for one) run on patch 130's
+kernel, 256 on patch 131's (LLM-11).
 
 ### LLM-11: prompt attention at head sizes 96-256
 

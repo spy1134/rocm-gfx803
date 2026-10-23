@@ -611,6 +611,13 @@ measurements and a reproduction. In short:
   Ollama 83.0 -> 80.3 s. Error against an fp32 reference the fp16 rounding
   of K and V (the tile kernel's up to 1000x higher); FLASH_ATTN_EXT tests
   pass (3982/3982, plus 513 added head-256 cases).
+- **132-gcn4-cublas-fp16-f32-compute.patch**: matmuls with fp16 weights (a
+  vision encoder, an F16 GGUF) ran in fp16 compute on rocBLAS kernels that
+  accumulate in fp16, with an error of about 1% RMS at the vision encoder's
+  shapes and at ~3.3 TFLOPS. On gfx803 they now ask for fp32 compute, which
+  the base image's SGEMM shim runs on its fp16 tiles: error down to the fp16
+  rounding of the product, the encoder's projections 1.3-1.6x faster, a
+  1080p image prompt on Qwen3.5 9B 14.19 -> 13.61 s.
 - **113-116: fewer dispatches per generated token.** On gfx803 every GPU
   dispatch costs about 4.3 us of command-processor time however small the
   kernel, and a Qwen3.6 35B-A3B token issues about 1,425 of them. Four
@@ -737,7 +744,7 @@ GPU:
   now twice the first discovery's duration, between 3 and 30 s; GPUs that start
   quickly keep 3 s.
 
-The llama.cpp kernel patches 100-104, 106, 118 and 127-131 are gfx803-only by
+The llama.cpp kernel patches 100-104, 106, 118 and 127-132 are gfx803-only by
 construction: each takes effect only for `GGML_CUDA_CC_GCN4` or `__gfx803__` and
 is sized from gfx803 register and bandwidth measurements. 105 changes q5_K's dot
 product for every GPU, with the same arithmetic. 107, 108, 111-117, 119-126, 090
