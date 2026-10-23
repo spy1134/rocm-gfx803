@@ -46,6 +46,7 @@ arm() { # name, seconds, script, extra env...
 
 echo "=== image: $IMG"
 docker rm -f "$NAME" >/dev/null 2>&1
+trap 'docker rm -f "$NAME" >/dev/null 2>&1' EXIT
 # label=disable: on an SELinux-enforcing host the probe folder carries no
 # container label, and the container would get "Permission denied" on every
 # probe; relabeling with :z would rewrite the host's own labels.
