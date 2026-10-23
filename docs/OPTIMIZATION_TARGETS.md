@@ -185,7 +185,7 @@ Open targets in recommended order, then the done ones.
 | LLM-10 | Image prompts | a 1080p image (2061 tokens) took 50.4 s against 8.8 s for 2028 text tokens (Qwen3.5 9B), 38.7 s of it the vision encoder's attention at 0.21 TFLOPS; patch 128 (narrower, non-spilling one-head-per-K/V tiles): 18.7 s; patch 129 (gfx803 attention kernel for head sizes 40-80, 3.5 TFLOPS): 14.2 s; Qwen3.6 35B-A3B through Ollama 51.7 -> 14.0 -> 9.6 s. What is left (9B, rocprof): the image tokens' own prefill (~6.6 s, the same rate as text), the encoder's projections on rocBLAS fp16 (~2.0 s at ~3.3 TFLOPS), its attention (~2.4 s) | Open: encoder projections on the shim; the rest is text-rate prefill |
 | SD-7 | Fused Winograd F(2x2, 3x3) | fp16 SD at most ~9 ms per step (2%); fp32 and training unmeasured | Open, low |
 | SD-1 | Winograd weight gradients | full fine-tuning and LoCon only | Open |
-| LLM-11 | Prompt attention at head sizes 96-256 | head size 128 on a gfx803 kernel (patch 130, Q in registers, 3.4-3.8 TFLOPS against 0.9-2.5): a 13,316-token prompt, Qwen2.5-Coder 7B 97.4 -> 65.8 s (attention 42.6 -> 10.7 s), Qwen3 8B 78.3 -> 74.6 s (21.1 -> 17.1 s). Head size 256, the full-attention layers of Qwen3.5/3.6 and Qwen3-Coder-Next, still runs the tile kernel at 1.5-2.1 TFLOPS: an estimated 6 s of a 12k-token prompt on Qwen3.6 35B-A3B | Open: head size 256; the cost of split-K/V partial results |
+| LLM-11 | Prompt attention at head sizes 96-256 | head size 128 on a gfx803 kernel (patch 130, Q in registers, 3.4-3.8 TFLOPS against 0.9-2.5): a 13,316-token prompt, Qwen2.5-Coder 7B 97.4 -> 65.8 s (attention 42.6 -> 10.7 s), Qwen3 8B 78.3 -> 74.6 s (21.1 -> 17.1 s). Head size 256, the full-attention layers of Qwen3.5/3.6 and Qwen3-Coder-Next (patch 131, Q split over 16 lanes, 16-key tiles): 1.5-2.1 -> 3.0-3.5 TFLOPS, 6-15x where the GQA ratio is 1 or odd; a 13,513-token prompt, Qwen3.5 9B 65.7 -> 62.5 s (attention 6.16 -> 3.57 s), Qwen3.6 35B-A3B through Ollama 83.0 -> 80.3 s | Open: the cost of split-K/V partial results |
 | LLM-3 | mmvq vs mmq for 9-16 tokens | speculative/parallel decoding | Open |
 | LLM-1b | SDWA dot product losses (2-token decode) | 1-11% on 2-token decode | Open, minor |
 | TRAIN-1 | fp16 LoRA training against fp32 | 2.87 -> 2.47 s/step, 5.8 -> 3.6 GB; without checkpointing 2.07 -> 1.73 s/step, 7.1 -> 4.9 GB | Done (fp16 is `gfx803-train`'s default) |
@@ -811,7 +811,10 @@ Encoders with head size 96 or 128 (InternViT-6B's, for one) run on patch
 **Why.** Prompt attention grows with the square of the prompt, and at head
 size 128 the tile kernel ran it at 2.0-2.5 TFLOPS, or 0.9 where the GQA ratio
 is odd (Qwen2.5-Coder 7B's 7) and it cannot serve query heads together: 42.6
-of 97.3 s of GPU time for Coder 7B's 13,316-token prompt.
+of 97.3 s of GPU time for Coder 7B's 13,316-token prompt. At head size 256
+(the full-attention layers of Qwen3.5, Qwen3.6 and Qwen3-Coder-Next, one
+layer in four) it ran at 1.5-2.1 TFLOPS, and at 0.1-0.3 with one query head
+per tile: 6.2 of 66.8 s for Qwen3.5 9B's 13,513-token prompt.
 
 **Now.** Patch 130 runs head sizes 96 and 128 on a gfx803 kernel that keeps
 Q in registers and reaches it through DPP inside the multiply-adds, with 64-
@@ -820,14 +823,21 @@ about 3.0 in Qwen3 8B's prompt, where 512-token batches over 32 heads leave
 part of the last wave of blocks idle. Coder 7B 97.4 -> 65.8 s, Qwen3 8B
 78.3 -> 74.6 s (llama-server, 16k context, q8_0 KV cache).
 
+Patch 131 runs head size 256. Patch 130's layout needs 64 VGPRs for Q and
+64 for the output accumulators per lane there, and a 32-key K/V tile pair
+takes 66.5 KB of LDS. Its kernel gives each set of query rows a whole 16-lane
+row instead of eight lanes, so a lane holds 16 floats of Q and of output per
+row, and uses 16-key tiles (33 KB for K and V); Q*K^T and P*V run in 16 DPP
+steps. Blocks of 32 or 48 query rows (195 and 233 VGPRs): 3.0-3.5 TFLOPS at
+model shapes, 1.7-1.8x the tile kernel per call and 6-15x where it served
+one head per tile; against an fp32 reference its error is the fp16 rounding
+of K and V (3-4.5e-8 NMSE, the tile kernel up to 4.8e-5). Qwen3.5 9B's
+13,513-token prompt 65.7 -> 62.5 s (attention 6.16 -> 3.57 s), through
+Ollama 65.2 -> 63.2 s; Qwen3.6 35B-A3B through Ollama 83.0 -> 80.3 s. Four
+rows per lane spill, or run 3.5% slower with K and V read one float4 at a
+time.
+
 **Next.**
-- Head size 256 (Qwen3.5 9B, Qwen3.6 35B-A3B and Qwen3-Coder-Next run it in
-  their full-attention layers) at 1.5-2.1 TFLOPS: an estimated 6 s of a 12k-token
-  prompt on the 35B, more as contexts grow. Patch 130's layout needs 64 VGPRs
-  for Q and 64 for the output accumulators per lane there, and the K and V
-  tiles together pass 64 KiB of LDS, so it needs a different split: K and V
-  in one LDS buffer one after the other, or the d-range of P*V split across
-  two passes.
 - Split-K/V partial results: written by patch 130's kernel they cost far more
   than their size suggests (a 2048-query batch over 512 keys, 4 K/V heads at
   GQA 4: 2.8 ms with one block per output tile, 9.4 ms with two, 2.4 ms with

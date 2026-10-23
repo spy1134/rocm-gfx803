@@ -601,6 +601,16 @@ measurements and a reproduction. In short:
   prompt with llama-server: Qwen2.5-Coder 7B 97.4 -> 65.8 s, Qwen3 8B 78.3 ->
   74.6 s. Error against the CPU at parity; FLASH_ATTN_EXT tests pass
   (3982/3982, plus 938 added head-96/128 cases).
+- **131-gfx803-fattn-prompt-d256.patch**: the same for head size 256, the
+  full-attention layers of Qwen3.5, Qwen3.6 and Qwen3-Coder-Next, where the
+  tile kernel ran at 1.5-2.1 TFLOPS (0.1-0.3 with one query head per tile).
+  Patch 130's layout would need 128 VGPRs of Q and output per lane and 66.5
+  KB of shared memory there; each set of query rows gets a whole 16-lane row
+  instead, with 16-key tiles. 3.0-3.5 TFLOPS. A 13,513-token prompt:
+  Qwen3.5 9B 65.7 -> 62.5 s with llama-server, Qwen3.6 35B-A3B through
+  Ollama 83.0 -> 80.3 s. Error against an fp32 reference the fp16 rounding
+  of K and V (the tile kernel's up to 1000x higher); FLASH_ATTN_EXT tests
+  pass (3982/3982, plus 513 added head-256 cases).
 - **113-116: fewer dispatches per generated token.** On gfx803 every GPU
   dispatch costs about 4.3 us of command-processor time however small the
   kernel, and a Qwen3.6 35B-A3B token issues about 1,425 of them. Four
@@ -727,7 +737,7 @@ GPU:
   now twice the first discovery's duration, between 3 and 30 s; GPUs that start
   quickly keep 3 s.
 
-The llama.cpp kernel patches 100-104, 106, 118 and 127-130 are gfx803-only by
+The llama.cpp kernel patches 100-104, 106, 118 and 127-131 are gfx803-only by
 construction: each takes effect only for `GGML_CUDA_CC_GCN4` or `__gfx803__` and
 is sized from gfx803 register and bandwidth measurements. 105 changes q5_K's dot
 product for every GPU, with the same arithmetic. 107, 108, 111-117, 119-126, 090

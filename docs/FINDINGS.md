@@ -1206,6 +1206,19 @@ bullets are the original findings (patches 100-105); the rest build on them.
   a quarter of the GPU idle. Why the partial-result stores are that slow is
   not understood: wider stores, another layout and half the writers changed
   nothing.
+- **Prompt attention at head size 256** (the full-attention layers of
+  Qwen3.5, Qwen3.6 and Qwen3-Coder-Next) ran on the tile kernel at 1.5-2.1
+  TFLOPS, and at 0.1-0.3 where it serves one query head per tile. Patch
+  130's kernel does not fit there: split over eight lanes, two query rows
+  hold 64 floats of Q and 64 of output per lane, and a 32-key K/V tile pair
+  takes 66.5 KB of shared memory. Patch 131 splits each set of query rows
+  over a whole 16-lane row (16 floats of Q and of output per row and lane,
+  DPP rotation over 16 lanes) with 16-key tiles (33 KB): 3.0-3.5 TFLOPS,
+  Qwen3.5 9B's 13,513-token prompt 65.7 -> 62.5 s (attention 6.16 -> 3.57
+  s). Against an fp32 reference its error is the fp16 rounding of K and V
+  (3-4.5e-8 NMSE), the tile kernel's up to 4.8e-5. Checks against the CPU
+  backend with f16 K and V measure distance to a reference that itself
+  accumulates the output in fp16 and rounds Q to fp16.
 - **Generation with an 8-bit KV cache slowed with context** (27.9 tok/s empty,
   20.9 at 8k). The vec kernel that generates with a quantized cache needs 229
   VGPRs on gfx803, so one wave runs per SIMD and its memory latency goes
