@@ -1,24 +1,20 @@
 # Agent instructions for rocm-gfx803
 
-Read `README.md` first. It gives the layout and the status of each line. This
-file gives the process rules and the judgment calls. You cannot get either one
+Read `README.md` first for the layout and the results, and `docs/STACK.md` for
+how the images are built and run. This file gives the process rules and the
+judgment calls. You cannot get either one
 from the code or from a patch header alone.
 
-## Scope of this fork
+## Scope
 
-This repository is a fork of Schaka/rocm-gfx803 that maintains only the
-`rocm6.4.4/` line and the host tools in `tools/`. Work there. The ROCm 10 line
-at the root (`docker/`, `docker-bake.hcl`, `scripts/`, `patches/`, `vllm/`, the
-CI workflows) and the archived `rocm7.14/` are inherited and unmaintained here:
-do not build, change or "fix" them unless asked, and do not apply their rules
-to `rocm6.4.4/`. The rules that only concern the ROCm 10 line (the
-TENSOR_TOPK_OPT_LEVEL build level, the hosted-runner disk budget, branch pins,
-the vLLM fork) are in `AGENTS-rocm10.md`; read it only when asked to work on
-that line. The standing philosophy, the investigation workflow and the patch
-conventions below apply to `rocm6.4.4/` as written. `rocm6.4.4/` builds with
-plain `docker build`, has no CI, and is validated on a local card.
-`docs/FINDINGS.md` holds this fork's findings; `README-rocm10.md` is the
-inherited ROCm 10 README.
+This repository maintains one stack: ROCm 6.4.4 for gfx803, with its images
+(`Dockerfile`, `Dockerfile-ComfyUI`, `Dockerfile-Ollama`), its patches
+(`patches/`), and the host tools in `tools/`. It builds with plain
+`docker build` from the repository root, has no CI, and is validated on a
+local card. `docs/FINDINGS.md` holds the findings, `docs/OPTIMIZATION_TARGETS.md`
+the performance work, and `docs/KERNEL_BUGS.md` the earlier investigations from
+Schaka/rocm-gfx803, which this project started from. Work on another ROCm
+version goes on its own branch.
 
 ## Standing philosophy
 
@@ -89,8 +85,8 @@ a comment only to justify something that is present.
 
 Some comments need to explain how one file relates to three others, why a
 Dockerfile stage exists in the larger pipeline, or how a patch fits the
-gfx803-versus-mainline story. That text belongs in `README.md` or in a patch
-header. It does not belong in an inline code comment. A code comment explains
+gfx803-versus-mainline story. That text belongs in `docs/STACK.md`, `README.md`
+or a patch header. It does not belong in an inline code comment. A code comment explains
 the code next to it. If you want to write three paragraphs above a function
 about how the pipeline works, that is a docs change, not a comment.
 
@@ -180,13 +176,13 @@ These steps worked many times in this repo's history.
    everything else the same. History: two rocBLAS patches were each *partly*
    responsible. Removing them made the symptom much worse, which is a different
    and more useful result than "no difference" or "yes".
-5. When one line works and the other does not, first ask whether the two are
+5. When one version works and another does not, first ask whether the two are
    comparable. Newer ORT, ROCm, and MIGraphX add real new features (new ONNX
-   opsets, new parser paths) that the older line cannot run at all. A test
-   that fails on the new line and does not even load on the old one is not a
+   opsets, new parser paths) that the older version cannot run at all. A test
+   that fails on the new version and does not even load on the old one is not a
    regression. It is new and still broken. Count something as "worked there,
-   broken here" only after you make sure that the older line ran the same code
-   path and got it right.
+   broken here" only after you make sure that the older version ran the same
+   code path and got it right.
 
 ## Patch conventions
 
@@ -201,14 +197,11 @@ These steps worked many times in this repo's history.
 - Every `.sh` driver makes sure that its own apply worked. It greps for a marker
   string, and it stops with `exit 1` when the marker is absent. Do not add a driver
   that trusts only the exit code of the patch tool.
-- The three lines (ROCm 10.x at the root, `rocm7.14/`, and `rocm6.4.4/`) are
-  separate copies by design. Do not make one line point at another line's
-  `patches/`. Each one carries its own patch set, and a shared file risks a
-  half-fixed bug on one line reaching the hardware-tested state of another.
-  Copy, do not link, until the planned merge in README's "Convergence" section
-  actually happens. `tools/` is the one exception. It holds hardware and arch
-  level tooling (host-setup, correctness-suite) rather than version-specific
-  code, so it lives once at the root and every line uses it from there.
+- Each ROCm version lives on its own branch with its own patch set. Port a fix
+  to another branch by copying the patch and re-verifying it on the card there;
+  a patch that applies on both is not proof that it fixes both, and a shared
+  file risks a half-fixed bug on one branch reaching the hardware-tested state
+  of another.
 
 ## Hardware access
 

@@ -1,11 +1,13 @@
 # rocm-gfx803: ROCm 6.4.4 for AMD Polaris (gfx803)
 
-AMD removed gfx803 GPUs (Radeon RX 470, 480, 570, 580 and 590) from ROCm after
-version 6.0. The software still builds for them, but much of the stack either
-returns wrong results or runs far below what the hardware can do. This project
-maintains a ROCm 6.4.4 stack for these cards, rebuilt from source with the
-fixes below, and packages ComfyUI (Stable Diffusion 1.5 and SDXL), LoRA
-training with sd-scripts, and Ollama on top of it.
+Stable Diffusion, LoRA training and local LLMs on Radeon RX 470, 480, 570, 580
+and 590 cards, with results checked against a CPU reference.
+
+AMD removed gfx803 GPUs from ROCm after version 6.0. The software still builds
+for them, but much of the stack either returns wrong results or runs far below
+what the hardware can do. This project maintains a ROCm 6.4.4 stack for these
+cards, rebuilt from source with the fixes below, and packages ComfyUI (Stable
+Diffusion 1.5 and SDXL), LoRA training with sd-scripts, and Ollama on top of it.
 
 Every fix is checked against a CPU reference, because the usual failure on this
 hardware is a program that completes and returns wrong numbers.
@@ -14,30 +16,39 @@ hardware is a program that completes and returns wrong numbers.
 
 Measured on an RX 590 8 GB. For images and training, "before" is an early setup
 that already computed correct results (the original stack was faster in places,
-but its results were wrong). For Ollama, it is the same llama.cpp version
-without this project's patches.
+but its results were wrong). For language models, "before" is the same
+llama.cpp version without this project's patches, or, where a row names a
+change, the stack just before it.
+
+**Images and training**
 
 | Workload | Before | Now | Speedup |
 | --- | --- | --- | --- |
 | SD 1.5 image, 20 steps at 512 px (ComfyUI, fp32) | 35 s | 10.5 s | 3.3x |
 | SD 1.5 LoRA training step (4 images, 512 px; fp16 mixed precision now, fp32 before) | 12.1 s | 2.5 s | 4.8x |
 | SD 1.5 UNet step in fp16 (ComfyUI default, 512 px, batch of 2, with the node), before the fp16 GEMM tiles and now | 602 ms | 342 ms | 1.76x |
-| Prompt processing, 512 tokens (Qwen3 8B, Q4_K_M, llama-bench on Ollama's llama.cpp) | 14 tokens/s | 223 tokens/s | 16x |
+
+**Language models** (Ollama and its llama.cpp)
+
+| Workload | Before | Now | Speedup |
+| --- | --- | --- | --- |
+| Prompt processing, 512 tokens (Qwen3 8B, Q4_K_M, llama-bench) | 14 tokens/s | 223 tokens/s | 16x |
 | A coding agent's first request (12,000-token prompt) | 18 min | 71 s | 15x |
-| Prompt processing, MoE model with experts in system RAM, without and with expert prefetch (Qwen3.6 35B-A3B through Ollama, 3,100-token prompt) | 165 tokens/s | 196 tokens/s | 1.2x |
-| Text generation, MoE model with experts in system RAM, without and with the dispatch fusions (Qwen3.6 35B-A3B through Ollama) | 22.7 tokens/s | 24.2 tokens/s | 1.07x |
-| Prompt processing, MoE model with experts in system RAM, without and with the fp32 expert GEMM (Qwen3.6 35B-A3B through Ollama, 2,800-token prompt, mean of two rounds) | 395 tokens/s | 483 tokens/s | 1.22x |
-| Text generation (Qwen3 8B, short context, llama-bench on Ollama's llama.cpp) | 27 tokens/s | 30.5 tokens/s | 1.1x |
-| A 1080p image prompt, without and with the vision-encoder attention fixes (Qwen3.6 35B-A3B with experts in system RAM, through Ollama) | 51.7 s | 9.6 s | 5.4x |
-| A 13,000-token prompt, without and with the attention kernel for head size 128 (Qwen2.5-Coder 7B, llama-server on Ollama's llama.cpp) | 97.4 s | 65.8 s | 1.5x |
+| Text generation (Qwen3 8B, short context, llama-bench) | 27 tokens/s | 30.5 tokens/s | 1.1x |
+| A 13,500-token prompt, before and after the head-size 256 attention kernel and the GEMM tile fix (Qwen3.5 9B) | 65.2 s | 54.6 s | 1.19x |
+| A 13,000-token prompt, before and after the head-size 128 attention kernel (Qwen2.5-Coder 7B, llama-server) | 97.4 s | 65.8 s | 1.5x |
+| MoE prompt with experts in system RAM, before and after the fp32 expert GEMM (Qwen3.6 35B-A3B, 2,800 tokens) | 395 tokens/s | 483 tokens/s | 1.22x |
+| MoE text generation with experts in system RAM, before and after the dispatch fusions (Qwen3.6 35B-A3B) | 22.7 tokens/s | 24.2 tokens/s | 1.07x |
+| A 1080p image prompt, before and after the vision-encoder attention fixes (Qwen3.6 35B-A3B) | 51.7 s | 9.4 s | 5.5x |
 
 The largest gains come from replacing the code paths that were slowest on this
 architecture:
 
 - **GEMM.** A correct replacement for rocBLAS's fp32 matrix multiply, with
-  register-tiled and pipelined kernels, reaches 3.9-4.8 TFLOPS on large
+  register-tiled and pipelined kernels, reaches 3.9-5 TFLOPS on large
   matrices, up from 2.8-3.3. fp16 matrix multiplies in the layouts where rocBLAS
-  is 15-25x slower now run on the shim's kernels.
+  is 15-25x slower, and fp16-weight matmuls that rocBLAS would accumulate in
+  fp16, run on the same kernels with fp32 sums.
 - **Convolution.** A new Winograd F(2x2, 3x3) kernel replaces MIOpen's binary
   Winograd kernels, which corrupt memory on gfx803. It runs about 2x faster than
   the GEMM path for most SD 1.5 convolutions, in fp32 and fp16.
@@ -51,11 +62,9 @@ architecture:
   while the GPU computes, and MoE generation with the experts in system RAM
   runs the shared expert on the GPU while the CPU computes the routed ones.
   Qwen3.5/3.6 prompts run the DeltaNet recurrence on a kernel that keeps its
-  state in registers (Qwen3.6 35B-A3B prompts 26% faster in 2048-token
-  batches), and MoE prompts run the expert matmuls as grouped fp32 GEMMs
-  instead of emulated int8 dot products (another 21%, and closer
-  to CPU results). Prompt attention at head sizes 40-80, 96 and 128 runs
-  on gfx803 kernels that compute from registers in fp32, at up to 3.8 TFLOPS.
+  state in registers, and MoE prompts run the expert matmuls as grouped fp32
+  GEMMs. Prompt attention at head sizes 40-256 runs on gfx803 kernels that
+  compute from registers in fp32, at up to 3.8 TFLOPS.
 
 Text generation is limited mainly by memory bandwidth, so it had the least room
 to improve. Its gain grows with context length (20.9 to 26.5 tokens/s at 8,000
@@ -71,7 +80,7 @@ could still get faster.
 
 ```
 git clone https://github.com/spy1134/rocm-gfx803.git
-cd rocm-gfx803/rocm6.4.4
+cd rocm-gfx803
 ./setup.sh                        # check the system and build the images
 ./start-comfyui.sh                # ComfyUI at http://localhost:8188
 ./start-ollama.sh run qwen3:8b    # chat with a local language model
@@ -79,7 +88,7 @@ cd rocm-gfx803/rocm6.4.4
 
 `setup.sh` reports anything that is missing, asks which components to build,
 and can be interrupted and resumed. The first run takes several hours because
-the main libraries are compiled for gfx803. [`rocm6.4.4/README.md`](rocm6.4.4/README.md)
+the main libraries are compiled for gfx803. [`docs/STACK.md`](docs/STACK.md)
 documents each component: the images, LoRA training, ComfyUI and Ollama.
 
 ## Requirements
@@ -114,7 +123,8 @@ Without this project's changes, on these cards:
   AMD's compiler reads some of a function's implicit arguments from address 0
   on gfx8 when the function is not inlined.
 - Ollama read prompts about ten times slower than the card allows, generated
-  text below its memory bandwidth, and could fill VRAM until the desktop stalled.
+  text below its memory bandwidth, could fill VRAM until the desktop stalled,
+  and ran fp16-weight matmuls (vision encoders) with about 1% error.
 
 All of these are fixed or mitigated. [`docs/FINDINGS.md`](docs/FINDINGS.md)
 gives each problem's symptom, cause, fix and how to reproduce the check.
@@ -139,28 +149,56 @@ gives each problem's symptom, cause, fix and how to reproduce the check.
   [`docs/FINDINGS.md`](docs/FINDINGS.md)).
 - An atomic on fine-grained host memory (a plain `hipHostMalloc`, or
   `hipHostMallocCoherent`) whose result a kernel does not use stores its
-  operand instead of updating the value: `atomicAdd()` of 5 to 1 leaves 5. Use the returned value or keep such counters in
-  device memory. The image's patched `ockl.bc` does this for HSA signals, which
-  is what makes device `printf` and `assert()` messages work.
+  operand instead of updating the value: `atomicAdd()` of 5 to 1 leaves 5. Use
+  the returned value or keep such counters in device memory. The image's
+  patched `ockl.bc` does this for HSA signals, which is what makes device
+  `printf` and `assert()` messages work.
 - Mining-edition cards often ship with memory clocked above its rating, which
   causes random faults and freezes. Check the memory clock first (see
-  "Mining-tuned VRAM clocks" in [`rocm6.4.4/README.md`](rocm6.4.4/README.md)).
+  "Mining-tuned VRAM clocks" in [`docs/STACK.md`](docs/STACK.md)).
 - Linux kernels 6.12 and 6.13 have been reported to crash with these cards.
 
-## Scope and origin
+## Repository layout
 
-This is a fork of [Schaka/rocm-gfx803](https://github.com/Schaka/rocm-gfx803),
-which built the original ROCm 6.4.4 setup and its first fixes. Upstream has
-moved on to ROCm 10 and no longer maintains this version; this fork does. Only
-`rocm6.4.4/` and `tools/` are maintained here. The rest of the repository (the
-ROCm 10 build at the root and the archived `rocm7.14/`) is inherited from
-upstream and left as it was; its documentation is
-[`README-rocm10.md`](README-rocm10.md).
+| Path | What it holds |
+| --- | --- |
+| `Dockerfile`, `Dockerfile-ComfyUI`, `Dockerfile-Ollama` | the base image (ROCm 6.4.4 with the gfx803 libraries, PyTorch and the SGEMM shim), ComfyUI with training, and Ollama |
+| `setup.sh`, `start-*.sh`, `container-args.sh` | the host-side setup check and launchers |
+| `patches/` | every source patch the images apply, each with a header that says why |
+| `runtime/`, `training/` | Python workarounds installed into the base image; the training tools in the ComfyUI image |
+| `tools/` | correctness suite, the ComfyUI attention node, host setup, hang capture and repro tools |
+| `docs/` | [`STACK.md`](docs/STACK.md) (building and using the images), [`FINDINGS.md`](docs/FINDINGS.md), [`OPTIMIZATION_TARGETS.md`](docs/OPTIMIZATION_TARGETS.md), [`KERNEL_BUGS.md`](docs/KERNEL_BUGS.md) |
+| `wip_patches/` | runtime patches that were investigated and not shipped, kept for their history |
+
+## Origin
+
+This project started as a fork of
+[Schaka/rocm-gfx803](https://github.com/Schaka/rocm-gfx803), which built the
+original ROCm 6.4.4 setup and its first fixes and has since moved on to ROCm 10.
+It is now a standalone repository that maintains the ROCm 6.4.4 stack only; the
+git history keeps all of the original commits. Work on another ROCm version
+would go on its own branch.
 
 ## Credit
 
-The original 6.4.4 setup and its first fixes are [Schaka](https://github.com/Schaka)'s
-(see [`rocm6.4.4/KERNEL_BUGS.md`](rocm6.4.4/KERNEL_BUGS.md)). Using ROCm 6.x with
-libraries rebuilt for gfx803 comes from the community projects
-[robertrosenbusch/gfx803_rocm](https://github.com/robertrosenbusch/gfx803_rocm) and
-[woodrex83/ROCm-For-RX580](https://github.com/woodrex83/ROCm-For-RX580).
+- [Schaka](https://github.com/Schaka) built the original ROCm 6.4.4 setup this
+  project grew from: the base image with MIGraphX and ONNX Runtime for gfx803,
+  the first rocBLAS and MIOpen fixes and the first SGEMM shim, the correctness
+  suite, the vector-L1 staleness probes, the host setup notes and the
+  investigations in [`docs/KERNEL_BUGS.md`](docs/KERNEL_BUGS.md).
+- [robertrosenbusch/gfx803_rocm](https://github.com/robertrosenbusch/gfx803_rocm)
+  and [woodrex83/ROCm-For-RX580](https://github.com/woodrex83/ROCm-For-RX580)
+  showed that ROCm 6.x with libraries rebuilt for gfx803 works, and which
+  settings Polaris needs; gfx803_rocm is also the source of the torch 2.6
+  hardware validation and the kernel-version warning.
+- The root-cause analysis in [ROCm/clr#269](https://github.com/ROCm/clr/issues/269)
+  and the patched runtime in
+  [lucbruni-amd/TheRock](https://github.com/lucbruni-amd/TheRock/tree/lb/gfx803-polaris-support)
+  explain why ROCm 7 drops Polaris at the runtime level, which is why this
+  stack stays on 6.4.4.
+- Built on [ComfyUI](https://github.com/comfyanonymous/ComfyUI),
+  [sd-scripts](https://github.com/kohya-ss/sd-scripts),
+  [Ollama](https://github.com/ollama/ollama),
+  [llama.cpp](https://github.com/ggml-org/llama.cpp),
+  [PyTorch](https://github.com/pytorch/pytorch) and AMD's
+  [ROCm](https://github.com/ROCm) libraries.
