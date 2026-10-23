@@ -1,5 +1,5 @@
 # Build context for all three Dockerfiles is the repository root. Only
-# patches/ and runtime/ (Dockerfile, Dockerfile-Ollama) and training/
+# patches/ (Dockerfile, Dockerfile-Ollama), runtime/ (Dockerfile) and training/
 # (Dockerfile-ComfyUI) are COPYed from it; Dockerfile-ComfyUI takes tools/
 # through its own named build context. Everything else is documentation,
 # host-side tooling, git metadata, or user data that would otherwise be hashed

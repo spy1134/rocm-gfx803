@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1
 # Polaris / gfx803 base image: MIGraphX + ONNX Runtime + PyTorch on ROCm 6.4.4,
-# with rocBLAS, rocSOLVER, rocSPARSE, MIOpen and the HIP runtime rebuilt for gfx803. User-facing docs
-# (versions, building, caveats): docs/STACK.md.
+# with rocBLAS, rocSOLVER, rocSPARSE, MIOpen, the HIP runtime, clang/comgr and
+# the device library's ockl.bc rebuilt or patched for gfx803, and the SGEMM shim
+# preloaded. User-facing docs (versions, building, caveats): docs/STACK.md.
 #
 # Why ROCm 6.4.4 for gfx803 (RX 460/470/480/550/560/570/580/590):
 #
@@ -43,10 +44,16 @@
 #                compute wrong on gfx803. Rebuilt with patches/miopen/, whose
 #                applicability-check patches route the affected shapes to
 #                other solvers: ConvOclDirectFwd's out-of-bounds weights read
-#                for grouped/depthwise convolutions (see KERNEL_BUGS.md), the
+#                for grouped/depthwise convolutions (see docs/KERNEL_BUGS.md), the
 #                fused Winograd kernel's non-3x3 padding path, and the binary
 #                Winograd solvers (ConvBinWinogradRxS, ConvBinWinograd3x3U),
 #                which corrupt memory and hang the GPU on gfx803.
+#   ockl.bc   -- the device library's signal functions use a no-return atomic,
+#                which gfx803 executes as a plain store on host memory; device
+#                printf and assert() hang without patches/device-libs/.
+#   SGEMM shim -- an LD_PRELOAD library that takes rocBLAS's fp32 GEMMs, which
+#                return wrong results on gfx803, and its slow fp16 layouts
+#                (patches/sgemm-shim-batched/).
 #
 # What is switched off, because no version of it has ever supported gfx8:
 #
@@ -220,20 +227,14 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocblas-ccache \
     # resolves inside the build directory (/rocblas-src/build/release/
     # rocblas-install), not against ROCM_DIR/ROCM_PATH/CPACK_PACKAGING_
     # INSTALL_PREFIX -- those three only point the *build* at the existing
-    # ROCm install for headers/deps, they don't control install output.
-    # Confirmed from a real build log: rmake correctly compiles and installs
-    # TensileLibrary_lazy_gfx803.dat and friends, but into that relative path.
+    # ROCm install for headers/deps, they don't control install output. So
+    # the gfx803 libraries (TensileLibrary_lazy_gfx803.dat and the rest) are
+    # copied from that path into /opt/rocm below.
     #
-    # A second bug compounded this: rmake.py's own --cleanup flag (previously
-    # passed here) deletes the entire build/release tree -- rocblas-install
-    # included -- as its last internal action, before returning control to
-    # the shell. So even after adding a `cp -a rocblas-install/. /opt/rocm/`
-    # step, the copy ran against an already-emptied source and silently
-    # copied nothing (confirmed: a second build log showed the copy "succeed"
-    # with zero gfx803 files landing in /opt/rocm). --cleanup is dropped
-    # entirely below; we already do our own `rm -rf /rocblas-src/build`
-    # right after the copy, so nothing is lost by not asking rmake to do it
-    # itself first.
+    # rmake.py's --cleanup would delete the whole build/release tree,
+    # rocblas-install included, before returning, and the copy would then
+    # find nothing to copy and still succeed. The build tree is removed after
+    # the copy instead.
     && echo "Copying rocBLAS gfx803 install output into /opt/rocm..." \
     && cp -a /rocblas-src/build/release/rocblas-install/. /opt/rocm/ \
     # rmake's own install produces librocblas.so.4.4 (rocBLAS's own SOVERSION,
@@ -254,7 +255,7 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocblas-ccache \
     # Verify the copy actually landed gfx803 Tensile kernels in /opt/rocm
     # before letting this stage be considered a success. Without this check,
     # a broken rebuild or a future change to rmake's install layout still
-    # exits 0 and gets pushed to the shared :gfx803 tag -- and every
+    # exits 0 -- and every
     # downstream consumer (migraphx, pytorch, the final image) then inherits
     # a rocBLAS with no gfx803 code objects at all, failing only much later
     # at runtime with "Illegal seek for GPU arch: gfx803" instead of here, at
@@ -264,13 +265,8 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocblas-ccache \
     # /opt/rocm-6.4.4 in this base image). GNU find's default -P mode never
     # follows a symlink given as the search root -- it treats /opt/rocm as
     # a leaf node and never recurses into it, so a plain `find /opt/rocm`
-    # here always matches zero regardless of what's actually installed
-    # (confirmed: an unfiltered `find /opt/rocm/lib/rocblas/library` --
-    # which resolves the same symlink transparently via normal path
-    # resolution, since it names the target directory explicitly instead of
-    # relying on find's own recursion -- showed the gfx803 files were
-    # present all along). `-L` makes find follow the symlink so it actually
-    # recurses.
+    # here always matches zero regardless of what is installed. `-L` makes
+    # find follow the symlink so it recurses.
     && echo "Verifying gfx803 Tensile library is present in /opt/rocm..." \
     && if ! find -L /opt/rocm -iname "*TensileLibrary*gfx803*" | grep -q .; then \
         echo "FATAL: /opt/rocm has no gfx803 Tensile library after the copy." >&2; \
@@ -309,7 +305,7 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocblas-ccache \
     fi \
     && echo "OK: librocblas.so.4 resolves to a gfx803 build with a ${fatbin_size}-byte .hip_fatbin."
 
-# The original SGEMM shim: intercepts rocblas_sgemm/rocblas_gemm_ex only, not
+# The first SGEMM shim: intercepts rocblas_sgemm/rocblas_gemm_ex only, not
 # the strided-batched calls attention uses, so its attention gradients are
 # wrong. It stays in the image for A/B comparisons (gfx803-train.sh
 # --shim original); the shim the image preloads is the batched one built in
@@ -453,7 +449,7 @@ RUN echo "Copying MIOpen gfx803 build into /opt/rocm..." \
     && rm -f /tmp/libMIOpen.so* \
     # Verify our content actually landed: our gfx803-only, CK/MLIR-off build
     # is always meaningfully smaller than the base image's multi-arch stock
-    # one (~380MB here vs ~695MB stock at the time of writing), so an
+    # one (~380MB here vs ~695MB stock for ROCm 6.4.4), so an
     # unchanged size means the overwrite silently didn't happen.
     && new_size="$(stat -c%s "$resolved")" \
     && echo "libMIOpen.so.1 resolved path: $resolved (stock ${stock_size} bytes -> new ${new_size} bytes)" \
@@ -472,8 +468,8 @@ FROM ${MIOPEN_IMAGE} AS miopen-export
 # librocsolver.so.0, librocblas.so.4 and libamdhip64.so.6 (all sonames, no
 # device code), so the stock libhipsolver resolves to the rebuilt library.
 #
-# Builds against rocblas-export, which carries the patched ROCr runtime and the
-# gfx803 rocBLAS. Only the library file leaves this stage.
+# Builds against rocblas-export, which carries the gfx803 rocBLAS. Only the
+# library file leaves this stage.
 FROM python-base AS rocsolver-builder
 
 ARG ROCM_VERSION
@@ -504,7 +500,7 @@ COPY --from=rocsolver-builder /rs-out/ /
 
 # rocSPARSE rebuilt for gfx803. The library in the base image has no gfx803 code object and launches for a missing
 # architecture are dropped without an error, so sparse products on the GPU return wrong values silently.
-# Builds against the patched ROCr runtime and rocBLAS carried by rocblas-export. Only the library file leaves this stage.
+# Builds against the gfx803 rocBLAS carried by rocblas-export. Only the library file leaves this stage.
 FROM python-base AS rocsparse-builder
 
 ARG ROCM_VERSION
@@ -655,8 +651,7 @@ RUN python3 -m venv /rbuild-venv \
 # Fixes to MIGRAPHX_REF's pinned commit that upstream merged to develop but
 # never backported to this release branch. patches/ is grouped by what gets
 # patched (migraphx/, rocblas/) rather than by arch: this whole directory is
-# gfx803-exclusive, so a patches/<arch>/ level underneath it only repeated the
-# name of its own parent. Each patch documents its own why/what in its header;
+# gfx803-exclusive. Each patch documents its own why/what in its header;
 # applied right after the clone so a patch that stops applying (e.g.
 # MIGRAPHX_REF moves) fails the build loudly instead of silently shipping
 # unpatched code.
@@ -788,7 +783,7 @@ ARG TORCHAUDIO_REF
 ARG BUILD_PARALLEL_LEVEL
 
 # torch links rocBLAS but not MIGraphX, so this stage only needs the rocBLAS
-# rebuild -- keeping it off the MIGraphX chain lets CI run the two in parallel.
+# rebuild; off the MIGraphX chain, BuildKit builds the two in parallel.
 COPY --from=rocblas-export /opt/rocm /opt/rocm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -1050,9 +1045,9 @@ COPY --from=migraphx-export /opt/rocm /opt/rocm
 # migraphx-builder already copies this same file in before building itself
 # (see that stage), so what's sitting in /opt/rocm after the migraphx-export
 # copy above should already match -- this explicit copy is kept as the
-# independently-controllable, authoritative source (final takes its own
-# MIOPEN_IMAGE/with-miopen-image input), not as the only place this file
-# reaches the final image.
+# independently-controllable, authoritative source (MIOPEN_IMAGE can point
+# it at another build), not as the only place this file reaches the final
+# image.
 COPY --from=miopen-export /opt/rocm/lib/libMIOpen.so.1.0.* /opt/rocm/lib/
 
 # Rebuilt rocSOLVER (gfx803 code object). Only the library file: copying the
@@ -1106,13 +1101,11 @@ ENV ROC_ENABLE_PRE_VEGA=1
 ENV TORCH_BLAS_PREFER_HIPBLASLT=0
 
 # MIOpen's grouped-conv OOB fix is a source patch (miopen-builder, above,
-# via patches/miopen/conv-direct-fwd-grouped-oob.sh) rather than an env var:
-# an earlier, blunter fix (MIOPEN_DEBUG_CONV_DIRECT_OCL_FWD=0) disabled the
-# whole solver rather than just the broken grouped-conv case, which also
-# risked pushing unrelated non-grouped shapes onto a *different* MIOpen
-# fallback path with its own unverified correctness. See KERNEL_BUGS.md for
-# both the root-cause investigation and why the source patch replaced the
-# env var.
+# via patches/miopen/conv-direct-fwd-grouped-oob.sh) rather than
+# MIOPEN_DEBUG_CONV_DIRECT_OCL_FWD=0: that switch disables the whole solver,
+# not just the broken grouped case, and moves unrelated non-grouped shapes onto
+# other MIOpen paths with their own unverified correctness. See
+# docs/KERNEL_BUGS.md for the root cause.
 
 ENV PYTHONPATH=/opt/rocm/lib
 ENV VIRTUAL_ENV=/opt/venv

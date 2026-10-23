@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1
 # Ollama on the rocm-gfx803 base image, with llama.cpp's HIP backend compiled
-# for gfx803. At runtime it loads the base's patched rocBLAS and HSA runtime.
+# for gfx803. At runtime it loads the base's gfx803 rocBLAS and HIP runtime
+# (with AMD's stock HSA runtime).
 # Build the base first, from the repository root:
 #   docker build -t rocm-gfx803:rocm6.4.4 -f Dockerfile .
 #   docker build -t rocm-gfx803-ollama:latest -f Dockerfile-Ollama .

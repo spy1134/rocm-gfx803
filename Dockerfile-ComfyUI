@@ -77,7 +77,7 @@ RUN pip uninstall -y opencv-python opencv-python-headless \
     && pip install --no-cache-dir opencv-python==4.10.0.84
 
 # Reports dependency conflicts in the build log without failing the build; the
-# known ones (see README.md) are harmless.
+# known ones (see docs/STACK.md) are harmless.
 RUN pip check || true
 
 # start-comfyui.sh runs the container as the user who starts it, with an
