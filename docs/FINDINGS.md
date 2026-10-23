@@ -99,7 +99,7 @@ run with wrong numbers, not a crash. "It runs" was never taken as evidence.
 | ONNX Runtime TopK with sorted = 0 fails above K of about 7,800 | Fixed | 5 | `patches/onnxruntime/topk-safe-small-k-smem-bound.patch` |
 | No fused attention in PyTorch on gfx803 | ComfyUI node (inference; its GroupNorm and GEGLU are fp32 only) | 6 | `tools/ComfyUI-gfx803-attention/` |
 | Schaka's patched HSA runtime (va-reuse-defer) page-faults on gfx803 | Not built: the images run AMD's stock runtime, and the bug it targeted is the stale vector L1 below | 4 | git history up to `0e67b7d` |
-| Kernels read stale data from the per-CU vector L1 after a freed address is reused (silent wrong results in rocBLAS, rocSOLVER, torch.linalg) | Fixed (libamdhip64 rebuilt); decode costs about 2.6% | 4 | `patches/clr/` |
+| Kernels read stale data from the per-CU vector L1 and scalar cache after a freed address is reused (silent wrong results in rocBLAS, rocSOLVER, torch.linalg, MIOpen reductions) | Fixed (libamdhip64 rebuilt); decode costs about 2.6% | 4 | `patches/clr/` |
 | Device printf and assert() hang (hostcall's doorbell signal never changes) | Fixed (ockl.bc rebuilt) | 4 | `patches/device-libs/` |
 | No-return atomics on fine-grained host memory store their operand instead (user kernels) | Open (hardware; use the returned value) | 4 | none |
 | Non-inlined device functions read implicit kernel arguments from address 0: PyTorch's mixed fp16/fp32 binary ops crash, assert() faults at its trap | Fixed (clang and libamd_comgr rebuilt, PyTorch rebuilt with them) | 4 | `patches/llvm/` |
@@ -527,7 +527,7 @@ Profilers work on the stock runtime: `rocprof --hip-trace --stats`,
 `rocprofv3 --kernel-trace --stats` and `torch.profiler` record kernels, with
 or without the SGEMM shim preloaded.
 
-### A kernel can read stale data from the vector L1 across dispatches
+### A kernel can read stale data from its CU's caches across dispatches
 
 Symptom: a rocBLAS call returns `rocblas_status_success` with wrong numbers.
 `rocblas_sgemm_strided_batched` with m=n=k=8 and batch 4 comes out with a
@@ -541,23 +541,52 @@ inverse, QR, SVD, eigh) goes through the same calls and returned wrong factors
 that varied from run to run, and MIOpen's reduce kernels returned wrong sums in
 a sequence of calls on recycled buffers.
 
-Cause: the command processor of gfx803 (MEC firmware 730) does not
-invalidate the per-CU vector L1 cache at a dispatch boundary. ROCm expresses
-cross-dispatch coherence only through the fence scopes in the AQL packet
-header, and the LLVM memory model for GFX6 to GFX9 relies on the packet
-processor to act on them, so no code ever issues the cache invalidate itself.
-A kernel on a CU whose L1 still holds lines of a page that something else has
-rewritten since then reads the old bytes. The rewrite is a copy: copies of 16 KiB
-or less are shader copies that write through L2, and an address comes back
-either because the application refills the same buffer or because ROCr's
+Cause: at a dispatch boundary the command processor of gfx803 (MEC firmware
+730) leaves cache lines valid that ROCm's contract says it drops. ROCm
+expresses cross-dispatch coherence only through the fence scopes in the AQL
+packet header, and the LLVM memory model for GFX6 to GFX9 relies on the packet
+processor to act on them, so compiled code never invalidates a cache itself.
+Which lines survive depends on how they were fetched.
+`tools/tc-staleness/loadpaths.hip` refills a recycled 4 KiB buffer 1,000 times,
+reads it back each time through one load path, and empties both caches before
+each path. With the packet described below switched off:
+
+| Load path | Stale reads of 1,000 |
+| --- | --- |
+| `flat_load` (every global load the compiler generates for gfx8) | 0 |
+| `s_load` (the compiler's scalar loads of kernel arguments and uniform data) | 0 |
+| `buffer_load` through a descriptor with word3 bit 27 clear | 993 to 996 |
+| `s_buffer_load` through such a descriptor | 989 |
+| either buffer load with bit 27 set | 0 |
+
+Bit 27 of a buffer descriptor's word3 is the low bit of the memory-type field
+(MTYPE) in ROCr's gfx8 register layout; AMD's GCN3 ISA guide calls it NV. A line
+that a buffer instruction fetched through a descriptor with the bit clear
+survives the boundary, in the vector L1 and in the scalar cache alike. Once a
+line survives, any later load of its address hits it, whatever path that load
+takes. The compiler's own loads fetch no such lines. Its register spills do,
+through the scratch descriptor ROCr builds with the bit clear, but every reload
+follows the same wave's store. Hand-written assembly and code built on buffer
+intrinsics fetch them all the time: Tensile's gfx803 assembly GEMM kernels,
+MIOpen's assembly convolutions and its composable-kernel reductions all build
+descriptors with the bit clear. That is why every failure in the table below goes through
+rocBLAS's assembly kernels or MIOpen's reductions, and why probes through
+PyTorch's own kernels stay clean. At kernel entry, `buffer_wbinvl1` cures the
+vector case and `s_dcache_inv` the scalar one;
+`buffer_wbinvl1_vol`, the invalidate LLVM emits for an acquire on gfx8, cures
+neither.
+
+A kernel on a CU whose caches still hold such lines of a page that something
+else has rewritten since then reads the old bytes. The rewrite is a copy: copies
+of 16 KiB or less are shader copies that write through L2, and an address comes
+back either because the application refills the same buffer or because ROCr's
 fragment heap hands a freed 4 KiB page to the next `hipMalloc` of the same size,
-with no ioctl, unmap or TLB flush in between. Operands much larger than the 16 KiB
-L1 push the old lines out on their own, which is why big GEMMs were never
-affected. The wrong values are what
-was last at that address (a zero-padded and a NaN-padded buffer give different
-garbage at the same case, so this is not an out-of-bounds read), serialising
-launches does not cure it, and neither do SDMA, the SGEMM shim or the workspace
-size.
+with no ioctl, unmap or TLB flush in between. Operands much larger than the 16
+KiB L1 push the old lines out on their own, which is why big GEMMs were never
+affected. The wrong values are what was last at that address (a zero-padded and
+a NaN-padded buffer give different garbage at the same case, so this is not an
+out-of-bounds read), serialising launches does not cure it, and neither do SDMA,
+the SGEMM shim or the workspace size.
 
 Fix: `patches/clr/` rebuilds `libamdhip64` from ROCm/clr at the rocm-6.4.4 tag
 with one PM4 `ACQUIRE_MEM` packet, published in its own AQL ring slot ahead of
@@ -566,6 +595,23 @@ every kernel dispatch, that invalidates the vector L1 and the scalar cache
 library is replaced; the Ollama image carries the identical stock file, so
 the same rebuilt file fits it. `CLR_GFX8_TC_INVALIDATE=0` switches the packet off in the same
 binary, which is how the fix is measured against itself.
+
+The invalidate sits in the HIP runtime because the runtime issues the dispatch
+packets whose fence scopes promise it. Two other placements were measured and
+not taken. Setting bit 27 in every gfx8 buffer descriptor leaves no line to go
+stale and costs nothing measurable inside a kernel (within 0.3% for re-reads of
+4 KiB to 16 MiB). With Tensile's descriptors patched that way, the rocBLAS probe
+passes all 727 cases with the packet off. But correctness would then depend on
+no kernel anywhere building a descriptor without the bit, which nothing
+enforces, and on undocumented firmware behaviour. A scan of every gfx803 code
+object in the images finds two that build one: Tensile's assembly kernels and
+the attention backward kernel in `tools/`. MIOpen builds more of them at run
+time. An invalidate at every kernel's entry keeps the contract instead, and
+`s_dcache_inv` there costs next to nothing except on very large grids (3.5 us on
+an empty kernel of 16k waves). But it needs a compiler change, every library
+rebuilt and the assembly kernels edited, and it leaves precompiled code
+uncovered. Either would save only the packet's cost per dispatch (RT-1 in
+`OPTIMIZATION_TARGETS.md`).
 
 Measured on the RX 590 with the stock HSA runtime, the same binary and only
 `CLR_GFX8_TC_INVALIDATE` toggled:
@@ -602,8 +648,9 @@ dispatches per token, an fp16 SD 1.5 step about 1,430 in ~400 ms.
 Open: why the L1-plus-L2-invalidate word fails while its neighbours pass, and
 why fp64 never fails. The probes in `tools/tc-staleness/` that go through
 PyTorch (`probe.py`, `soak.py`, the copy-engine and graph-replay probes) are
-clean on this stack with the packet off as well, so only the rocBLAS probe
-isolates the bug, together with the rocBLAS and reduce programs in the table.
+clean on this stack with the packet off as well, because PyTorch's kernels load
+through flat instructions. `loadpaths.hip` and the rocBLAS probe isolate the
+bug, together with the rocBLAS and reduce programs in the table.
 That MIOpen's reduce failures and rocBLAS's wrong results on small fp32 GEMMs
 (`KERNEL_BUGS.md`) are this bug follows from the table, and the patches
 written for them before its cause was known have nothing left to fix. On the

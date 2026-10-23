@@ -109,8 +109,9 @@ Without this project's changes, on these cards:
   to launch, or hung the GPU. The cause in several cases is one warp-size
   mismatch on 64-lane hardware.
 - rocBLAS, rocSOLVER and `torch.linalg` returned wrong numbers at random: the
-  card's vector L1 cache is not invalidated between kernel launches, so a
-  kernel could read the old contents of a recycled buffer. rocSOLVER and
+  card keeps cache lines that buffer loads fetched (in the vector L1 and the
+  scalar cache) valid from one kernel launch to the next, so a kernel could
+  read the old contents of a recycled buffer. rocSOLVER and
   rocSPARSE also shipped without any gfx803 code, so their kernels never ran.
 - PyTorch's binary ops on an fp16 and an fp32 tensor (`torch.maximum`, `mse_loss`,
   `gelu_backward` and others) crashed whenever the element count was not a

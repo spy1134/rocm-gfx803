@@ -24,7 +24,7 @@ next one.
 | WGM8 (`WorkGroupMapping != 1`) | rocBLAS assembly GEMM kernels, all dtypes | Silent wrong results, `rocblas_status_success` | Fixed: [`patches/rocblas/wgm-miscompute.sh`](../patches/rocblas/wgm-miscompute.sh) |
 | Pervasive Tensile fp32 GEMM miscompute | Every rocBLAS/Tensile fp32 GEMM solution (assembly and source-kernel), any shape, any GSU, any tile config | First call in a process correct, every call after intermittently wrong (1%-100% of output elements, error magnitude up to 1e5) | Fixed for the standard-algo fp32 path: [`patches/rocblas/sgemm-shim/`](../patches/rocblas/sgemm-shim/) |
 | MIOpen `ConvOclDirectFwd` grouped-conv OOB | `MIOpenConvUniBatchNormActiv` kernel (`ConvOclDirectFwd`/`ConvOclDirectFwdFused` solver), grouped/depthwise convolutions specifically | GPU memory access fault, page not present -- an actual out-of-bounds read past the weights buffer, not stale/uninitialized data | Fixed: [`patches/miopen/conv-direct-fwd-grouped-oob.sh`](../patches/miopen/conv-direct-fwd-grouped-oob.sh), MIOpen rebuilt from source (`miopen-builder` stage in the Dockerfile). Confirmed NOT the same bug as the GEMM one above -- the sgemm-shim fix only measurably delayed this crash (1-4 sessions -> 11 sessions) because it never touched MIOpen at all. See "MIOpen ConvActivationFusion investigation" below for the full root-cause chase. |
-| Small-shape Tensile assembly GEMM miscompute | rocBLAS/Tensile fp32 GEMM, gfx803 assembly (`ISA803`/`KLA`) kernels, whenever *every* dimension is small (correct from ~48x48x48 up; thin shapes fine if one dimension is large) | Silent wrong results, `rocblas_status_success`. Reproduced down to a **1x1x1** problem: a cross-workgroup race in the GSU CAS-accumulate path, winner decided by GPU queue occupancy, so it only manifests under back-to-back dispatch. Surfaced as 84 of `onnxruntime_test_all`'s 96 failures (Einsum, Attention, DecoderAttention, MultiHeadAttention, FusedMatMul) | Worked around, not root-caused: [`patches/rocblas/small-gemm-assembly-miscompute.sh`](../patches/rocblas/small-gemm-assembly-miscompute.sh) makes Tensile dispatch prefer a HIP source kernel for small fp32 problems (guarded to `prob.strided_batch` -- the array-of-pointers batched GEMM API isn't supported by that source solution and must fall through to the tuned assembly). 96 -> 12 failures. The race *inside* the assembly kernels is understood but not fixable via patch -- see "The small-shape assembly GEMM miscompute" below |
+| Small-shape Tensile assembly GEMM miscompute | rocBLAS/Tensile fp32 GEMM, gfx803 assembly (`ISA803`/`KLA`) kernels, whenever *every* dimension is small (correct from ~48x48x48 up; thin shapes fine if one dimension is large) | Silent wrong results, `rocblas_status_success`. Reproduced down to a **1x1x1** problem, only after other small GEMMs on recycled buffers: the kernels read stale cache lines left by earlier dispatches ([FINDINGS section 4](FINDINGS.md)). Surfaced as 84 of `onnxruntime_test_all`'s 96 failures (Einsum, Attention, DecoderAttention, MultiHeadAttention, FusedMatMul) | Fixed by the HIP runtime's cache invalidate before every dispatch ([`patches/clr/`](../patches/clr/)). [`patches/rocblas/small-gemm-assembly-miscompute.sh`](../patches/rocblas/small-gemm-assembly-miscompute.sh), written before the cause was known, makes Tensile dispatch prefer a HIP source kernel for small fp32 problems (guarded to `prob.strided_batch` -- the array-of-pointers batched GEMM API isn't supported by that source solution and must fall through to the tuned assembly); it took the failures from 96 to 12 and stays because the source kernels are faster at those sizes. See "The small-shape assembly GEMM miscompute" below |
 | int8_float32 GEMM (CT2) | rocBLAS int8_r/int32_r GEMM path | Garbled/repeating output, not a crash | **Confirmed fixed as of the MIOpen grouped-conv fix**, though not independently re-isolated. Retested end-to-end via the real audiomuse-rocm-plugin image (JFK sample, `faster_whisper`, `int8_float32`) after rebuilding the base image with the MIOpen fix: correct transcription, whereas this was previously garbled. Whisper's encoder has real Conv1D layers, so this was plausibly the same `ConvOclDirectFwd` grouped-conv defect corrupting the int8 path's output, not a separate rocBLAS int8 bug -- but that's an inference from the retest, not a confirmed root cause the way the fp32 GEMM and MIOpen bugs above were. Worth a real isolation pass if it regresses. |
 | MultiHeadAttention "MHA basic" mode rejected on ROCm | ORT's own `GemmSoftmaxGemmPermuteGenericPipeline` (contrib op C++, not rocBLAS/MIOpen) -- the only path available once Composable Kernel is compiled out | `Could not find viable op` for any plain 3-tensor MultiHeadAttention call with query sequence_length > 1 (an ordinary shape, not an edge case); rocBLAS is never even reached | Fixed in ORT source: [`patches/onnxruntime/mha-basic-mode-no-viable-op.sh`](../patches/onnxruntime/mha-basic-mode-no-viable-op.sh) adds the missing Q/K/V transpose (via ORT's own existing `LaunchTransQkv` utility) before the GEMMs that need it. 12 -> 3 failures, no regressions. |
 | Generic TopK RadixTopK tie-break nondeterminism | ORT's own generic TopK kernel (`topk_impl.cuh`, contrib op / core op C++, not rocBLAS/MIOpen) -- hipified verbatim from CUDA, no ROCm-specific source | Picks a different winner among exactly-tied candidates from run to run on bit-identical input (hipCUB `BlockScan`/`BlockReduce`-based tie allocation). Surfaced as `BeamSearchTest.GptBeamSearchFp32_DisableFastTopK` decoding a different token sequence each run, ~50% of isolated runs | Fixed in ORT source: [`patches/onnxruntime/topk-radix-tiebreak-nondeterministic.sh`](../patches/onnxruntime/topk-radix-tiebreak-nondeterministic.sh) replaces the affected dispatch path with a self-contained, hipCUB-free kernel on ROCm only. 18 isolated runs: 17 passed (was ~50%). Not gfx803-specific in principle. |
@@ -311,10 +311,21 @@ gfx803's tuned Tensile *assembly* GEMM kernels return wrong results, silently
 and with `rocblas_status_success`, whenever every dimension of the problem is
 small. Fixing this took `onnxruntime_test_all` from 96 failures to 12.
 
-The shipped fix ([`patches/rocblas/small-gemm-assembly-miscompute.sh`](../patches/rocblas/small-gemm-assembly-miscompute.sh))
+Nothing is wrong inside those kernels. They read stale vector-L1 lines that
+earlier dispatches left behind on recycled buffers, the bug in
+[FINDINGS section 4](FINDINGS.md) that the HIP runtime's invalidate before
+every dispatch fixes. The assembly kernels are the ones that show it because
+they load through buffer descriptors, and on gfx803 the lines such loads fetch
+survive a dispatch boundary; the source kernels load through flat
+instructions, whose lines do not. Small problems show it because their operands
+fit in the 16 KiB L1, while larger ones push the old lines out. With the runtime
+fix, every rocBLAS solution for fp32 GEMMs of 1 to 16 cubed returns the exact
+product.
+
+[`patches/rocblas/small-gemm-assembly-miscompute.sh`](../patches/rocblas/small-gemm-assembly-miscompute.sh)
 routes small fp32 problems to a HIP source kernel inside rocBLAS's Tensile
-dispatch. It is a workaround at the right layer, **not** a root-cause fix: what
-is actually wrong inside those assembly kernels is still unknown.
+dispatch. It hid the bug before its cause was known, and it stays because the
+source kernels are faster at those sizes.
 
 ### The boundary
 
@@ -403,7 +414,7 @@ Every one of these cost real time here:
   Snug allocations also let one solution corrupt the next. Trust the in-process
   verifier.
 
-### The 1x1x1 case: root cause narrowed to a cross-workgroup race
+### The 1x1x1 case
 
 Extended the in-process verifier to dump every operand and result for any
 mismatch small enough to read by eye (`patch_dumpsmall.py`, applies on top of
@@ -418,54 +429,25 @@ call=36  A=1  B=10  Cpre=10  Cpost=20   expect=10   (Cpost == Cpre + expect: sta
 ```
 
 Same output address both times (`ptrC=0x90a800200`), same shape, same
-transpose, same `alpha`/`beta` -- and two structurally opposite failures. That
-rules out a static per-shape logic defect (a fixed wrong edge-shift or wrong
-operand index would fail the same way every time) and points at a **race
-between two per-element roles in the GSU (GlobalSplitU) accumulate path**: one
-workgroup is responsible for the initial `beta*C` store, another does the
-atomic-CAS accumulate of its partial sum (GCN3 has no native float
-atomic-add, so this is a compare-and-swap retry loop -- see
-`gsu-atomic-accumulate-miscompute` history above). Depending on which one wins:
-the accumulator can fire before the init-store lands (reads/CAS-adds onto
-stale pool memory -- call=36), or the init-store can land *after* the
-accumulate and clobber it outright (call=31 looks like nothing happened only
-because the "clean" write of `beta*C = 0` never actually ran either -- both
-paths were skipped or overwritten).
+transpose, same `alpha`/`beta` -- and two structurally opposite failures. A
+static per-shape logic defect (a fixed wrong edge-shift or wrong operand index)
+would fail the same way every time. Both fit reads of lines that an earlier
+kernel left in a CU's L1: the output read back as its old contents (call=31), or
+the product added to them (call=36). With the runtime fix the assembly kernels
+return exact products at these sizes.
 
-A third, structurally distinct-looking case confirmed this isn't limited to
-`1x1x1`: a `3x3x2` GEMM (`Einsum.ExplicitEinsumAsMatmulNhcwTransposeB`) came
-back with its entire last output column (the `n=2` tail, since 3 doesn't tile
-evenly) hard **zero** rather than stale-plus-partial. Zero looked at first like
-a separate edge/tail-handling defect (`EdgeType: ShiftPtr`), but see below --
-it isn't.
+A `3x3x2` GEMM (`Einsum.ExplicitEinsumAsMatmulNhcwTransposeB`) came back with
+its entire last output column (the `n=2` tail, since 3 doesn't tile evenly)
+hard **zero**. It is the same mechanism, not an edge-handling defect: switching
+`EdgeType` changed nothing.
 
-**The decisive test: isolation kills the bug.** Both the `1x1x1` cases and the
-`3x3x2` case were re-run *alone* (just that one test, nothing before it) three
-times each. All six runs passed -- verifier reports `ok` every time. The
+**Isolation hides the bug.** Both the `1x1x1` cases and the `3x3x2` case pass
+when run *alone* (just that one test, nothing before it), three runs each. The
 failures only appear inside the full `Einsum.*` run, always on the same tests,
-always preceded by other small GEMMs on the same stream. A pure logic bug
-(wrong shift, wrong index, wrong identity value) reproduces regardless of
-context; this does not. That makes it a **race whose winner is decided by GPU
-queue occupancy at launch time** -- back-to-back dispatch leaves the previous
-kernel's tail wavefronts still retiring when the next kernel's workgroups
-launch, which changes hardware scheduling order deterministically for a given
-call sequence but never shows up when a kernel launches onto an otherwise-idle
-GPU. This also explains two earlier observations that looked unrelated at the
-time: `TENSILE_DB=0x8000` (or any added `fprintf` between launches) hides the
-bug because it changes launch timing, and the "3x3x2 zero tail" and "1x1x1
-stale-add/dropped-write" are the *same* mechanism, not two bugs -- which
-workgroup loses the race just determines what garbage (zero, stale pool
-memory, a clobbered partial) ends up in the output.
-
-**This is not something a Docker-image patch can fix.** The missing piece is
-an inter-workgroup dependency/fence between the beta-init store and the GSU
-CAS-accumulate that Tensile's code generator does not emit for gfx803. Fixing
-it means regenerating or hand-patching the assembly kernels themselves, which
-was already ruled out as unreliable (see "Patching the assembly kernels
-directly" discussion, above). The shipped dispatch fix
-(`small-gemm-assembly-miscompute.patch`) remains correct and sufficient: it
-avoids this whole class of kernel below the 8x8x8 threshold rather than
-trying to fix the race inside it.
+always preceded by other small GEMMs on the same stream: a test run alone has no
+earlier kernel whose lines of a recycled buffer are still in the L1. Anything
+that adds work between launches (`TENSILE_DB=0x8000`, an `fprintf`) changes
+which lines are still cached, which is why observing the bug hides it.
 
 ### Resolved: the four FusedMatMulOpTest failures were the dispatch fix rejecting a GEMM variant it doesn't support, not a miscompute
 
@@ -507,9 +489,8 @@ call for that shape already picks the incompatible solution.
 Fix: added `&& prob.strided_batch` to the gate in
 `small-gemm-assembly-miscompute.patch`. Array-of-pointers batched GEMMs now
 fall straight through to `findBestSolution` and the tuned assembly path,
-exactly as they did before this patch existed -- unaffected by either the fix
-or, for whatever it's worth, the underlying race, since none of the four
-tests exercise the tiny-and-racy shape region in the first place.
+exactly as they did before this patch existed -- unaffected by the patch,
+since none of the four tests exercise the tiny shapes it reroutes.
 
 `onnxruntime_test_all`: **16 -> 12 failures**, all four `FusedMatMulOpTest`
 cases pass, no regressions elsewhere.
@@ -607,7 +588,8 @@ topk kernel. GCN3 has no matrix cores, and CK is compiled out of this image
 
 Isolating the test alone (nothing else running) showed it fails ~50% of the
 time, in a **fresh process every run** -- not the "fails in the full suite,
-passes alone" signature the GEMM race and `ReduceSum` show. This rules out
+passes alone" signature the small GEMMs and `ReduceSum` show (both the
+stale-cache bug of FINDINGS section 4). This rules out
 context/memory-pool state as the cause; whatever's wrong is inside the
 kernel itself, on identical input, every time it's invoked.
 
@@ -626,7 +608,7 @@ warning, not a different code path.
 Dumping the actual selected scores/tokens took real care: an initial dump
 that added a `hipStreamSynchronize` + device-to-host copy made the test pass
 4/4 -- the same observer effect as `TENSILE_DB=0x8000` masking the gfx803 GEMM
-race, just rediscovered in a different subsystem. Switching to a
+miscompute, just rediscovered in a different subsystem. Switching to a
 non-invasive dump (printing `next_scores`/`next_tokens`/`next_indices`,
 already host-visible at that point in the existing code, no new
 synchronization) reproduced the failure normally. At `%.9g` precision, the

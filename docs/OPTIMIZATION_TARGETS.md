@@ -172,7 +172,7 @@ Open targets in recommended order, then the done ones.
 | Target | Area | Expected gain | Status |
 | --- | --- | --- | --- |
 | LLM-6 | MoE prompts: expert copies, MUL_MAT_ID, dense parts | copies overlap compute since patch 108 (pp2048 295 -> 367 tok/s, against 376 with no copies at all); DeltaNet recurrence (patch 117: pp2048 361 -> 455 tok/s); expert matmuls, 62% of GPU time after 117, as a grouped fp32 GEMM (patch 118: pp2048 450 -> 547, pp512 234 -> 275); expert reduction (patch 119: +2.6%); a third prefetch slot (patch 126: pp2048 565 -> 599, pp512 282 -> 331). The copies run at the link limit (13.3 GB/s, 18.2 GiB per 2048-token batch) and with three slots they are hidden: skipping them altogether (timing-only build) gives 630 against 593 tok/s, so a prompt batch is bound by GPU compute, three quarters of it the dense fp32 GEMMs (gfx803 SGEMM) and the expert GEMMs. The fp32 two-wavefront tile (BLAS-7) and padded output rows for 8192-row matmuls (patch 127) take the dense GEMMs from about 4.0 to 4.6-5.3 TFLOPS: pp2048 about 599 -> 615; through Ollama (2,800-token prompt, a 2048- and a 752-token batch) 516 -> 519. 4096-token batches add 4% on 4096- and 8192-token prompts with three slots (8% with two), too little for an Ollama batch-size patch and a compute buffer about 1 GiB larger ; a 13,513-token prompt at 2048-token batches (29.0 s): expert GEMMs 32% of GPU time, dense GEMMs 33% at 4.37 TFLOPS on average, head-256 attention 17% (patch 131) | Open: dense GEMM efficiency (BLAS-7's main tile); the expert GEMM is bound by its staging (options below) |
-| RT-1 | Cost of the vector-L1 invalidate before every dispatch | 1.65 us per dispatch: ~2.4 ms of an MoE token (~6%), 2.3-2.7% of dense decode, ~2.4 ms of an SD 1.5 step. The cost is the extra ring slot, not the cache work: an empty-kernel dispatch costs 4.27-4.30 us with the shipped packet, with only the L1 bit, with poll interval 1, and with the L1 action moved onto the slot's RELEASE_MEM (no ACQUIRE_MEM), against 2.65 us without the slot | Measured, no cheaper packet; only fewer slots would help, and skipping the invalidate between kernels is not provably correct |
+| RT-1 | Cost of the vector-L1 invalidate before every dispatch | 1.65 us per dispatch: ~2.4 ms of an MoE token (~6%), 2.3-2.7% of dense decode, ~2.4 ms of an SD 1.5 step. The cost is the extra ring slot, not the cache work: an empty-kernel dispatch costs 4.27-4.30 us with the shipped packet, with only the L1 bit, with poll interval 1, and with the L1 action moved onto the slot's RELEASE_MEM (no ACQUIRE_MEM), against 2.65 us without the slot | Measured, kept: no cheaper packet, and the two ways to drop it (bit 27 in every buffer descriptor, an invalidate at every kernel entry) were measured and rejected; only fewer dispatches help |
 | LLM-5 | Dense decode above the bandwidth bound | per 36 ms token: K-quant kernels ~2.9 ms, flash-attention decode ~2.6 ms at 5k depth, F16 `attn_v` ~1 ms, launches ~1 ms by fusion; the same kernels make up MoE generation's GPU part | Open, measured before the stale-L1 fix and patch 111 |
 | LLM-8 | MoE generation with experts in system RAM | Qwen3.6 35B-A3B, 39 ms per token before patches 113-116 (25.6 tok/s, llama-bench with a cold page cache): CPU experts ~16.7 ms, GPU kernels ~12 ms, ~1,425 dispatches at ~4.3 us each (~6 ms), hand-offs ~3 ms; 113-116 remove up to 300 dispatches per token (25.60 -> 27.51 tok/s), 120-125 another 320 (+0.9%, +2.0%, +0.7%); CPU experts run at ~91% of practical DDR4 bandwidth (36.5 GB/s): strict thread pinning lost 21%, the AVX2 repacked layout gained nothing; 6-8 expert layers resident in VRAM give +9% (llama.cpp's fit does this by itself when the VRAM is free) | Open: RMS norm + multi-section rope fusion (did not fire) |
 | SD-10 | fp16 GroupNorm/SiLU and GEGLU in the node | the node's kernels take fp32 only, so ComfyUI's fp16 default runs neither; a few ms of a 342 ms step | Open, unmeasured |
@@ -339,10 +339,30 @@ read index, and the AQL dispatch and barrier packets' own acquire scopes are
 what the firmware ignores, so no packet the dispatch already publishes can
 carry the invalidate.
 
+**Ruled out.** The packet can go only if no line can survive a dispatch
+boundary some other way. Only lines that a buffer instruction fetched through a
+descriptor with word3 bit 27 clear survive (FINDINGS section 4), and the two
+ways to rule them out were measured:
+
+- Bit 27 in every gfx8 buffer descriptor. Built for Tensile (one function sets
+  every assembly kernel's descriptor): the rocBLAS probe passes 727 of 727 cases
+  with the packet off, at no measurable cost inside a kernel. MIOpen needs the
+  same change in about twenty kernel files and a new kernel-cache name. But
+  correctness then rests on no kernel ever building a descriptor without the
+  bit. A scan of every gfx803 code object in the images found two that do, one
+  of them this repository's own attention backward kernel. Nothing would catch
+  the next one, and a miss returns wrong numbers without an error.
+- An invalidate at every kernel's entry (`s_dcache_inv` and `buffer_wbinvl1`).
+  `s_dcache_inv` costs about nothing on small grids and streaming kernels and
+  3.5 us on an empty kernel of 16k waves. But it needs a compiler change, the
+  assembly kernels of Tensile and MIOpen edited, and every library rebuilt, and
+  it covers no precompiled code.
+
+Neither is worth ~6% of MoE decode against a silent wrong answer, so the packet
+stays.
+
 **Options.** Fewer dispatches: every fusion in LLM-5 and LLM-8 saves 4.3 us,
-not 2.65. Skipping the invalidate for some dispatches is
-not an option without proof that their inputs cannot be stale; the bug it
-fixes returns wrong numbers without an error.
+not 2.65.
 
 **Verify.** FINDINGS section 4's table (the rocBLAS probe's 511 cases, the
 MIOpen reduce shapes, the small sgemm loops, `SOLVE_TRI`) with the change,
