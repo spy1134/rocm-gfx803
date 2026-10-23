@@ -98,7 +98,7 @@ run with wrong numbers, not a crash. "It runs" was never taken as evidence.
 | MIGraphX fp16 matrix products accumulate in fp16 (error 0.7-1% instead of 0.02%) | Fixed | 5 | `patches/migraphx/rocblas-compute-fp32-gfx803.patch` |
 | ONNX Runtime TopK with sorted = 0 fails above K of about 7,800 | Fixed | 5 | `patches/onnxruntime/topk-safe-small-k-smem-bound.patch` |
 | No fused attention in PyTorch on gfx803 | ComfyUI node (inference; its GroupNorm and GEGLU are fp32 only) | 6 | `tools/ComfyUI-gfx803-attention/` |
-| Schaka's patched HSA runtime (va-reuse-defer) page-faults on gfx803 | Not built: the images run AMD's stock runtime, and the bug it targeted is the stale vector L1 below | 4 | `patches/rocr/` |
+| Schaka's patched HSA runtime (va-reuse-defer) page-faults on gfx803 | Not built: the images run AMD's stock runtime, and the bug it targeted is the stale vector L1 below | 4 | git history up to `0e67b7d` |
 | Kernels read stale data from the per-CU vector L1 after a freed address is reused (silent wrong results in rocBLAS, rocSOLVER, torch.linalg) | Fixed (libamdhip64 rebuilt); decode costs about 2.6% | 4 | `patches/clr/` |
 | Device printf and assert() hang (hostcall's doorbell signal never changes) | Fixed (ockl.bc rebuilt) | 4 | `patches/device-libs/` |
 | No-return atomics on fine-grained host memory store their operand instead (user kernels) | Open (hardware; use the returned value) | 4 | none |
@@ -501,7 +501,8 @@ and `journalctl -k` should show no `qcm fence` line after the trap.
 
 The images run AMD's stock `libhsa-runtime64` (`.so.1.15.60404`) from the ROCm
 base image. Schaka's gfx803 tree patches it with a "va-reuse-defer" change
-to how freed GPU virtual addresses are reused (`patches/rocr/va-reuse-defer.patch`,
+to how freed GPU virtual addresses are reused
+(`patches/rocr/va-reuse-defer.patch` in git history up to commit `0e67b7d`;
 investigation in `KERNEL_BUGS.md`), written for MIOpen's CK reduction kernels
 reading stale data when a freed address is reused at once (ONNX Runtime's
 `ReduceSum` test). The images do not build it, for two reasons.
@@ -1539,8 +1540,8 @@ a reproduction.
   The images do not build it. The reproducers are
   `gfx803_unet_check.py --only GEGLU` and the wide-GEMM-then-transposed-copy
   sequence described in section 4, run against a `libhsa-runtime64` built
-  from ROCR-Runtime `rocm-6.4.4` with `patches/rocr/va-reuse-defer.sh`, with
-  the desktop stopped (a fault storm can freeze it).
+  from ROCR-Runtime `rocm-6.4.4` with `patches/rocr/va-reuse-defer.sh` (commit
+  `0e67b7d`), with the desktop stopped (a fault storm can freeze it).
 - Whether PyTorch's group_norm computes wrong weight and bias gradients on
   gfx9 for a spatial size of 1 and more than 128 rows:
   `GammaBeta1dBackwardCUDAKernel2` reduces a 32-wide tile with shuffles over

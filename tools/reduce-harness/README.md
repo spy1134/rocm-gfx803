@@ -42,13 +42,14 @@ README.md
 ```
 
 The bug this reproduces is the stale per-CU vector L1 across kernel
-dispatches (`KERNEL_BUGS.md`, "FIXED (root cause): stale vector L1 across
-kernel dispatches"), fixed in CLR by `patches/clr/`. On AMD's stock libhsa,
-which the images run, the 52-shape sweep is 0/52 with that fix and 10-12/52
-with it off (`CLR_GFX8_TC_INVALIDATE=0`). Upstream's runtime patch
-`patches/rocr/va-reuse-defer.patch` also brings the sweep to 0/52, but it
-page-faults on gfx803 and the images do not build it. Keep using this harness
-to re-validate whenever the CLR, ROCR or MIOpen layer is touched.
+dispatches (`docs/KERNEL_BUGS.md`, "FIXED (root cause): stale vector L1
+across kernel dispatches"), fixed in CLR by `patches/clr/`. On AMD's stock
+libhsa, which the images run, the 52-shape sweep is 0/52 with that fix and
+10-12/52 with it off (`CLR_GFX8_TC_INVALIDATE=0`). Schaka's runtime patch
+`patches/rocr/va-reuse-defer.patch` (git history up to commit `0e67b7d`) also
+brings the sweep to 0/52, but it page-faults on gfx803 and the images do not
+build it. Keep using this harness to re-validate whenever the CLR, ROCR or
+MIOpen layer is touched.
 
 ## Pre-requisites
 

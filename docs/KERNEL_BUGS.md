@@ -29,7 +29,7 @@ next one.
 | MultiHeadAttention "MHA basic" mode rejected on ROCm | ORT's own `GemmSoftmaxGemmPermuteGenericPipeline` (contrib op C++, not rocBLAS/MIOpen) -- the only path available once Composable Kernel is compiled out | `Could not find viable op` for any plain 3-tensor MultiHeadAttention call with query sequence_length > 1 (an ordinary shape, not an edge case); rocBLAS is never even reached | Fixed in ORT source: [`patches/onnxruntime/mha-basic-mode-no-viable-op.sh`](../patches/onnxruntime/mha-basic-mode-no-viable-op.sh) adds the missing Q/K/V transpose (via ORT's own existing `LaunchTransQkv` utility) before the GEMMs that need it. 12 -> 3 failures, no regressions. |
 | Generic TopK RadixTopK tie-break nondeterminism | ORT's own generic TopK kernel (`topk_impl.cuh`, contrib op / core op C++, not rocBLAS/MIOpen) -- hipified verbatim from CUDA, no ROCm-specific source | Picks a different winner among exactly-tied candidates from run to run on bit-identical input (hipCUB `BlockScan`/`BlockReduce`-based tie allocation). Surfaced as `BeamSearchTest.GptBeamSearchFp32_DisableFastTopK` decoding a different token sequence each run, ~50% of isolated runs | Fixed in ORT source: [`patches/onnxruntime/topk-radix-tiebreak-nondeterministic.sh`](../patches/onnxruntime/topk-radix-tiebreak-nondeterministic.sh) replaces the affected dispatch path with a self-contained, hipCUB-free kernel on ROCm only. 18 isolated runs: 17 passed (was ~50%). Not gfx803-specific in principle. |
 | Stale per-CU vector L1 across dispatches | Every kernel on gfx803 that reads a page a copy kernel just refilled, seen as wrong rocBLAS/rocSOLVER results after `hipFree` then `hipMalloc` | Silent wrong numbers, bit-identical per run | Fixed: [`patches/clr/`](../patches/clr/clr-gfx8-tc-invalidate-6.4.4.patch), see the last section |
-| MIOpen `miopenReduceTensor` dynamic-reduction intermittent wrong sums | Root cause: below MIOpen. The HIP allocator's **device-address recycling** (hipFree->hipMalloc returning the same input VA) interacts with gfx803's GPU memory-system state (stale cache/TLB coherence) so the **specific CK reduction kernels mis-read freshly-written input** at the reused address. Proven via the committed `tools/reduce-harness/` (real CK kernels, plain hipModule + hipMalloc/hipFree reuse, no MIOpen host code: reuse=10/52, fresh-distinct-input=0/52, dominated by the INPUT buffer). Rock-solid: seq5-via-API reuse=7/52 vs fresh=0/52; observer effect ruled out (copy to a *recycled* internal buffer = 21/52). | **Not built by the images.** The cause is the stale per-CU vector L1 (see "FIXED (root cause): stale vector L1 across kernel dispatches" below and `docs/FINDINGS.md` section 4), fixed in CLR (`patches/clr/`); with it the reduce programs pass on AMD's stock runtime. The runtime patch written for it, [`patches/rocr/va-reuse-defer.patch`](../patches/rocr/va-reuse-defer.patch) ("FIXED (runtime): ROCR va-reuse-defer patch" below, version history in `wip_patches/README.md`), page-faults on gfx803 in workloads that free and reallocate GPU memory. |
+| MIOpen `miopenReduceTensor` dynamic-reduction intermittent wrong sums | Root cause: below MIOpen. The HIP allocator's **device-address recycling** (hipFree->hipMalloc returning the same input VA) interacts with gfx803's GPU memory-system state (stale cache/TLB coherence) so the **specific CK reduction kernels mis-read freshly-written input** at the reused address. Proven via the committed `tools/reduce-harness/` (real CK kernels, plain hipModule + hipMalloc/hipFree reuse, no MIOpen host code: reuse=10/52, fresh-distinct-input=0/52, dominated by the INPUT buffer). Rock-solid: seq5-via-API reuse=7/52 vs fresh=0/52; observer effect ruled out (copy to a *recycled* internal buffer = 21/52). | **Not built by the images.** The cause is the stale per-CU vector L1 (see "FIXED (root cause): stale vector L1 across kernel dispatches" below and `docs/FINDINGS.md` section 4), fixed in CLR (`patches/clr/`); with it the reduce programs pass on AMD's stock runtime. The runtime patch written for it, `patches/rocr/va-reuse-defer.patch` ("The va-reuse-defer runtime patch" below; in git history up to commit `0e67b7d`, with its version history in `wip_patches/`), page-faults on gfx803 in workloads that free and reallocate GPU memory. |
 
 ## How we found the pervasive GEMM bug
 
@@ -839,12 +839,12 @@ validated against).
 
 ## The ReduceSum kernel-cache mystery
 
-**This one is not fixed at the root.** Everything else in this document
-identifies a specific defective instruction sequence and corrects it. This
-section is different: a real, reproducible bug was found and worked around,
-but *why* the workaround works was never established. Read this before
-touching [`patches/miopen/reduce-kernel-cache-eviction.sh`](../patches/miopen/reduce-kernel-cache-eviction.sh)
-or reusing its pattern anywhere else.
+**The root cause is the stale per-CU vector L1** ("FIXED (root cause): stale
+vector L1 across kernel dispatches" below), fixed in CLR. This section
+records how the bug was isolated below MIOpen. The MIOpen workarounds it
+describes (`reduce-kernel-cache-eviction` and `reduce-program-bound-eviction`)
+are not needed with the CLR fix and are not in the tree; they are in git
+history up to commit `0e67b7d`.
 
 **The bug.** A standalone, ORT-independent MIOpen-only repro -- one
 `miopenHandle_t`, a sweep of `miopenReduceTensor` ADD calls over many
@@ -934,60 +934,19 @@ there was no fast, reliable way left to iterate (every test cycle meant a
 multi-minute, sometimes-inconclusive full ORT suite run, and the standalone
 repros that previously caught every other variant of this bug all came back
 clean), shipping this would have traded one characterized bug for a worse,
-uncharacterized one. Abandoned; the patch and its `.sh` wrapper are kept in
-`patches/miopen/` for reference (both are explicitly marked as not applied
-by the Dockerfile), and ReduceSum is left on the unpatched baseline.
+uncharacterized one. The patch and its `.sh` wrapper are in git history up
+to commit `0e67b7d`.
 
-**How to pick this up and find the real fix (or make the workaround
-actually reliable):**
-
-1. The failure is a function of *which other* dynamic-CK reduction kernels
-   were compiled and cached on the same `Handle` before the failing call,
-   not a property of the failing shape alone -- `m=8,9,11,13` at `n=128`
-   all share the identical compiled kernel (same `reduceImpl`/tunable/
-   padding bucket), yet only `m=13` (the last of that group dispatched in
-   default shape-sweep order) was wrong; `m=9` and `m=11` (also needing
-   padding) were fine.
-2. Failing output columns aren't scattered randomly -- one valgrind run of
-   the `m=13,n=128` case reproduced the failure as a single **contiguous**
-   run of wrong columns (`j=32..41` out of 128), suggestive of a specific
-   wavefront/SIMD-lane-group boundary rather than generic corruption.
-3. No experiment ever directly observed a wrong byte inside the workspace
-   descriptor or the compiled kernel's machine code for a failing call --
-   every attempt to look (buffer-writes stashing decoded descriptor
-   fields, a sentinel proving the prepare kernel's writes are visible to
-   the main kernel) itself masked the bug by adding a memory operation to
-   the kernel.
-4. Next tools to try, roughly in order of likely payoff: (a) disassemble
-   the actual compiled code object (`roc-obj`/`roc-obj-ls`) for the same
-   `kernel_name`+`params` compiled fresh vs. compiled as the Nth kernel in
-   a long sweep, to check whether the generated machine code genuinely
-   differs -- if so, this is COMGR/LLVM codegen state leaking between
-   separate in-process JIT compiles; (b) if the machine code is identical,
-   HSA-level tracing (rocprofiler's HSA API trace, not just the HIP-level
-   trace used here) to check for GPU-visible code-object address overlap
-   between different loaded modules across a session; (c) `rocgdb` wasn't
-   usable in this container/ROCm-version combination -- worth retrying
-   bare-metal or with newer tooling, since a hardware breakpoint at the
-   point of divergence would settle this quickly if it can be made to
-   work; (d) fixing the static-reduction compile error is a separate,
-   self-contained yes/no question that doesn't require understanding the
-   dynamic-path bug at all, and would unblock testing whether routing to
-   static reduction (the clean, Winograd-precedent-style fix this
-   investigation deliberately avoided) is actually viable.
-5. The eviction workaround's ORT-only failure is itself a clue worth
-   chasing before writing off that whole approach: whatever ORT's real test
-   binary does differently from every standalone repro tried (thread pool
-   behavior, its own allocator reusing memory across tests, running
-   hundreds of unrelated ops before reaching ReduceSum, or something else
-   entirely) is *also* part of triggering the original bug's real-world
-   exposure, not just an artifact of the attempted fix. A working
-   bisection strategy would need to run inside (or alongside) the actual
-   ORT test binary rather than a fresh standalone MIOpen process --
-   e.g. `--gtest_filter` bisection to find the minimal preceding-test set
-   that makes `ReduceSum_apex_matrix_large` unreliable, since the standalone
-repro's inability to reproduce it suggests the trigger condition isn't
-    just "many different reduce ops on one handle."
+**What it turned out to be.** The stale per-CU vector L1 across kernel
+dispatches ("FIXED (root cause): stale vector L1 across kernel dispatches"
+below): a kernel reading a recycled buffer could see the cache lines of its
+previous contents. That fits what this section measured: failures that depend
+on which kernels ran before on the same handle and buffers, runs of
+contiguous wrong columns, and an observer effect from any added memory
+operation. With the CLR fix (`patches/clr/`) on AMD's stock runtime,
+`tools/reduce-harness/`'s 52-shape sweep is 0/52, against 10-12/52 with the
+fix switched off (`CLR_GFX8_TC_INVALIDATE=0`), so no MIOpen-side workaround
+is needed.
 
 ---
 
@@ -1087,7 +1046,7 @@ small-ring version.
   `HAR_RING=N`, `HAR_LOGADDR=0|1`, `HAR_BENCH="m,n[,m,n]"`, `HAR_BENCH_REPS=N`,
   `HAR_PRELOAD=1`).
 
-## FIXED (runtime): ROCR va-reuse-defer patch, both gates green
+## The va-reuse-defer runtime patch (not built)
 
 The images do not build this patch. On gfx803 it page-faults in workloads that
 free and reallocate GPU memory (a GEGLU op test, llama-server mid-prompt), and
@@ -1095,15 +1054,14 @@ the reduce failures it was written for are the stale vector L1 described in
 "FIXED (root cause): stale vector L1 across kernel dispatches" below, fixed in
 CLR. The rest of this section describes the patch and how it was validated.
 
-The runtime fix called for above is implemented and validated against both
-gates: `patches/rocr/va-reuse-defer.patch` (applied by the sibling `.sh`). It
+The patch, `patches/rocr/va-reuse-defer.patch` with its `.sh` driver, is in
+git history up to commit `0e67b7d`; it passed both gates below. It
 patches **ROCR-Runtime @ rocm-6.4.4** only -- libhsakmt
 is statically linked into libhsa-runtime64, so no clr/HIP rebuild is needed.
 
-The shipped mechanism is v13 ("park fully alive, busy-flush teardown") --
-see `wip_patches/README.md` for the full version history and
-`wip_patches/v13-park-alive-busy-flush/README.md` for the mechanism in
-detail. Two layers recycle freed GPU VAs; both are blocked:
+Its mechanism is v13 ("park fully alive, busy-flush teardown"); the version
+history and the mechanism in detail are in `wip_patches/README.md` and
+`wip_patches/v13-park-alive-busy-flush/README.md` at commit `0e67b7d`. Two layers recycle freed GPU VAs; both are blocked:
 
 1. **libhsakmt fmm aperture free-list** (`libhsakmt/src/fmm.c`,
    `__fmm_release`): a freed object is parked on a per-aperture FIFO fully
@@ -1113,7 +1071,7 @@ detail. Two layers recycle freed GPU VAs; both are blocked:
    `fmm_do_release()` really free the BOs, inside a *later* FREE call while
    the GPU pipeline is typically active -- the busy-teardown timing is what
    actually clears the stale GPU memory-system state (an idle-time teardown
-   does not, per the v9/v10 dead ends in `wip_patches/README.md`). The VA
+   does not, per the v9/v10 dead ends in that version history). The VA
    only returns to the aperture free-list once freed, so it can't be
    reallocated until it has sat through the FIFO window (contrast: the
    earlier "never reuse VAs" leak experiment passed the harness but made ORT
@@ -1199,9 +1157,9 @@ ReductionOpTest **10/10 runs: 315 OK / 0 FAILED / 0 GPU faults** (previously
 conclusive -- rerun the soak after any further fmm change).
 
 The `deferred` flag this fix added carried forward into the
-later v13 mechanism (see the "FIXED (runtime)" section above) -- v13's
+later v13 mechanism (see "The va-reuse-defer runtime patch" above) -- v13's
 park-alive approach eliminates the fault class further still, per
-`wip_patches/README.md`'s kernel-7.1.7 cross-check (v13: 1/170 vs v4's
+the version history's kernel-7.1.7 cross-check (v13: 1/170 vs v4's
 persistent 6/50).
 
 NOTE also a build trap hit here: iterating on a local quick-iteration

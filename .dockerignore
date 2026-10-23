@@ -14,7 +14,6 @@
 *.log
 docs/
 tools/
-wip_patches/
 ollama-tools/
 # Bytecode from running training/'s scripts on the host; the image compiles
 # its own.

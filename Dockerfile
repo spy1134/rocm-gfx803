@@ -163,13 +163,10 @@ RUN git clone --branch "rocm-${ROCM_VERSION}" --depth 1 \
 # with rocblas_status_success. This rewrites the solution logic before Tensile
 # generates any assembly from it; the script header carries the measurements and
 # the reasoning, and it fails the build if it ever stops matching upstream.
-#
-# A source-level replacement (wgm-miscompute-source.{patch,sh}, also in this
-# directory) exists but is NOT wired in: a build of the same rocBLAS source
-# with it left 518 WGM8 kernel symbols in the TensileLibrary_Type_*_fallback_
-# gfx803 libraries, which don't route through the SolutionStructs.py hook that
-# patch targets. Not swapped in until that gap is closed and re-verified
-# against a real build of this stack.
+# It works on the solution logic rather than on Tensile's source, because the
+# TensileLibrary_Type_*_fallback_ gfx803 libraries do not route through
+# Tensile's SolutionStructs.py, and a source patch there leaves their WGM8
+# kernels in place (518 symbols).
 COPY patches/rocblas/wgm-miscompute.sh patches/rocblas/small-gemm-assembly-miscompute.patch patches/rocblas/small-gemm-assembly-miscompute.sh /rocblas-patches/
 RUN sh /rocblas-patches/wgm-miscompute.sh /rocblas-src
 
@@ -399,24 +396,6 @@ RUN sh /miopen-patches/reduce-prod-wrong-identity.sh /miopen-src
 # patch makes both not applicable there, so MIOpen uses its GEMM solvers.
 COPY patches/miopen/winograd-bin-gfx803-disable.patch patches/miopen/winograd-bin-gfx803-disable.sh /miopen-patches/
 RUN sh /miopen-patches/winograd-bin-gfx803-disable.sh /miopen-src
-
-# miopenReduceTensor's dynamic-reduction dispatch intermittently returns wrong
-# sums on gfx803 (confirmed via ReductionOpTest.ReduceSum_apex_matrix_large and a
-# standalone repro). The prior kernel-cache-eviction workaround
-# (reduce-kernel-cache-eviction.patch) passed every standalone repro but failed
-# ORT's real test suite, and was abandoned. A NEW narrow workaround
-# (reduce-program-bound-eviction.patch, which bounds how many distinct reduction
-# programs stay resident instead of evicting every call) is under validation and
-# opt-in here via ENABLE_REDUCE_BOUND -- NOT part of any default production
-# build until it passes the real ORT suite AND a perf benchmark. See
-# KERNEL_BUGS.md, "The ReduceSum kernel-cache mystery".
-ARG ENABLE_REDUCE_BOUND=0
-COPY patches/miopen/reduce-program-bound-eviction.patch patches/miopen/reduce-program-bound-eviction.sh /miopen-patches/
-RUN if [ "$ENABLE_REDUCE_BOUND" = "1" ]; then \
-        sh /miopen-patches/reduce-program-bound-eviction.sh /miopen-src; \
-    else \
-        echo "reduce-program-bound workaround NOT applied (opt-in, gfx803 validation)"; \
-    fi
 
 # Gives gfx803 a Winograd solver again, for 3x3 stride-1 fp32 and fp16 convs:
 # small HIP transform kernels around one batched GEMM (the SGEMM shim runs the

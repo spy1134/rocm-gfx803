@@ -174,7 +174,6 @@ gives each problem's symptom, cause, fix and how to reproduce the check.
 | `patches/` | every source patch the images apply, each with a header that says why |
 | `runtime/`, `training/` | Python workarounds installed into the base image; the training tools in the ComfyUI image |
 | `tools/` | correctness suite, the ComfyUI attention node, host setup, hang capture and repro tools |
-| `wip_patches/` | runtime patches that were investigated and not shipped, kept for their history |
 
 ## Origin
 
