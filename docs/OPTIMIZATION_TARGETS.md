@@ -185,7 +185,7 @@ Open targets in recommended order, then the done ones.
 | LLM-10 | Image prompts | a 1080p image (2061 tokens) took 50.4 s against 8.8 s for 2028 text tokens (Qwen3.5 9B), 38.7 s of it the vision encoder's attention at 0.21 TFLOPS; patch 128 (narrower, non-spilling one-head-per-K/V tiles): 18.7 s; patch 129 (gfx803 attention kernel for head sizes 40-80, 3.5 TFLOPS): 14.2 s; Qwen3.6 35B-A3B through Ollama 51.7 -> 14.0 -> 9.6 s. patch 132 (the encoder's fp16 projections in fp32 compute, on the shim, which also removes their fp16-accumulation error of about 1% RMS): 13.6 s (13.4 s through Ollama). What is left (9B, rocprof): the image tokens' own prefill (~6.6 s, the same rate as text), the encoder's attention (~2.4 s) | Open: the rest is text-rate prefill (LLM-6) and the encoder's attention |
 | SD-7 | Fused Winograd F(2x2, 3x3) | fp16 SD at most ~9 ms per step (2%); fp32 and training unmeasured | Open, low |
 | SD-1 | Winograd weight gradients | full fine-tuning and LoCon only | Open |
-| LLM-11 | Prompt attention at head sizes 96-256 | head size 128 on a gfx803 kernel (patch 130, Q in registers, 3.4-3.8 TFLOPS against 0.9-2.5): a 13,316-token prompt, Qwen2.5-Coder 7B 97.4 -> 65.8 s (attention 42.6 -> 10.7 s), Qwen3 8B 78.3 -> 74.6 s (21.1 -> 17.1 s). Head size 256, the full-attention layers of Qwen3.5/3.6 and Qwen3-Coder-Next (patch 131, Q split over 16 lanes, 16-key tiles): 1.5-2.1 -> 3.0-3.5 TFLOPS, 6-15x where the GQA ratio is 1 or odd; a 13,513-token prompt, Qwen3.5 9B 65.7 -> 62.5 s (attention 6.16 -> 3.57 s), Qwen3.6 35B-A3B through Ollama 29.8 -> 27.0 s | Open: the cost of split-K/V partial results |
+| LLM-11 | Prompt attention at head sizes 96-256 | head size 128 on a gfx803 kernel (patch 130, Q in registers, 3.4-3.8 TFLOPS against 0.9-2.5): a 13,316-token prompt, Qwen2.5-Coder 7B 97.4 -> 65.8 s (attention 42.6 -> 10.7 s), Qwen3 8B 78.3 -> 74.6 s (21.1 -> 17.1 s). Head size 256, the full-attention layers of Qwen3.5/3.6 and Qwen3-Coder-Next (patch 131, Q split over 16 lanes, 16-key tiles): 1.5-2.1 -> 3.0-3.5 TFLOPS, 6-15x where the GQA ratio is 1 or odd; a 13,513-token prompt, Qwen3.5 9B 65.7 -> 62.5 s (attention 6.16 -> 3.57 s), Qwen3.6 35B-A3B through Ollama 29.8 -> 27.0 s | Open: splitting for the last wave, cheap since patch 136 |
 | PT-3 | Triton for gfx803: `torch.compile`, then vLLM | a capability rather than a speedup: `torch.compile` (inductor), Triton-based libraries (Unsloth, Liger, SageAttention, FlashAttention's AMD Triton backend) and vLLM need Triton, which the images do not build. Schaka/rocm-gfx803's ROCm 10 line has four hardware-verified Triton patches for a newer Triton; PyTorch 2.8 needs Triton 3.4, so three have to be ported and one is probably unneeded there. A plain Triton GEMM reached 0.59 TFLOPS there (the shim: 4-5), so tuning is most of the work | Open, not started |
 | LLM-3 | mmvq vs mmq for 9-16 tokens | speculative/parallel decoding | Open |
 | LLM-1b | SDWA dot product losses (2-token decode) | 1-11% on 2-token decode | Open, minor |
@@ -875,21 +875,29 @@ Ollama 65.2 -> 63.2 s; Qwen3.6 35B-A3B through Ollama 29.8 -> 27.0 s. Four
 rows per lane spill, or run 3.5% slower with K and V read one float4 at a
 time.
 
+**Split K/V and the output stores.** Patch 130's kernel split a head's keys
+over several blocks at a high price (a 2048-query batch over 512 keys, 4 K/V
+heads at GQA 4: 3.06 ms unsplit, 8.55 ms split in two), and its unsplit
+output stores were slow as well: with the stores skipped (behind a condition
+the compiler cannot prove false) the kernel took 2.29 ms. The cause is DRAM
+channel camping. Consecutive query rows of a head lie n_head x D floats apart
+in the output (8 KiB here, 16 KiB for split partial results), a stride that
+maps all of a head's rows to one channel, and blocks start in launch order
+with the query tile fastest, so the blocks in flight were one head. Patch 136
+starts the heads of one K/V head side by side instead: 2.47 ms unsplit, 3.96
+ms split (combine included), same bits. Mask, tile order and store width
+were not the cause. In real prompts the gain is small, because at long
+contexts a block's compute outweighs its stores (Qwen3.6's head-256
+attention 10.03 -> 9.76 ms per call at 8k depth; prompt speed unchanged).
+
 **Next.**
-- Split-K/V partial results: written by patch 130's kernel they cost far more
-  than their size suggests (a 2048-query batch over 512 keys, 4 K/V heads at
-  GQA 4: 2.8 ms with one block per output tile, 9.4 ms with two, 2.4 ms with
-  two when the partial results are not written). Wider stores, a key-split-
-  major layout, half the writers and writing into the output tensor changed
-  nothing; the tile kernel's partial results show no such cost, and
-  `flash_attn_combine_results` takes 1.1-1.4 ms per call at these sizes for
-  every kernel. The kernel avoids the split except when the GPU would sit
-  mostly idle, so the cost is not paid in practice, but its cause is unknown.
-  With few heads and long contexts the split still wins: 4 query heads over
-  16,384 keys take 18.1 ms per 2048-query batch split and 21.0 ms unsplit
-  (8 heads at 1024 queries: 18.1 against 20.6 ms). Qwen3 8B and
-  Qwen2.5-Coder 7B, with 32 and 28 query heads, give enough blocks that the
-  rule does not split there.
+- Splitting to fill the last wave of blocks, now that the split is cheap:
+  4-5% faster at 16k-128k keys (head 256 at GQA 6, head 128 at GQA 4 and 7)
+  but up to 74% slower at 512 keys, measured with the split forced for every
+  batch. A rule keyed on the number of keys would keep the gain; at ~23% of a
+  long prompt's GPU time in attention it is worth about 1%.
+- `flash_attn_combine_results` takes 1.1-1.4 ms per call at these sizes for
+  every kernel; whether its stores camp the same way is unmeasured.
 
 ### PT-3: Triton for gfx803
 

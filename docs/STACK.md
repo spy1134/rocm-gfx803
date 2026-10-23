@@ -654,6 +654,17 @@ measurements and a reproduction. In short:
   - **135-gcn4-mmvf-f32-unroll.patch**: the fp32 matrix-vector loop (the
     MoE router, the shared expert's gate) is unrolled by 8 on gfx803, so its
     loads no longer issue one at a time: router 20.5 -> 17.6 us per call.
+- **136-gcn4-fattn-prompt-head-order.patch**: the prompt attention kernels
+  of 130 and 131 wrote their output at a few GB/s. Consecutive query rows of
+  a head lie n_head x D floats apart, a stride that maps them all to one DRAM
+  channel, and the blocks in flight were all one head because blocks start
+  with the query tile fastest. They now start with the heads of one K/V head
+  side by side, which spreads the stores over the channels and keeps the
+  shared K/V tiles in L2; same bits. A 2048-query batch over 512 keys
+  (head 128, GQA 4): 3.06 -> 2.47 ms, and 8.55 -> 3.96 ms with the keys split
+  over two blocks. At long contexts the stores are a small share: Qwen3.6's
+  head-256 attention 10.03 -> 9.76 ms per call at 8k depth, prompt speed
+  unchanged within noise.
 - **113-116: fewer dispatches per generated token.** On gfx803 every GPU
   dispatch costs about 4.3 us of command-processor time however small the
   kernel, and a Qwen3.6 35B-A3B token issues about 1,425 of them. Four

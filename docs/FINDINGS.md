@@ -1273,6 +1273,21 @@ bullets are the original findings (patches 100-105); the rest build on them.
   (3-4.5e-8 NMSE), the tile kernel's up to 4.8e-5. Checks against the CPU
   backend with f16 K and V measure distance to a reference that itself
   accumulates the output in fp16 and rounds Q to fp16.
+- **Prompt attention wrote its output at a few GB/s.** Patch 130's kernel
+  split a head's keys over blocks only where the GPU would otherwise idle,
+  because the split's partial results cost far more than their size (a
+  2048-query batch over 512 keys: 3.06 ms unsplit, 8.55 ms split), and even
+  unsplit its stores took 0.67 ms for 16.8 MB. Consecutive query rows of a
+  head lie n_head x D floats apart in the output, 8 KiB at 16 heads and head
+  size 128, and a stride that size maps every row to the same DRAM channel;
+  blocks start with the query tile fastest, so all blocks in flight wrote
+  rows of one head into that channel. Writing the same rows head-major
+  (consecutive lanes 512 B apart, wrong output, timing only) took 2.42 ms.
+  `136-gcn4-fattn-prompt-head-order.patch` starts the heads of one K/V head
+  side by side, whose rows lie D floats apart and who read the same K and
+  V: 2.47 ms unsplit, 3.96 ms split, same bits. At long contexts a block's
+  compute outweighs its stores, so real prompts gain little (Qwen3.6's
+  head-256 attention 10.03 -> 9.76 ms per call at 8k depth).
 - **fp16-weight matmuls accumulated in fp16** (the vision encoder of an
   image model, any F16 GGUF). llama.cpp runs a matmul with fp16 weights
   through cuBLAS in fp16 compute on every AMD GPU but CDNA and RDNA4;
@@ -1618,6 +1633,13 @@ a reproduction.
   code in the prompt kernels, for table-lookup operands and for 2-token decode.
 - Whether the decode kernels (mmvq) beat the prompt kernels (mmq) for 9-16
   tokens on gfx803; llama.cpp switches at 8.
+- Why the gfx803 prompt attention kernel (patch 130) returns NaN for a fully
+  masked query row in one test case, where the CPU returns 0: head size 128,
+  113 keys, a 512-query batch over two sequences (`test-backend-ops test -o
+  FLASH_ATTN_EXT` with the head-128 prompt cases), and only when the case
+  runs after others; alone it passes 20 times in 20. The same with and
+  without patch 136. Prompts never mask a row completely, so no model run is
+  known to hit it.
 - fp16 LoRA training in ComfyUI (only short runs so far).
 - An intermittent GPU memory fault in SD 1.5 LoRA training on AMD's stock HSA
   runtime. Two of sixteen runs of 120-300 steps (same image and data) died, at

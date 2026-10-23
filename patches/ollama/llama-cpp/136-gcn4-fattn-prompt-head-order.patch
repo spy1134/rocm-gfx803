@@ -1,0 +1,127 @@
+llama.cpp (as fetched by Ollama v0.35.1, llama.cpp b11232, applied after
+135): the gfx803 prompt flash-attention kernels for head sizes 96, 128 and
+256 (patches 130 and 131) start their blocks with the query heads of one
+K/V head side by side, instead of every query tile of one head in a row.
+The results are the same bits.
+gfx803-specific: these kernels run only on GCN4.
+
+WHY
+---
+A block of these kernels covers 64-96 query rows of one head and writes
+its output rows to dst, where consecutive query rows of a head lie n_head
+x D floats apart: 8 KiB for 16 heads at D 128, 16 KiB for the partial
+results of a split K/V range. On an RX 590 an address stride that large
+maps every row to the same DRAM channel. Blocks start in launch order with
+the query tile fastest, so the ~36 blocks in flight belonged to one head
+and all of their stores queued on one channel. With 512 keys and a
+2048-query batch (head size 128, 4 K/V heads at GQA 4) the kernel took
+2.96 ms, of which the output stores cost 0.67 ms (16.8 MB, about 25 GB/s);
+split over two key ranges it took 6.8 ms plus 1.4 ms to combine, which is
+why patch 130 avoids the split unless the GPU would sit mostly idle.
+
+WHAT
+----
+Each block derives its query tile and head from its linear launch index
+with the heads of one K/V head varying fastest. Those heads' rows lie D
+floats apart, which spreads the stores over the channels, and they read
+the same K and V tiles, so the blocks in flight still share them in L2.
+The arithmetic of every block is unchanged.
+
+Result on an RX 590, test-backend-ops perf (f16 K/V, mask, us per call
+including the combine of split results):
+
+    head 128, 4 K/V heads at GQA 4, 512 keys, 2048 queries
+      one block per output tile                 3056 ->  2473
+      K/V range split over two blocks           8552 ->  3958
+    head 128, 8 K/V heads at GQA 4, 4096 keys, 4096 queries
+                                               71797 -> 69446
+    head 256, 2 K/V heads at GQA 16 (Qwen3.6 35B-A3B), 10000 keys, 512 queries
+      run alone                                 47241 -> 46859
+      inside a sweep of head-256 cases          86255 -> 47131
+
+In a real prompt, Qwen3.6 35B-A3B in 512-token batches 8192 tokens deep
+(llama-bench, rocprof), the head-256 kernel takes 9.76 ms per call instead
+of 10.03. At that depth the compute of a block outweighs its stores, so
+prompt speed is unchanged within noise on Qwen3 8B and Qwen3.5 9B
+(llama-bench -p 512 -d 8192). The split K/V range is now cheap, but this
+patch leaves patch 130's rule for when to split as it is: splitting to fill
+the last wave as well gains 4-5% at 16k-128k keys and loses up to 74% at
+512.
+
+Logits are byte-identical: llama-perplexity over 1,024 tokens in 512-token
+batches on Qwen3.6 35B-A3B, Qwen3 8B and Qwen3.5 9B writes the same file
+with and without the patch.
+
+Verified on an RX 590: test-backend-ops test -b ROCm0 -o FLASH_ATTN_EXT,
+with the head-96/128/256 prompt cases added (6,555 in all), gives the same
+result with and without the patch: all pass but one, head 128 with 113 keys
+and two sequences, where a fully masked row comes out NaN instead of 0, and
+only when the case runs after others (alone it passes).
+
+To reproduce, build llama.cpp b11232 with GGML_HIP=ON and
+AMDGPU_TARGETS=gfx803, then with and without the patch:
+
+    test-backend-ops perf -b ROCm0 -o FLASH_ATTN_EXT -p "hsk=128,hsv=128,nh=8"
+
+diff --git a/ggml/src/ggml-cuda/fattn-gcn4-prompt.cuh b/ggml/src/ggml-cuda/fattn-gcn4-prompt.cuh
+--- a/ggml/src/ggml-cuda/fattn-gcn4-prompt.cuh
++++ b/ggml/src/ggml-cuda/fattn-gcn4-prompt.cuh
+@@ -468,10 +468,18 @@
+     const int ty   = (lane >> 1) & (NG - 1);
+ 
+     const int N        = ne01.z;
+-    const int sequence = blockIdx.z / ne02;
+-    const int head     = blockIdx.z - sequence*ne02;
++    // Blocks start in launch order, x fastest, so the blocks in flight would all be one head. Its output
++    // rows lie ne02*D floats apart, a stride that puts them all on one DRAM channel. Here the heads of one
++    // K/V head come first: their rows are D floats apart, which spreads the stores over the channels, and
++    // they read the same K and V.
++    const int gqa      = ne02/ne12;
++    const int lin      = blockIdx.z*gridDim.x + blockIdx.x;
++    const int tile_x   = (lin/gqa) % gridDim.x;
++    const int tile_z   = lin % gqa + gqa*(lin/(gqa*gridDim.x));
++    const int sequence = tile_z / ne02;
++    const int head     = tile_z - sequence*ne02;
+     const int head_KV  = head / (ne02/ne12);
+-    const int q0       = blockIdx.x*BR;
++    const int q0       = tile_x*BR;
+ 
+     const char * Q = Q_ptr + int64_t(nb03)*sequence + int64_t(nb02)*head;
+     const char * K = K_ptr + nb13*sequence + int64_t(nb12)*head_KV;
+@@ -552,7 +560,7 @@
+         const int row = min(q0 + wave*WR + tx + NG*i, ne31 - 1);
+         mask_row[i] = use_mask ? (const half *) (maskc + int64_t(row)*nb31) : nullptr;
+     }
+-    const int k_end     = KV_max_ptr ? min(KV_max_ptr[sequence*gridDim.x + blockIdx.x], ne11) : ne11;
++    const int k_end     = KV_max_ptr ? min(KV_max_ptr[sequence*gridDim.x + tile_x], ne11) : ne11;
+     const int num_tiles = (k_end + BC - 1) / BC;
+ 
+     if (int(blockIdx.y) < num_tiles) {
+@@ -840,10 +848,15 @@
+     const int ty   = lane & (NG - 1);
+ 
+     const int N        = ne01.z;
+-    const int sequence = blockIdx.z / ne02;
+-    const int head     = blockIdx.z - sequence*ne02;
++    // Launch order as in flash_attn_gcn4_prompt_qreg: the heads of one K/V head first.
++    const int gqa      = ne02/ne12;
++    const int lin      = blockIdx.z*gridDim.x + blockIdx.x;
++    const int tile_x   = (lin/gqa) % gridDim.x;
++    const int tile_z   = lin % gqa + gqa*(lin/(gqa*gridDim.x));
++    const int sequence = tile_z / ne02;
++    const int head     = tile_z - sequence*ne02;
+     const int head_KV  = head / (ne02/ne12);
+-    const int q0       = blockIdx.x*BR;
++    const int q0       = tile_x*BR;
+ 
+     const char * Q = Q_ptr + int64_t(nb03)*sequence + int64_t(nb02)*head;
+     const char * K = K_ptr + nb13*sequence + int64_t(nb12)*head_KV;
+@@ -924,7 +937,7 @@
+         const int row = min(q0 + wave*WR + tx + NR*i, ne31 - 1);
+         mask_row[i] = use_mask ? (const half *) (maskc + int64_t(row)*nb31) : nullptr;
+     }
+-    const int k_end     = KV_max_ptr ? min(KV_max_ptr[sequence*gridDim.x + blockIdx.x], ne11) : ne11;
++    const int k_end     = KV_max_ptr ? min(KV_max_ptr[sequence*gridDim.x + tile_x], ne11) : ne11;
+     const int num_tiles = (k_end + BC - 1) / BC;
+ 
+     if (int(blockIdx.y) < num_tiles) {
