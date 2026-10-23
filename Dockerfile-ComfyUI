@@ -70,11 +70,6 @@ WORKDIR /opt/sd-scripts
 RUN sed -i '/^bitsandbytes/d' requirements.txt \
     && pip install --no-cache-dir -r requirements.txt
 
-# sd-scripts' WD14 tagger (finetune/tag_images_by_wd14_tagger.py --onnx), for
-# captioning datasets, imports onnx to read the model's batch size, and
-# requirements.txt does not list it.
-RUN pip install --no-cache-dir onnx==1.23.1 ml_dtypes==0.6.0
-
 # opencv-python and opencv-python-headless both provide the cv2 module, and pip
 # installs both side by side, each overwriting the other's files. Resolve to one
 # package last, so nothing installed above has the final say.

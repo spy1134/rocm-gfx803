@@ -695,6 +695,7 @@ RUN git clone --branch "${MIGRAPHX_REF}" --depth 1 \
     done
 # The loop above trusts only the exit code of git apply; these drivers also check their marker.
 RUN sh /migraphx-patches/dpp-int32-sum-gfx8.sh /migraphx-src \
+    && sh /migraphx-patches/parse-resize-fixes.sh /migraphx-src \
     && sh /migraphx-patches/rocblas-compute-fp32-gfx803.sh /migraphx-src
 
 WORKDIR /migraphx-src
@@ -1147,6 +1148,11 @@ RUN "$VIRTUAL_ENV/bin/pip" install --no-cache-dir numpy /tmp/ort/*.whl /tmp/torc
     && "$VIRTUAL_ENV/bin/python3" -c "import torchvision; print('torchvision', torchvision.__version__)" \
     && "$VIRTUAL_ENV/bin/python3" -c "import torchaudio; print('torchaudio', torchaudio.__version__)" \
     && "$VIRTUAL_ENV/bin/python3" -c "import migraphx; print('migraphx python module OK')"
+
+# verify.py builds its MIGraphX test model with onnx, sd-scripts' WD14 tagger
+# reads its model's batch size with it, and most code that feeds ONNX Runtime
+# needs it.
+RUN "$VIRTUAL_ENV/bin/pip" install --no-cache-dir onnx==1.23.1 ml_dtypes==0.6.0
 
 # This image is a drop-in base for downstream Dockerfiles -- any of them can
 # `pip install`/`uv pip install` something that pulls in torch, torchvision,
