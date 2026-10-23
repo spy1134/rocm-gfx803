@@ -50,9 +50,9 @@ dispatch convolutions to.
 ROCm 6.x has no doorbell check at all. A stock `rocm/dev-ubuntu-24.04:6.4.x`
 image enumerates a Polaris card as shipped, no runtime patch required, and
 MIOpen still works. So this line pins the last ROCm 6 release rather than
-carrying a patched runtime forward. (Upstream's ROCm 10 line, documented in
-[`README-rocm10.md`](../README-rocm10.md), took the other road: it rebuilds the
-whole stack from source with the doorbell and other runtime patches.)
+carrying a patched runtime forward. ([Schaka/rocm-gfx803](https://github.com/Schaka/rocm-gfx803)'s
+ROCm 10 line took the other road: it rebuilds the whole stack from source with
+the doorbell and other runtime patches.)
 
 ## What gets rebuilt, and why
 
@@ -895,7 +895,7 @@ method.
 
 ## Host-side caveats
 
-Neither of these can be fixed inside the image:
+None of these can be fixed inside the image:
 
 - **Linux 6.12 and 6.13 are reported to segfault on gfx803** (per the
   gfx803_rocm project). If the stack crashes on an otherwise correct setup,
@@ -903,6 +903,55 @@ Neither of these can be fixed inside the image:
 - Mining-edition cards often have no display outputs, which is irrelevant for
   compute, but confirm the board is a genuine 8GB Polaris 10 and not a 4GB
   rebadge.
+
+### PCIe ASPM
+
+On at least one gfx803 host, PCIe ASPM (link power management) enabled in the
+BIOS caused rare stalls and hangs under GPU load that look like a driver or
+kernel bug. Keep ASPM disabled in the BIOS until a board proves otherwise. If
+the board never hands OS-level ASPM control to Linux, `pcie_aspm=off` does not
+help, because it leaves the bits the firmware already programmed;
+[`tools/host-setup/`](../tools/host-setup/) has a `setpci`-based systemd unit that
+clears them on both ends of the link.
+
+### Mining-tuned VRAM clocks
+
+At least one card used with this stack (Sapphire RX 470 8GB Mining UEFI,
+Hynix `H5GQ8H24MJR` VRAM) shipped with a mining VBIOS that runs VRAM (MCLK) at
+2000-2100 MHz, above the rating of a 7 Gbps Hynix chip. Under
+correctness-checked compute work this produced two symptoms that look like
+software bugs:
+
+- an intermittent GPU VM fault at a deterministic address in about half the
+  runs of `tools/correctness-suite/pool_sweep`;
+- under sustained load, an unrecoverable hang where a wave waits forever in
+  `s_waitcnt vmcnt(0)` for a vector-memory operation that never returns;
+  killing the process then fails a KFD queue eviction, and only a reboot
+  recovers.
+
+A mining workload tolerates occasional VRAM bit errors; a long or
+correctness-checked workload shows them as faults, hangs or wrong results.
+Flash a VBIOS whose VRAM clock matches the installed memory's rating, with
+`amdvbflash`'s force-flash mode (`amdvbflash -f -p 0 <rom>`), and dump and keep
+the existing ROM first. Two tests on that card confirmed the cause:
+
+- its own mining VBIOS with MCLK capped at 1750 MHz through overdrive
+  (`amdgpu.ppfeaturemask=0xffffffff` plus `pp_od_clk_voltage`): 64 of 64 clean
+  runs, against repeated hangs and crashes at 2000 MHz in the same boot with
+  every binary unchanged;
+- a Sapphire RX 570 Nitro VBIOS with Hynix straps (`113-2E366AU-X56`,
+  [TechPowerUp 212597](https://www.techpowerup.com/vgabios/212597/212597)),
+  whose stock MCLK table ends at 1750 MHz: 75 of 75 clean runs at stock
+  settings.
+
+Two RX 570 VBIOS files with Samsung straps, the wrong vendor for those Hynix
+chips, did not probe at all (`SMU load firmware failed`, `probe with driver
+amdgpu failed with error -22`). Match the VBIOS memory-vendor strap to the
+chips physically installed, not only to the card model and VRAM size.
+
+Read the VRAM clock with `cat /sys/class/drm/card*/device/pp_dpm_mclk` and
+compare it with the card's rating before treating a gfx803 fault or hang as a
+software bug.
 
 ## Credit
 

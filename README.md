@@ -143,8 +143,8 @@ gives each problem's symptom, cause, fix and how to reproduce the check.
   device memory. The image's patched `ockl.bc` does this for HSA signals, which
   is what makes device `printf` and `assert()` messages work.
 - Mining-edition cards often ship with memory clocked above its rating, which
-  causes random faults and freezes. Check the memory clock first (see "Host
-  VBIOS setting" in [`README-rocm10.md`](README-rocm10.md)).
+  causes random faults and freezes. Check the memory clock first (see
+  "Mining-tuned VRAM clocks" in [`rocm6.4.4/README.md`](rocm6.4.4/README.md)).
 - Linux kernels 6.12 and 6.13 have been reported to crash with these cards.
 
 ## Scope and origin
