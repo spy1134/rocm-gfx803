@@ -665,6 +665,17 @@ measurements and a reproduction. In short:
   over two blocks. At long contexts the stores are a small share: Qwen3.6's
   head-256 attention 10.03 -> 9.76 ms per call at 8k depth, prompt speed
   unchanged within noise.
+- **137-gcn4-prompt-gemm-pad-tokens.patch**: on 106's path a prompt matmul
+  whose batch is not a multiple of 128 tokens runs over the batch rounded up
+  to 128 (when that adds at most a sixteenth), with the extra columns zero
+  and dropped afterwards, so the shim takes its fast 64x128 tile for the last
+  batch of a prompt too. Qwen3 8B 752-token batch 256 -> 267 tok/s, 1,000
+  tokens 245 -> 262; same bits.
+- **138-fattn-combine-masked-row.patch**: the combine of split flash
+  attention wrote NaN (0/0) for a query row whose keys are all masked; it
+  now writes 0, as the CPU backend does. Only padding rows are fully masked
+  in a prompt, so no model output changes; test-backend-ops FLASH_ATTN_EXT
+  passes in full.
 - **113-116: fewer dispatches per generated token.** On gfx803 every GPU
   dispatch costs about 4.3 us of command-processor time however small the
   kernel, and a Qwen3.6 35B-A3B token issues about 1,425 of them. Four

@@ -1288,6 +1288,25 @@ bullets are the original findings (patches 100-105); the rest build on them.
   V: 2.47 ms unsplit, 3.96 ms split, same bits. At long contexts a block's
   compute outweighs its stores, so real prompts gain little (Qwen3.6's
   head-256 attention 10.03 -> 9.76 ms per call at 8k depth).
+- **A fully masked query row came out NaN when attention was split.** A
+  kernel that splits a head's keys over blocks leaves the final division to
+  `flash_attn_combine_results`, which divides the weighted partial results by
+  the weighted sums; for a row whose keys are all masked every sum is 0, and
+  the combine wrote 0/0 where the CPU backend writes 0. test-backend-ops
+  showed it on patch 130's kernel (head 128, 113 keys, 512 queries over two
+  sequences) inside the full suite only; with the split forced off the suite
+  passed. Only padding rows are fully masked in a model's prompt, and their
+  output is discarded. `138-fattn-combine-masked-row.patch` writes 0 for an
+  empty sum; the combine is generic code, so other GPUs reach the same NaN.
+- **Prompt batches that are not a multiple of 64 tokens missed the fast
+  SGEMM tile.** The shim's 64x128 two-wavefront tile needs whole 128-column
+  tiles, and the columns of a prompt matmul are the batch's tokens, so the
+  last batch of a prompt (752 tokens of a 2,800-token prompt in 2,048-token
+  batches) went to an older tile. `137-gcn4-prompt-gemm-pad-tokens.patch`
+  rounds such a batch up to 128 columns when that adds at most a sixteenth
+  and drops the zero columns afterwards: Qwen3 8B at 752 tokens 256 -> 267
+  tok/s, at 1,000 tokens 245 -> 262, Qwen3.5 9B at 752 tokens 252.5 ->
+  266.7; same bits.
 - **fp16-weight matmuls accumulated in fp16** (the vision encoder of an
   image model, any F16 GGUF). llama.cpp runs a matmul with fp16 weights
   through cuBLAS in fp16 compute on every AMD GPU but CDNA and RDNA4;
@@ -1633,13 +1652,6 @@ a reproduction.
   code in the prompt kernels, for table-lookup operands and for 2-token decode.
 - Whether the decode kernels (mmvq) beat the prompt kernels (mmq) for 9-16
   tokens on gfx803; llama.cpp switches at 8.
-- Why the gfx803 prompt attention kernel (patch 130) returns NaN for a fully
-  masked query row in one test case, where the CPU returns 0: head size 128,
-  113 keys, a 512-query batch over two sequences (`test-backend-ops test -o
-  FLASH_ATTN_EXT` with the head-128 prompt cases), and only when the case
-  runs after others; alone it passes 20 times in 20. The same with and
-  without patch 136. Prompts never mask a row completely, so no model run is
-  known to hit it.
 - fp16 LoRA training in ComfyUI (only short runs so far).
 - An intermittent GPU memory fault in SD 1.5 LoRA training on AMD's stock HSA
   runtime. Two of sixteen runs of 120-300 steps (same image and data) died, at

@@ -1,0 +1,46 @@
+llama.cpp (as fetched by Ollama v0.35.1, llama.cpp b11232, applied after
+137): flash_attn_combine_results writes 0 for a query row whose keys are
+all masked, as the CPU backend does, instead of 0/0.
+
+WHY
+---
+When a flash-attention kernel splits a head's keys over several blocks,
+each block writes a partial result with its running maximum and sum, and
+flash_attn_combine_results divides the weighted partial results by the
+weighted sums. A row whose keys are all masked has a sum of 0 in every part,
+so the combine computes 0/0 and writes NaN. The CPU backend writes 0 for
+such a row (S_inv = S == 0 ? 0 : 1/S), and so do the kernels when they do
+not split. test-backend-ops caught it on gfx803 with patch 130's prompt
+kernel: head size 128, 113 keys, a 512-query batch over two sequences,
+split because so few blocks fill the GPU, failed with NaN against the CPU's
+0 when it ran inside the full suite (alone it passed). In a model's
+prompt only padding rows are masked completely, and their output is not
+used, so no model run is known to be affected.
+
+The combine is generic code; the same 0/0 is reached on any GPU whose
+kernel splits a fully masked row.
+
+WHAT
+----
+The combine writes 0 when the weighted sum of a row is 0.
+
+Verified on an RX 590: test-backend-ops test -b ROCm0 -o FLASH_ATTN_EXT,
+with the head-96/128/256 prompt cases added, passes 6,555 of 6,555 (6,554
+without the patch: the case above). With the K/V split forced off for every
+case, the same suite passed without the patch, which places the NaN in the
+split path.
+
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -969,7 +969,9 @@
+         VKQ_denominator += KQ_max_scale * meta[l].y;
+     }
+ 
+-    dst[tid] = VKQ_numerator / VKQ_denominator;
++    // A row whose keys are all masked has l == 0 in every part; the CPU backend writes 0 for it, and 0/0 here
++    // would write NaN.
++    dst[tid] = VKQ_denominator > 0.0f ? VKQ_numerator / VKQ_denominator : 0.0f;
+ }
+ 
+ template <int DV, int ncols1, int ncols2>

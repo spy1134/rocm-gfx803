@@ -185,6 +185,12 @@ RUN CC=/opt/rocm/llvm/bin/clang CXX=/opt/rocm/llvm/bin/clang++ \
     && { grep -qF "lin % gqa + gqa*(lin/(gqa*gridDim.x))" \
              build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/fattn-gcn4-prompt.cuh \
          || { echo "136-gcn4-fattn-prompt-head-order.patch was not applied" >&2; exit 1; }; } \
+    && { grep -qF ne11_gemm \
+             build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/ggml-cuda.cu \
+         || { echo "137-gcn4-prompt-gemm-pad-tokens.patch was not applied" >&2; exit 1; }; } \
+    && { grep -qF "VKQ_denominator > 0.0f ? VKQ_numerator / VKQ_denominator : 0.0f" \
+             build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/fattn-common.cuh \
+         || { echo "138-fattn-combine-masked-row.patch was not applied" >&2; exit 1; }; } \
     && { grep -q ggml_backend_sched_prefetch_split \
              build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-backend.cpp \
          || { echo "108-moe-expert-prefetch.patch was not applied" >&2; exit 1; }; } \

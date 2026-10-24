@@ -1,0 +1,84 @@
+llama.cpp (as fetched by Ollama v0.35.1, llama.cpp b11232, applied after
+136): on gfx803, a prompt matmul that patch 106 sends through the fp32
+SGEMM is computed over a token count rounded up to a multiple of 128, when
+that adds at most a sixteenth. The results are the same bits.
+gfx803-specific: engages only on 106's GCN4 path.
+
+WHY
+---
+The base image's SGEMM shim runs its fastest fp32 tile (64x128, two
+wavefronts) only on whole 128-column tiles, and a column count that is not
+a multiple of 64 goes to an older tile. In a prompt matmul the columns are
+the batch's tokens, so every batch but the full ones misses it: Ollama runs
+a 2,800-token prompt as a 2,048- and a 752-token batch, and the 752 tokens
+of Qwen3 8B ran at 256 tok/s against 2,048-token batches at their full rate.
+
+WHAT
+----
+On 106's path the activations are already copied into padded rows; that
+copy now gets the rounded-up column count with the extra columns zeroed,
+the GEMM runs over all of them, and the product goes through 127's padded
+output buffer, whose 2D copy keeps only the real columns. A batch is padded
+only when that adds at most 1/16 of its columns (752 -> 768, 1,000 ->
+1,024), so the extra work stays below what the faster tile gains. The
+shim's tiles accumulate each output in the same order, so the real columns
+are the same bits.
+
+Result on an RX 590 (llama-bench, one batch of the given size, q8_0 KV
+cache, flash attention, tok/s):
+
+                          752 tokens         1000 tokens
+    Qwen3 8B Q4_K_M    256.1 -> 267.3     245.4 -> 262.3
+    Qwen3.5 9B         252.5 -> 266.7
+    2048-token batches unchanged (no padding); Qwen3.6 35B-A3B's tail batch
+    unchanged within noise (its prompt time is in the expert GEMM, 118)
+
+Logits over 752-token batches (llama-perplexity -c 752 -b 752 -ub 752,
+Qwen3.5 9B) are byte-identical with and without the patch.
+test-backend-ops test -b ROCm0 -o MUL_MAT passes (1301/1301).
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1512,11 +1512,23 @@
+         src1_ptr = src1_alloc.get();
+     }
+ 
++    // The image's SGEMM runs its fastest fp32 tile only on whole 128-column tiles and falls back to an
++    // older, slower tile for a column count that is not a multiple of 64, such as the 752-token tail of a
++    // 2800-token prompt in 2048-token batches. Where rounding the batch up to 128 columns adds at most a
++    // sixteenth, the product is computed over zero columns and the extra ones are dropped.
++    int64_t ne11_gemm = ne11;
+     if (gcn4_to_fp32_ld != nullptr && ne11 > 1) {
++        const int64_t ne11_up = (ne11 + 127)/128*128;
++        if (ne11_up != ne11 && 16*(ne11_up - ne11) <= ne11) {
++            ne11_gemm = ne11_up;
++        }
+         const int64_t ld = ne10 + 16;
+-        src1_pad.alloc(ld*ne11);
++        src1_pad.alloc(ld*ne11_gemm);
+         CUDA_CHECK(cudaMemcpy2DAsync(src1_pad.get(), ld*sizeof(cuda_t), src1_ptr, s11*sizeof(cuda_t), ne10*sizeof(cuda_t), ne11,
+             cudaMemcpyDeviceToDevice, main_stream));
++        if (ne11_gemm != ne11) {
++            CUDA_CHECK(cudaMemsetAsync(src1_pad.get() + ld*ne11, 0, ld*(ne11_gemm - ne11)*sizeof(cuda_t), main_stream));
++        }
+         src1_ptr = src1_pad.get();
+         s11 = ld;
+     }
+@@ -1583,12 +1595,12 @@
+     // apart. The product goes to padded columns and a 2D copy (0.65 ms) moves
+     // it to dst.
+     if (compute_type == GGML_TYPE_F32 && ne12 == 1 && ne13 == 1 && gcn4_to_fp32_ld != nullptr && ne11 > 1 &&
+-            (ne0*sizeof(float)) % 32768 == 0) {
+-        const int64_t ldd = ne0 + 16;
+-        ggml_cuda_pool_alloc<float> gcn4_dst_pad(ctx.pool(), ldd*ne11);
++            ((ne0*sizeof(float)) % 32768 == 0 || ne11_gemm != ne11)) {
++        const int64_t ldd = (ne0*sizeof(float)) % 32768 == 0 ? ne0 + 16 : ne0;
++        ggml_cuda_pool_alloc<float> gcn4_dst_pad(ctx.pool(), ldd*ne11_gemm);
+         CUBLAS_CHECK(
+             cublasSgemm(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
+-                    ne01, ne11, ne10,
++                    ne01, ne11_gemm, ne10,
+                     (const float *) alpha, (const float *) src0_ptr, s01,
+                                            (const float *) src1_ptr, s11,
+                     (const float *) beta,  gcn4_dst_pad.get(), ldd));
