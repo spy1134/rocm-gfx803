@@ -186,6 +186,7 @@ Open targets in recommended order, then the done ones.
 | SD-7 | Fused Winograd F(2x2, 3x3) | fp16 SD at most ~9 ms per step (2%); fp32 and training unmeasured | Open, low |
 | SD-1 | Winograd weight gradients | full fine-tuning and LoCon only | Open |
 | LLM-11 | Prompt attention at head sizes 96-256 | head size 128 on a gfx803 kernel (patch 130, Q in registers, 3.4-3.8 TFLOPS against 0.9-2.5): a 13,316-token prompt, Qwen2.5-Coder 7B 97.4 -> 65.8 s (attention 42.6 -> 10.7 s), Qwen3 8B 78.3 -> 74.6 s (21.1 -> 17.1 s). Head size 256, the full-attention layers of Qwen3.5/3.6 and Qwen3-Coder-Next (patch 131, Q split over 16 lanes, 16-key tiles): 1.5-2.1 -> 3.0-3.5 TFLOPS, 6-15x where the GQA ratio is 1 or odd; a 13,513-token prompt, Qwen3.5 9B 65.7 -> 62.5 s (attention 6.16 -> 3.57 s), Qwen3.6 35B-A3B through Ollama 29.8 -> 27.0 s | Open: splitting for the last wave, cheap since patch 136 |
+| LLM-12 | MoE generation: the hottest experts in VRAM instead of whole layers | the VRAM llama.cpp's fit gives to 8 whole layers of experts covers 20% of a token's expert reads; the 2,048 hottest experts across all layers would cover 64-73% | Open: design and measurement only (estimate +15-25% generation) |
 | PT-3 | Triton for gfx803: `torch.compile`, then vLLM | a capability rather than a speedup: `torch.compile` (inductor), Triton-based libraries (Unsloth, Liger, SageAttention, FlashAttention's AMD Triton backend) and vLLM need Triton, which the images do not build. Schaka/rocm-gfx803's ROCm 10 line has four hardware-verified Triton patches for a newer Triton; PyTorch 2.8 needs Triton 3.4, so three have to be ported and one is probably unneeded there. A plain Triton GEMM reached 0.59 TFLOPS there (the shim: 4-5), so tuning is most of the work | Open, not started |
 | LLM-3 | mmvq vs mmq for 9-16 tokens | speculative/parallel decoding | Open |
 | LLM-1b | SDWA dot product losses (2-token decode) | 1-11% on 2-token decode | Open, minor |
@@ -239,6 +240,12 @@ and padded copies, near the shim's best tile; the 32-, 256- and 512-row ones
 (about 0.9 s) at 0.5-3.2 TFLOPS. Nothing left here is a lever of more than
 a few percent on its own: a faster main GEMM tile (BLAS-7) would move the
 dense third, and the expert GEMM is bound by its staging (options below).
+
+**Tail batches.** The last batch of a prompt (752 tokens of a 2,800-token
+prompt) missed the shim's fast fp32 tile, which needs whole 128-column tiles;
+patch 137 pads it, which helps dense models (Qwen3 8B 752 tokens 256 -> 267
+tok/s) and leaves Qwen3.6's tail batch unchanged within noise, its time being
+the expert GEMM (118).
 
 **Options.**
 - Done: patch 117 runs GATED_DELTA_NET for prompt batches with head size
@@ -457,9 +464,15 @@ gate read in place (+0.7%). Patches 133-135 take about 0.8 ms of GPU time
 out of the token with the same bits out: reductions through DPP instead of
 `ds_bpermute` (top-k 14.9 -> 12.2 us), four DeltaNet state columns per wave
 (34.6 -> 23.4 us per layer) and the fp32 router's loop unrolled (20.5 ->
-17.6 us); through Ollama, generation medians 28.4 -> 29.2 tok/s. Still open:
-RMS norm with the multi-section rope (a fusion built for it found no
-matching node chain on the card).
+17.6 us); through Ollama, generation medians 28.4 -> 29.2 tok/s. Patch 116's
+MoE tail kernel takes 13.3 us per layer on one CU: run with one expert
+instead of eight it takes 8.9, so the experts' loads are 4.4 us and the rest
+is a single block's norm and quantize (a plain 1024-thread rms_norm takes
+6.6). Unrolling the expert loop and keeping h in registers both made it
+slower; a multi-block version needs the row's sum of squares across blocks
+(another dispatch or a grid barrier) and is worth at most ~0.3 ms per token.
+Still open: RMS norm with the multi-section rope (a fusion built for it
+found no matching node chain on the card).
 
 Placement and threads, measured (llama-bench, all shipped patches): keeping
 6 layers' experts in VRAM (`-ncmoe 34`) gives 28.3 tok/s against 25.9-26.0
@@ -932,6 +945,71 @@ attention 10.03 -> 9.76 ms per call at 8k depth; prompt speed unchanged).
   long prompt's GPU time in attention it is worth about 1%.
 - `flash_attn_combine_results` takes 1.1-1.4 ms per call at these sizes for
   every kernel; whether its stores camp the same way is unmeasured.
+
+### LLM-12: the hottest experts in VRAM
+
+**Why.** With most experts in system RAM, a Qwen3.6 35B-A3B token reads about
+0.56 GB of expert weights on the CPU (~16.7 ms at 82% of the DDR4 read rate),
+almost half of the token. llama.cpp places experts by whole layers
+(`-ncmoe`, and the fit Ollama runs keeps 8-9 layers' experts in VRAM when the
+card is free), and those layers' 256 experts get no more use than the others.
+Routing is skewed, so the same VRAM spent on each layer's most-used experts
+serves far more of a token's reads.
+
+**Measured** (`tools/skew.py` over the routing of 2,048 tokens of
+`kld_text.txt`, dumped per MUL_MAT_ID during a llama-perplexity run):
+
+| Experts in VRAM | Share of the expert reads they serve |
+| --- | --- |
+| 8 whole layers (2,048 experts) | 20% |
+| the 2,048 most-used (layer, expert) pairs | 72.6% |
+| the same, chosen on tokens 0-1023 and measured on 1024-2047 | 63.8% |
+| 12 whole layers / 3,072 most-used | 30% / 85% |
+
+Per layer, the 54 most-used of 256 experts take a median 76% of the
+selections (43-87%), and a median of 37 experts are never chosen in this
+text.
+
+**Estimate.** CPU expert time follows the share of reads left on the CPU:
+six resident layers (15%) gave +9% tok/s (28.3 against 25.9). At 64% instead
+of 20% the CPU side would shrink by about 7 ms per token, against about 2 ms
+more GPU work (the hot experts' matrix-vector products from VRAM), so
+roughly +15-25% generation over the fit's default. Not measured.
+
+**Design.**
+- A hot set per model: the most-used experts of each layer under a VRAM
+  budget, from a calibration run (counts per layer and expert, like
+  llama.cpp's imatrix tool collects activations) and stored beside the
+  model. A static set is the first step; the half-and-half split above
+  measures what it loses against an oracle (64% against 76%).
+- Per MoE layer, a GPU tensor holding the hot experts' gate, up and down
+  weights packed by slot, and a 256-entry table mapping an expert id to its
+  slot or to -1. The full expert tensors stay in host memory.
+- The router and top-k run on the GPU as now. A small kernel splits the
+  selected ids into hot (remapped to slots) and cold (marked -1 for the GPU
+  pass, kept for the CPU pass). The GPU runs MUL_MAT_ID over the hot slots
+  while the CPU runs it over the cold experts, whose kernel must skip ids
+  marked -1 (ggml-cpu groups rows by expert, so skipping is one check). The
+  weighted sum adds both parts; patch 116's tail kernel takes the CPU part as
+  it takes the expert outputs now.
+- The scheduler change is the large part: today one MUL_MAT_ID node runs on
+  one backend. Either the graph gets two nodes per expert product (hot on the
+  GPU, cold on the CPU) and an add, built by the model graph in
+  `qwen35moe.cpp` and `qwen3next.cpp` where 112 already reorders the MoE
+  block, or a new op does the split inside the backend.
+- Ollama: an option to enable it and a VRAM budget that its fit accounts for
+  (the hot set replaces resident whole layers).
+
+**Risks.** Results are not bit-identical to the CPU experts (the GPU
+quantizes activations to q8_1, the CPU to q8_K), as with resident layers
+today. Routing on chat and code, and on Qwen3-Coder-Next (512 experts, top
+10), is unmeasured; a hot set calibrated on one kind of text may serve
+another less well. The split adds one kernel and a GPU-CPU join per layer.
+
+**Next.** Dump routing from a few real conversations (the ids tensor of each
+MUL_MAT_ID, written from the CUDA backend in the format `tools/skew.py`
+reads) and measure coverage across topics; then prototype
+with a static hot set in llama-bench before any Ollama work.
 
 ### PT-3: Triton for gfx803
 
