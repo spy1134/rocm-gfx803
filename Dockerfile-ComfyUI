@@ -107,4 +107,8 @@ EXPOSE 8188
 
 # Copy the staged custom nodes into the mounted folder without overwriting
 # anything already there, then start ComfyUI.
-CMD ["sh", "-c", "cp -an /opt/staging_nodes/* /opt/ComfyUI/custom_nodes/ 2>/dev/null || true; exec python3 main.py --listen 0.0.0.0 --lowvram --use-split-cross-attention"]
+# --fp16-vae: ComfyUI otherwise decodes in fp32, where a 1024 px SDXL decode
+# runs out of memory on 8 GB and falls back to tiles (14.3 s against 3.4 s).
+# The original SDXL VAE overflows fp16 and decodes to black; a checkpoint
+# that carries it needs the fp16-fix SDXL VAE loaded with a Load VAE node.
+CMD ["sh", "-c", "cp -an /opt/staging_nodes/* /opt/ComfyUI/custom_nodes/ 2>/dev/null || true; exec python3 main.py --listen 0.0.0.0 --lowvram --use-split-cross-attention --fp16-vae"]

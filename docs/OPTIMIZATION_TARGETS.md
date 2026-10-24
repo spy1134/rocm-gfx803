@@ -102,7 +102,7 @@ op(B) = not transposed.
 
 ### SDXL inference
 
-Pony V6 (SDXL), 1024 px, CFG batch 2, fp16 UNet, the gfx803 node: one UNet
+An SDXL checkpoint, 1024 px, CFG batch 2, fp16 UNet, the gfx803 node: one UNet
 step 2.67 s. By kernel, before the two-wavefront TN tile (BLAS-7; step
 2.98 s then): the shim's GEMMs 2.23 s (75%), fused attention 0.50 s (17%),
 elementwise and norms 0.18 s, Winograd transforms 0.04 s; the fused
@@ -177,7 +177,7 @@ Open targets in recommended order, then the done ones.
 | LLM-8 | MoE generation with experts in system RAM | Qwen3.6 35B-A3B, 39 ms per token before patches 113-116 (25.6 tok/s, llama-bench with a cold page cache): CPU experts ~16.7 ms, GPU kernels ~12 ms, ~1,425 dispatches at ~4.3 us each (~6 ms), hand-offs ~3 ms; 113-116 remove up to 300 dispatches per token (25.60 -> 27.51 tok/s), 120-125 another 320 (+0.9%, +2.0%, +0.7%); CPU experts run at ~91% of practical DDR4 bandwidth (36.5 GB/s): strict thread pinning lost 21%, the AVX2 repacked layout gained nothing; 6-8 expert layers resident in VRAM give +9% (llama.cpp's fit does this by itself when the VRAM is free) | Open: RMS norm + multi-section rope fusion (did not fire) |
 | SD-10 | fp16 GroupNorm/SiLU and GEGLU in the node | the node's kernels take fp32 only, so ComfyUI's fp16 default runs neither; a few ms of a 342 ms step | Open, unmeasured |
 | SD-11 | ComfyUI time outside the UNet | 1.5 s of an 8.45 s warm SD 1.5 image with the service's `--lowvram`: CPU text encoder 0.33 s, VAE decode 0.93 s, model moves | Measured: `--highvram` 7.77 s, `--gpu-only` 7.63 s, per step unchanged; a flag choice (SDXL does not fit resident) |
-| SD-12 | SDXL VAE decode at 1024 px | 1024 px decode 14.3 s by default (regular decode runs out of memory, then tiles), 27.4 s at bf16 | Measured: an fp16-fix SDXL VAE decodes in 3.3-3.5 s untiled (PSNR 38-45 dB against the default); tiling explicitly 10.1 s; a workflow choice |
+| SD-12 | SDXL VAE decode at 1024 px | 1024 px decode 14.3 s in fp32 (regular decode runs out of memory, then tiles), 27.4 s at bf16 | Done: the comfyui image runs `--fp16-vae`; SDXL checkpoints that carry the fp16-fix VAE decode in 3.4 s untiled; the original SDXL VAE needs the fix VAE loaded instead |
 | SD-2 | Winograd F(4x4, 3x3) in the gfx803 HIP solver | estimate ~25 ms (7%) of an fp16 SD 1.5 step, more at SDXL; precision and small latents unknown | Open, estimate |
 | TRAIN-3 | Where a training step goes | ~2.65 s per optimizer step (4 images, fp16, checkpointing); fp16 NT GEMMs still run on the older tiles | Measured: forward 0.79 s, backward with recompute 1.7 s, AdamW 5 ms, host 33 ms per step; GEMM layout split next |
 | BLAS-7 | Shim GEMM efficiency at SD 1.5 / SDXL shapes | fp16 dispatch fixes, fp16 widening, a one-wavefront tile for batched NN and a two-wavefront TN tile took the SD 1.5 step 415 -> 355 ms, SDXL 3.34 -> 2.84 s; the two-wavefront tile also takes fp32 TN (8-23% faster at llama.cpp's prompt shapes and SD's fp32 linears); its 64x64 form for TN calls with few tiles and a padded copy of operands whose rows camp on one DRAM channel took the SDXL step 2.77 -> 2.67 s, bit-identical; left: a faster main tile | Open, measured |
@@ -601,7 +601,8 @@ resident saves 0.7-0.8 s of an SD 1.5 image. In `--gpu-only` mode a node
 returns before its GPU work ends, so the VAE and preview times absorb the
 sampler's tail; only the image totals compare. SD 1.5 fits fully resident
 on 8 GB; SDXL's UNet (~5 GB) beside its two text encoders does not, so the
-flags remain the user's choice per model.
+flags remain the user's choice per model. These decode times are fp32; with
+the image's `--fp16-vae` (SD-12) the SD 1.5 decode takes 0.38 s.
 
 ### SD-12: SDXL VAE decode
 
@@ -609,26 +610,41 @@ flags remain the user's choice per model.
 bf16 when tiled, against ~55 s for the 20 UNet steps. With `--bf16-vae` the
 convolutions run on im2col GEMMs (there is no bf16 Winograd and no bf16 shim
 tile), and ComfyUI falls back to tiled decoding when the regular decode runs
-out of memory.
+out of memory. Without a flag this ComfyUI decodes in fp32 on gfx803.
 
-**Measured** (the service's server, Illustrious-based SDXL checkpoint, 1024
-px, `--lowvram --use-split-cross-attention`, warm runs):
+**Measured** (the service's server, an SDXL checkpoint whose
+built-in VAE is the fp16-fix SDXL VAE, 1024 px, `--lowvram
+--use-split-cross-attention`, warm runs):
 
-| VAE and dtype | Decode | Peak card VRAM |
+| VAE dtype | Decode | Peak card VRAM |
 | --- | --- | --- |
-| checkpoint's VAE, fp32 (the default) | 14.3 s: the regular decode runs out of memory every time, then ComfyUI tiles | 7.1 GiB |
-| same, `VAEDecodeTiled` at 512 px tiles | 10.1 s | 7.1 GiB |
-| checkpoint's VAE, `--bf16-vae` | 27.4 s (tiled after the same failure) | 7.0 GiB |
-| fp16-fix SDXL VAE (`fixFP16ErrorsSDXLLowerMemoryUse_v10`), `--fp16-vae` | 3.3-3.5 s, untiled, no failure | 7.8 GiB |
+| fp32 (ComfyUI's choice without a flag) | 14.3 s: the regular decode runs out of memory every time, then ComfyUI tiles | 7.1 GiB |
+| fp32, `VAEDecodeTiled` at 512 px tiles | 10.1 s | 7.1 GiB |
+| `--bf16-vae` | 27.4 s (tiled after the same failure) | 7.0 GiB |
+| `--fp16-vae` | 3.3-3.5 s, untiled, no failure | 7.8 GiB |
 
-The default path loses about 4 s per image to the failed untiled attempt and
-the smaller fallback tiles. The fp16-fix VAE decodes in fp16 in a quarter
-of the time; its images differ
-from the default path's (same seeds, 12 steps): PSNR 38.1 and 45.5 dB, mean
-difference 0.8-2.0 of 255, part of which is the default path's tile seams.
-It peaks within a few hundred MiB of the card's 8 GiB, so with less VRAM
-free (a desktop playing video) it tiles too. Which VAE a workflow loads is
-the user's choice.
+The fp32 path loses about 4 s per image to the failed untiled attempt and the
+smaller fallback tiles. The fp16 decode of the same weights differs from it
+by PSNR 38.1 and 45.5 dB (same seeds, mean difference 0.8-2.0 of 255): fine
+texture grain and sub-pixel edge positions, part of it the fp32 path's tile
+seams; side by side the images cannot be told apart. It peaks within a few
+hundred MiB of the card's 8 GiB, so with less VRAM free (a desktop playing
+video) it tiles too.
+
+**Shipped.** The comfyui image starts ComfyUI with `--fp16-vae`. The flag
+applies to every VAE ComfyUI loads:
+
+- SDXL checkpoints that carry the fp16-fix SDXL VAE (many community
+  SDXL checkpoints do; compare the checkpoint's `first_stage_model.*`
+  tensors with the VAE file) decode in fp16 with no workflow change.
+- The original SDXL VAE overflows fp16 and decodes to an all-black image. A
+  checkpoint that carries it needs an fp16-fix SDXL VAE (for example
+  madebyollin/sdxl-vae-fp16-fix) loaded with a Load VAE node, or the
+  container started with `--fp32-vae` in place of `--fp16-vae`.
+- SD 1.5's VAE decodes a 512 px image in 0.38 s instead of 0.99 s, within 2
+  of 255 of the fp32 result (PSNR 62-64 dB).
+- VAEs of other model families (Flux, Qwen-Image, video VAEs) are untested
+  in fp16 here.
 
 ### SD-2: Winograd F(4x4, 3x3)
 
