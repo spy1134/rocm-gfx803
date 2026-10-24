@@ -176,10 +176,10 @@ Open targets in recommended order, then the done ones.
 | LLM-5 | Dense decode above the bandwidth bound | per 36 ms token: K-quant kernels ~2.9 ms, flash-attention decode ~2.6 ms at 5k depth, F16 `attn_v` ~1 ms, launches ~1 ms by fusion; the same kernels make up MoE generation's GPU part | Open, measured before the stale-L1 fix and patch 111 |
 | LLM-8 | MoE generation with experts in system RAM | Qwen3.6 35B-A3B, 39 ms per token before patches 113-116 (25.6 tok/s, llama-bench with a cold page cache): CPU experts ~16.7 ms, GPU kernels ~12 ms, ~1,425 dispatches at ~4.3 us each (~6 ms), hand-offs ~3 ms; 113-116 remove up to 300 dispatches per token (25.60 -> 27.51 tok/s), 120-125 another 320 (+0.9%, +2.0%, +0.7%); CPU experts run at ~91% of practical DDR4 bandwidth (36.5 GB/s): strict thread pinning lost 21%, the AVX2 repacked layout gained nothing; 6-8 expert layers resident in VRAM give +9% (llama.cpp's fit does this by itself when the VRAM is free) | Open: RMS norm + multi-section rope fusion (did not fire) |
 | SD-10 | fp16 GroupNorm/SiLU and GEGLU in the node | the node's kernels take fp32 only, so ComfyUI's fp16 default runs neither; a few ms of a 342 ms step | Open, unmeasured |
-| SD-11 | ComfyUI time outside the UNet | 1.7 s of an 8.5 s warm SD 1.5 image (2.7 of 10.5 s without the node) | Open, unmeasured |
-| SD-12 | SDXL VAE decode at 1024 px | 12-25 s of an 83-99 s image, by VAE precision | Open, measured end to end |
+| SD-11 | ComfyUI time outside the UNet | 1.5 s of an 8.45 s warm SD 1.5 image with the service's `--lowvram`: CPU text encoder 0.33 s, VAE decode 0.93 s, model moves | Measured: `--highvram` 7.77 s, `--gpu-only` 7.63 s, per step unchanged; a flag choice (SDXL does not fit resident) |
+| SD-12 | SDXL VAE decode at 1024 px | 1024 px decode 14.3 s by default (regular decode runs out of memory, then tiles), 27.4 s at bf16 | Measured: an fp16-fix SDXL VAE decodes in 3.3-3.5 s untiled (PSNR 38-45 dB against the default); tiling explicitly 10.1 s; a workflow choice |
 | SD-2 | Winograd F(4x4, 3x3) in the gfx803 HIP solver | estimate ~25 ms (7%) of an fp16 SD 1.5 step, more at SDXL; precision and small latents unknown | Open, estimate |
-| TRAIN-3 | Where a training step goes | unmeasured; fp16 NT GEMMs still run on the older tiles | Open, profile first |
+| TRAIN-3 | Where a training step goes | ~2.65 s per optimizer step (4 images, fp16, checkpointing); fp16 NT GEMMs still run on the older tiles | Measured: forward 0.79 s, backward with recompute 1.7 s, AdamW 5 ms, host 33 ms per step; GEMM layout split next |
 | BLAS-7 | Shim GEMM efficiency at SD 1.5 / SDXL shapes | fp16 dispatch fixes, fp16 widening, a one-wavefront tile for batched NN and a two-wavefront TN tile took the SD 1.5 step 415 -> 355 ms, SDXL 3.34 -> 2.84 s; the two-wavefront tile also takes fp32 TN (8-23% faster at llama.cpp's prompt shapes and SD's fp32 linears); its 64x64 form for TN calls with few tiles and a padded copy of operands whose rows camp on one DRAM channel took the SDXL step 2.77 -> 2.67 s, bit-identical; left: a faster main tile | Open, measured |
 | SD-9 | SDXL attention | P now moves between lanes inside the multiply-adds (DPP): SDXL step attention 0.50 -> 0.42 s (step 2.84 -> 2.75 s), SD 1.5 91 -> 79 ms (step 355 -> 342 ms); self-attention at ~4 TFLOPS against ~5.4 for its instruction mix | Open, measured |
 | LLM-10 | Image prompts | a 1080p image (2061 tokens) took 50.4 s against 8.8 s for 2028 text tokens (Qwen3.5 9B), 38.7 s of it the vision encoder's attention at 0.21 TFLOPS; patch 128 (narrower, non-spilling one-head-per-K/V tiles): 18.7 s; patch 129 (gfx803 attention kernel for head sizes 40-80, 3.5 TFLOPS): 14.2 s; Qwen3.6 35B-A3B through Ollama 51.7 -> 14.0 -> 9.6 s. patch 132 (the encoder's fp16 projections in fp32 compute, on the shim, which also removes their fp16-accumulation error of about 1% RMS): 13.6 s (13.4 s through Ollama). What is left (9B, rocprof): the image tokens' own prefill (~6.6 s, the same rate as text), the encoder's attention (~2.4 s) | Open: the rest is text-rate prefill (LLM-6) and the encoder's attention |
@@ -564,33 +564,58 @@ shapes, and a ComfyUI image against the previous build.
 
 ### SD-11: ComfyUI time outside the UNet
 
-**Why.** A warm 20-step SD 1.5 image at 512 px takes 8.5 s with the node, of
-which the 20 UNet steps are 6.8 s; without the node 10.5 s, of which 7.8 s.
-The other 1.7 or 2.7 s are the text encoder, the VAE decode, the model moves
-of `--lowvram` (the comfyui image's default), and ComfyUI's own work, in
-unknown shares. Why the remainder is 1 s shorter with the node is not known
-either.
+**Why.** A warm 20-step SD 1.5 image at 512 px took 8.5 s with the node, of
+which the 20 UNet steps were 6.8 s. The rest was the text encoder, the VAE
+decode, the model moves of `--lowvram` (the comfyui image's default) and
+ComfyUI's own work, in unknown shares.
 
-**Measure.** Time the text encoder, the sampler and the VAE decode
-separately (the in-process harness in "Measuring"), and compare `--lowvram`
-with `--normalvram`: SD 1.5's fp16 UNet is 1.7 GB and fits beside its VAE and
-text encoder on 8 GB. SDXL's (~5 GB) is a separate measurement. The service's
-flags are the user's choice; this target measures what they cost.
+**Measured** (the service's server in a container, a txt2img workflow sent to
+its API, node times from its WebSocket events; 20 and 2 steps, which
+separates the per-step from the fixed cost; warm images, new seed and prompt
+each):
+
+| Flags | Image | Per step | Fixed | Text encoder | VAE decode |
+| --- | --- | --- | --- | --- | --- |
+| `--lowvram` (the service) | 8.45 s | 0.347 s | 1.51 s | 0.33 s (CPU) | 0.93 s |
+| none (normal VRAM) | 8.28 s | 0.345 s | 1.38 s | 0.12 s | 1.00 s |
+| `--highvram` | 7.77 s | 0.344 s | 0.89 s | 0.11 s | 0.69 s |
+| `--gpu-only` | 7.63 s | 0.345 s | 0.73 s | 0.07 s | (async) |
+
+The UNet steps cost the same in every mode. With `--lowvram` this ComfyUI
+runs the text encoder on the CPU, and every mode but `--gpu-only` moves the
+VAE and text encoder in and out of VRAM for each image; keeping them
+resident saves 0.7-0.8 s of an SD 1.5 image. In `--gpu-only` mode a node
+returns before its GPU work ends, so the VAE and preview times absorb the
+sampler's tail; only the image totals compare. SD 1.5 fits fully resident
+on 8 GB; SDXL's UNet (~5 GB) beside its two text encoders does not, so the
+flags remain the user's choice per model.
 
 ### SD-12: SDXL VAE decode
 
-**Why.** Decoding a 1024 px SDXL latent takes 12.2 s at fp32 and 24.6 s at
+**Why.** Decoding a 1024 px SDXL latent took 12.2 s at fp32 and 24.6 s at
 bf16 when tiled, against ~55 s for the 20 UNet steps. With `--bf16-vae` the
-convolutions run on im2col GEMMs (there is no bf16 Winograd and no bf16
-shim tile), and ComfyUI falls back to tiled decoding when the regular decode
-runs out of memory, on some images and not others (SDXL inference above).
+convolutions run on im2col GEMMs (there is no bf16 Winograd and no bf16 shim
+tile), and ComfyUI falls back to tiled decoding when the regular decode runs
+out of memory.
 
-**Measure.** The decode's time by convolution shape and solver
-(`MIOPEN_ENABLE_LOGGING_CMD=1`), with and without tiling, at bf16, fp16 and
-fp32, and its peak VRAM. Then the options: fp16 storage on the fp16
-Winograd solver and shim tiles (if the VAE's activations stay in fp16 range,
-which SDXL's VAE is known not to do everywhere), or a tiled fp32 decode with
-less overlap.
+**Measured** (the service's server, Illustrious-based SDXL checkpoint, 1024
+px, `--lowvram --use-split-cross-attention`, warm runs):
+
+| VAE and dtype | Decode | Peak card VRAM |
+| --- | --- | --- |
+| checkpoint's VAE, fp32 (the default) | 14.3 s: the regular decode runs out of memory every time, then ComfyUI tiles | 7.1 GiB |
+| same, `VAEDecodeTiled` at 512 px tiles | 10.1 s | 7.1 GiB |
+| checkpoint's VAE, `--bf16-vae` | 27.4 s (tiled after the same failure) | 7.0 GiB |
+| fp16-fix SDXL VAE (`fixFP16ErrorsSDXLLowerMemoryUse_v10`), `--fp16-vae` | 3.3-3.5 s, untiled, no failure | 7.8 GiB |
+
+The default path loses about 4 s per image to the failed untiled attempt and
+the smaller fallback tiles. The fp16-fix VAE decodes in fp16 in a quarter
+of the time; its images differ
+from the default path's (same seeds, 12 steps): PSNR 38.1 and 45.5 dB, mean
+difference 0.8-2.0 of 255, part of which is the default path's tile seams.
+It peaks within a few hundred MiB of the card's 8 GiB, so with less VRAM
+free (a desktop playing video) it tiles too. Which VAE a workflow loads is
+the user's choice.
 
 ### SD-2: Winograd F(4x4, 3x3)
 
@@ -617,16 +642,25 @@ on every SD 1.5 conv shape at fp16 and fp32. Independent of SD-7.
 
 ### TRAIN-3: where a training step goes
 
-**Why.** The fp16 step is 2.47 s (512 px, 4 accumulated images, gradient
-checkpointing). SD-8 took attention out of the picture, and nothing records
-where the rest goes: the forward, the checkpointed recompute, the backward,
-AdamW, data loading. The fp16 NT GEMMs of the backward (26% of the GEMM
-FLOPs at 384 px) run on the older 16x16-thread tiles: the one- and
+**Why.** The fp16 step is about 2.5 s (512 px, 4 accumulated images,
+gradient checkpointing). SD-8 took attention out of the picture, and the
+split between the forward, the checkpointed recompute, the backward, AdamW
+and data loading was not recorded. The fp16 NT GEMMs of the backward (26% of
+the GEMM FLOPs at 384 px) run on the older 16x16-thread tiles: the one- and
 two-wavefront tiles of BLAS-7 serve fp16 batched NN and TN only.
 
-**Measure.** CUDA events around the phases of a steady step, and the shim's
-call log (`GFX803_SGEMM_SHIM_VERBOSE`) for one step's GEMMs by layout and
-shape, timed at sustained clocks.
+**Measured** (`gfx803-train` on the Sherlock set, CUDA events around sd-scripts'
+UNet forward, accelerate's backward and AdamW's step, steady steps after
+MIOpen's per-bucket Find; per optimizer step of four images): UNet forwards
+0.79 s, backwards 1.70-1.73 s (each includes the checkpointed recompute of
+its forward, so the backward proper is about 0.9 s), AdamW 5 ms, host time
+from one step's end to the next forward 33 ms; the remaining ~0.15 s of a
+~2.65 s step is the frozen text encoder and the loss. The step is GPU work
+in the UNet's forward and backward; the optimizer and data loading are
+negligible. A step that meets a new bucket size spends 6-8 s more in MIOpen's
+Find (backward 8-10 s). Next: the shim's call log
+(`GFX803_SGEMM_SHIM_VERBOSE`) for one step's GEMMs by layout and shape, to
+size the NT share against the convolutions.
 
 ### BLAS-7: shim GEMM efficiency at SD shapes
 
@@ -1544,7 +1578,12 @@ matmul (4096x14336) goes from 233 to 224 us for one column and from 287 to
 - **Older kernel figures.** The TFLOPS figures in BLAS-1 to BLAS-6 and in
   BLAS-7's ablations are short timings that ran at the boost clock: compare
   them with each other, not with sustained figures, which read 10-20% lower.
-- **SD harness.** ComfyUI can run in-process: put `/opt/ComfyUI` on
+- **SD harness.** For end-to-end timing use the server: run the comfyui
+  image's `main.py` with the flags under test, post an API-format workflow to
+  `/prompt` and read the node times from the `executing` events on `/ws`.
+  In-process runs (below) skip `main.py`'s allocator setup and run out of
+  memory in the VAE decode of a 512 px SD 1.5 image after sampling, which the
+  server does not. ComfyUI can also run in-process: put `/opt/ComfyUI` on
   `sys.path`, set `sys.argv` to ComfyUI's flags, call
   `comfy.options.enable_args_parsing()`, load with
   `nodes.CheckpointLoaderSimple().load_checkpoint(...)`, and use
