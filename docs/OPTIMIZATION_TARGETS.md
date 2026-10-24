@@ -970,6 +970,20 @@ Per layer, the 54 most-used of 256 experts take a median 76% of the
 selections (43-87%), and a median of 37 experts are never chosen in this
 text.
 
+Across kinds of text (2,048 tokens each of prose, technical English and C++
+source; the 2,048 hottest experts chosen on one and measured on another):
+
+| Chosen on \ served | prose | technical | code |
+| --- | --- | --- | --- |
+| prose | 72.6% | 68.8% | 46.5% |
+| technical | 70.4% | 71.5% | 45.3% |
+| code | 45.4% | 43.8% | 69.5% |
+| all three pooled | 70.7% | 69.1% | 55.8% |
+
+Prose and technical text share their hot experts; code uses others. A set
+pooled over several kinds of text still serves more than twice what whole
+layers do on every one of them.
+
 **Estimate.** CPU expert time follows the share of reads left on the CPU:
 six resident layers (15%) gave +9% tok/s (28.3 against 25.9). At 64% instead
 of 20% the CPU side would shrink by about 7 ms per token, against about 2 ms
@@ -1002,13 +1016,13 @@ roughly +15-25% generation over the fit's default. Not measured.
 
 **Risks.** Results are not bit-identical to the CPU experts (the GPU
 quantizes activations to q8_1, the CPU to q8_K), as with resident layers
-today. Routing on chat and code, and on Qwen3-Coder-Next (512 experts, top
-10), is unmeasured; a hot set calibrated on one kind of text may serve
-another less well. The split adds one kernel and a GPU-CPU join per layer.
+today. A hot set serves code less well when calibrated on prose (46% against
+70%), so the calibration text matters; a pooled set gives 56-71%. Chat
+routing and Qwen3-Coder-Next (512 experts, top 10) are unmeasured. The split adds one kernel and a GPU-CPU join per layer.
 
-**Next.** Dump routing from a few real conversations (the ids tensor of each
-MUL_MAT_ID, written from the CUDA backend in the format `tools/skew.py`
-reads) and measure coverage across topics; then prototype
+**Next.** Dump routing from real conversations (the ids tensor of each
+MUL_MAT_ID in a prompt batch, written from the CUDA backend in the format
+`tools/skew.py` reads) to choose the calibration set; then prototype
 with a static hot set in llama-bench before any Ollama work.
 
 ### PT-3: Triton for gfx803
