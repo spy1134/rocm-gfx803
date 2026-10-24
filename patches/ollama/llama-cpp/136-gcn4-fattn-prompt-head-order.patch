@@ -55,8 +55,9 @@ with and without the patch.
 Verified on an RX 590: test-backend-ops test -b ROCm0 -o FLASH_ATTN_EXT,
 with the head-96/128/256 prompt cases added (6,555 in all), gives the same
 result with and without the patch: all pass but one, head 128 with 113 keys
-and two sequences, where a fully masked row comes out NaN instead of 0, and
-only when the case runs after others (alone it passes).
+and two sequences, where a fully masked row comes out NaN instead of 0 when
+the KV range is split. That failure is in the split-result combine, not in
+this kernel; patch 138 fixes it, and with both all 6,555 pass.
 
 To reproduce, build llama.cpp b11232 with GGML_HIP=ON and
 AMDGPU_TARGETS=gfx803, then with and without the patch:
