@@ -67,12 +67,24 @@ RUN cmake -S llama/server --preset cpu \
     && { grep -q GGML_SCHED_PREFETCH_SLOTS \
              build/llama-server-cpu/_deps/llama_cpp-src/ggml/src/ggml-backend.cpp \
          || { echo "126-moe-prefetch-slots.patch was not applied" >&2; exit 1; }; } \
+    && { grep -q GGML_SCHED_ASYNC_HOST_COPY \
+             build/llama-server-cpu/_deps/llama_cpp-src/ggml/src/ggml-backend.cpp \
+         || { echo "139-sched-async-host-copies.patch was not applied" >&2; exit 1; }; } \
+    && { grep -q llama_moe_hot_load \
+             build/llama-server-cpu/_deps/llama_cpp-src/src/llama-model.cpp \
+         && grep -q moe_hot_path \
+             build/llama-server-cpu/_deps/llama_cpp-src/common/fit.cpp \
+         || { echo "140-moe-hot-experts.patch was not applied" >&2; exit 1; }; } \
     && cmake --build build/llama-server-cpu --parallel "$(nproc)" \
     && cmake --install build/llama-server-cpu --component llama-server --strip \
     && { grep -q GGML_SCHED_EXPERT_PREFETCH dist/lib/ollama/libggml-base.so.0.* \
          && grep -q GGML_SCHED_EARLY_HOST_INPUTS dist/lib/ollama/libggml-base.so.0.* \
          && grep -q GGML_SCHED_PREFETCH_SLOTS dist/lib/ollama/libggml-base.so.0.* \
-         || { echo "the installed libggml-base.so lacks the scheduler patches" >&2; exit 1; }; }
+         && grep -q GGML_SCHED_ASYNC_HOST_COPY dist/lib/ollama/libggml-base.so.0.* \
+         || { echo "the installed libggml-base.so lacks the scheduler patches" >&2; exit 1; }; } \
+    && { grep -q "hot experts of" dist/lib/ollama/libllama.so.0.* \
+         || { echo "the installed libllama.so lacks 140-moe-hot-experts.patch" >&2; exit 1; }; } \
+    && install -m 755 build/llama-server-cpu/bin/llama-imatrix dist/lib/ollama/
 
 # Ollama applies every *.patch under llama/compat to the llama.cpp source it
 # fetches, in filename order. Copied here rather than before the CPU build: these
@@ -194,6 +206,9 @@ RUN CC=/opt/rocm/llvm/bin/clang CXX=/opt/rocm/llvm/bin/clang++ \
     && { grep -q ggml_backend_sched_prefetch_split \
              build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-backend.cpp \
          || { echo "108-moe-expert-prefetch.patch was not applied" >&2; exit 1; }; } \
+    && { grep -q "this expert runs on another device" \
+             build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/mmvq.cu \
+         || { echo "141-mmvq-skip-unselected-expert.patch was not applied" >&2; exit 1; }; } \
     && cmake --build build/llama-server-rocm_v7_2 --parallel "$(nproc)" \
     && cmake --install build/llama-server-rocm_v7_2 --component llama-server --strip
 
@@ -248,6 +263,15 @@ ENV HSA_ENABLE_SDMA=1
 # wait out of the SDMA queue; prompt speed with expert prefetch is unchanged
 # and greedy output identical (docs/FINDINGS.md, section 3).
 ENV ROC_CPU_WAIT_FOR_SIGNAL=1
+# With a MoE model's experts in system RAM, every layer of a generated token
+# waits for the CPU and then starts the GPU again, so the GPU's start latency
+# is on the critical path 40 times per token. A replayed HIP graph starts its
+# first kernel later than kernels launched one by one: Qwen3.6 35B-A3B with
+# hot experts (patch 140) generates 39.2 instead of 36.6 tok/s, with whole
+# layers in VRAM 33.8 instead of 33.2. Models fully in VRAM, where the CPU
+# launches ahead of the GPU, are unchanged (Qwen3 8B 31.6 both ways, Qwen3.5
+# 9B 34.3 against 34.4).
+ENV GGML_CUDA_DISABLE_GRAPHS=1
 EXPOSE 11434
 ENTRYPOINT ["/usr/bin/ollama"]
 CMD ["serve"]

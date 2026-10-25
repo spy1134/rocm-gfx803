@@ -456,6 +456,40 @@ counting its memory in the margin left Qwen3.6 35B-A3B 1.6 GB of the card and
 15 tok/s; subtracting it gives 4.4 GB and 24.6 tok/s, with the card at 7.5 of
 8 GB and speech requests still working.
 
+**Hot experts.** A MoE model too large for the card keeps its routed experts
+in system RAM, where the CPU computes them, and the fit fills the VRAM left
+after the rest of the model with whole layers of experts. A generated token
+selects a few experts per layer, and some experts are selected far more
+often than others, so the same VRAM serves more of a token's expert reads
+when it holds every layer's most-used experts (patch 140): for Qwen3.6
+35B-A3B, 3.6 GB of whole layers serve 20% of a chat's selections, the same
+memory as hot experts 50%. A model uses this when `ollama/moe-hot/` holds a
+list for it, named after its blob (`sha256-<digest>.hot`); `start-ollama.sh`
+passes the folder to the server, and models without a list load as before.
+`tools/moe_hot_calibrate.py MODEL` makes the list: with the service stopped,
+it has the model answer the chat prompts in `tools/moe_hot_prompts.json`
+and counts with llama-imatrix which experts each layer selects over those
+transcripts (about 10 minutes for the 35B; `--prompts
+tools/moe_hot_prompts_code.json` for a coding model). The list has to come
+from chat: a list chosen on plain document text serves only 19-27% of a
+chat's selections.
+
+Qwen3.6 35B-A3B through Ollama at its 32k context, ten chat prompts not used
+to choose the list: 28.9 -> 35.7 tok/s (3.4 GB of hot experts; 30.7 with this
+image but no list). A model gains only when its dense weights and context
+leave VRAM over: Qwen3-Coder-Next at a 32k context 22.8 -> 24.5 tok/s, at its
+256k context nothing is left, and the fit places layers as before. Answers
+differ slightly from experts computed on the CPU, as they already do for
+resident layers (the GPU and CPU quantize an expert's input differently).
+
+**HIP graphs off.** The image sets `GGML_CUDA_DISABLE_GRAPHS=1`. With experts
+in system RAM every layer of a generated token waits for the CPU and then
+starts the GPU again, 40 times per token for Qwen3.6 35B-A3B, and a replayed
+HIP graph starts its first kernel later than kernels launched one by one:
+39.2 instead of 36.6 tok/s with hot experts, 33.8 instead of 33.2 with whole
+layers. Models that fit the card are unchanged (Qwen3 8B 31.6 tok/s either
+way, Qwen3.5 9B 34.3 against 34.4).
+
 ### Patches
 
 `patches/ollama/llama-cpp/` holds llama.cpp patches. Ollama applies every
@@ -567,6 +601,24 @@ measurements and a reproduction. In short:
   Where llama.cpp's fit keeps some experts in VRAM, the extra slot moves
   about 290 MiB of them back to RAM, so those run on the CPU and the greedy
   text can differ from a 2-slot run at a near-tie.
+- **139-sched-async-host-copies.patch**: with experts in system RAM, every
+  layer of a generated token hands the FFN input and the expert ids to the
+  CPU and takes the CPU's output back; the scheduler did each of those copies
+  as a blocking copy, and waited for the whole GPU stream before handing the
+  output back. The copies now go on the GPU stream (the CPU's compute buffer
+  is pinned memory), and each side waits for one event. Nothing is computed
+  differently (logits byte-identical). Qwen3.6 35B-A3B through llama-server,
+  ten chat prompts: generation 31.5 -> 33.2 tok/s with the fit's whole
+  layers in VRAM, 28.8 -> 30.9 with every expert in RAM.
+- **140-moe-hot-experts.patch** (and **141-mmvq-skip-unselected-expert.patch**,
+  its HIP part): the hot experts above. The fit gives the hot experts the
+  VRAM it would have filled with whole layers; for a one-token batch the
+  device runs a token's selected experts that are hot, the CPU the others
+  (each side skips the ids of the other's, written as -1), and the outputs
+  are added. With a list holding all experts of the last 8 layers the logits
+  are byte-identical to keeping those layers in VRAM. Qwen3.6 35B-A3B through
+  llama-server, ten chat prompts not used to choose the list, 400 tokens
+  each, with 139: whole layers 33.8 tok/s, hot experts (3.8 GB) 39.2.
 - **127-gcn4-cublas-dst-pad.patch**: 106 pads the weight and activation rows
   of a prompt matmul, but the output kept its natural stride, and with 8192
   rows (Qwen3.6's DeltaNet input projection) the output's columns lie 32 KiB
@@ -682,7 +734,7 @@ measurements and a reproduction. In short:
   fusions, each taken only where its inputs allow it and otherwise falling
   back to the separate kernels, remove up to 300 per token on that model with
   unchanged arithmetic. All four together, llama-bench with every expert in
-  RAM: 25.60 -> 27.51 tok/s (HIP graphs on, the default), 26.21 -> 27.93
+  RAM: 25.60 -> 27.51 tok/s with HIP graphs on, 26.21 -> 27.93
   with graphs off; greedy output byte-identical and perplexity equal in
   every digit (KL divergence 0). Through Ollama (2,800-token prompt, beside
   the text-to-speech server with the desktop up): generation 22.7 -> 24.2

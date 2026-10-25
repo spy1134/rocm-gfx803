@@ -60,6 +60,7 @@ Measured on an RX 590 8 GB with the current images.
 | Qwen2.5-Coder 7B, 13,300-token prompt, then generation | 56 s, then 29 tokens/s |
 | Qwen3.5 9B, 13,500-token prompt, then generation | 55 s, then 31 tokens/s |
 | Qwen3.6 35B-A3B (MoE, experts in system RAM), 13,500-token prompt, then generation | 26 s, then 25 tokens/s |
+| Qwen3.6 35B-A3B chat generation with its most-used experts in VRAM (Ollama, 32k context) | 36 tokens/s |
 | A 1080p image as a prompt (Qwen3.5 9B / Qwen3.6 35B-A3B) | 13.4 s / 9.4 s |
 
 Against the same software without this project's fixes:
@@ -92,7 +93,8 @@ has the measurements behind each change and what could still get faster.
   compute from registers in fp32, without the large score matrices.
 - **Language models.** Prompts use fp32 GEMMs instead of emulated int8 dot
   products; MoE models copy their experts to the card in the background while
-  it computes; generation kernels were rewritten to avoid register spills.
+  it computes, and keep their most-used experts in VRAM for generation;
+  generation kernels were rewritten to avoid register spills.
 
 ## What this fixes
 

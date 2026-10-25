@@ -1,0 +1,177 @@
+llama.cpp (as fetched by Ollama v0.35.1, llama.cpp b11232, applied after
+126): the hand-off between a device split and a host split runs on the
+device stream instead of in blocking copies, so the host waits once per
+hand-off instead of once per tensor. Not gfx803-specific code; measured on
+gfx803.
+
+WHY
+---
+With a MoE model's routed experts in system RAM, every layer of a
+generated token hands work from the GPU to the CPU and back: the CPU split
+reads the FFN input and the expert ids from the GPU, and the next GPU split
+reads the CPU's expert outputs. The scheduler copied each such tensor with
+a blocking copy: the CPU split waited for the head event (patch 112), then
+synchronized a separate device-to-host copy per input, and the GPU split
+after it waited for the whole device stream before a blocking
+host-to-device copy, and only then launched its kernels. On an RX 590 that
+is tens of microseconds per layer on the critical path, 40 layers per
+token, while both sides wait for each other.
+
+WHAT
+----
+- Right after the head of a device split that is followed by a host split,
+  the host split's inputs that this device computed are queued as
+  asynchronous device-to-host copies on the device stream, before the
+  head's event is recorded. The host split then waits for that one event
+  and copies nothing itself. The CPU backend's compute buffer is the
+  device's pinned host buffer (llama_context picks it), so the copies are
+  truly asynchronous.
+- A device split's input computed by the CPU is queued as an asynchronous
+  host-to-device copy on the device stream, without waiting for the
+  device first: the stream orders the copy after the device's earlier use
+  of the destination and before the kernels that read it, and the CPU
+  wrote the source synchronously. An event is recorded after the copy, and
+  any later host split waits for it before it computes, because the
+  allocator may hand the copy's source memory to that split's tensors.
+
+Nothing is computed differently. GGML_SCHED_ASYNC_HOST_COPY=0 restores the
+blocking copies.
+
+VERIFIED ON REAL HARDWARE (RX 590, Qwen3.6 35B-A3B heretic Q4_K_M):
+- llama-perplexity, 2 chunks of 512 at -ub 1 (every token a one-token
+  decode), routed experts in system RAM: logits byte-identical to the
+  blocking copies, with and without hot experts (patch 140).
+- llama-server, ten chat prompts not used for anything else, 400 greedy
+  tokens each, generation tok/s (mean): with llama.cpp's fit placing whole
+  layers of experts in VRAM 31.5 -> 33.2; all experts in RAM (-ncmoe 99)
+  28.8 -> 30.9; with hot experts and HIP graphs off 36.6 -> 39.7. Per
+  token, the CPU's wait for its inputs fell from 9.0 to 7.5 ms and the
+  GPU's wait for the CPU's output from 3.4 to 2.7 ms.
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -859,6 +859,15 @@
+     int                   host_inputs_split[GGML_SCHED_MAX_BACKENDS]; // split the event is recorded for, -1 = none
+     ggml_backend_event_t  tail_done[GGML_SCHED_MAX_BACKENDS];
+     bool                  tail_pending[GGML_SCHED_MAX_BACKENDS];      // tail_done follows the last work on the stream
++
++    // host split inputs already queued on the device stream after the head: split, and a bit per input
++    bool                  async_host_copy;
++    int                   early_copy_split;
++    uint64_t              early_copy_mask;
++    // device inputs queued for upload from host memory: a host split waits for them before it computes,
++    // since it may reuse that memory
++    ggml_backend_event_t  upload_done[GGML_SCHED_MAX_BACKENDS];
++    bool                  upload_pending[GGML_SCHED_MAX_BACKENDS];
+ };
+ 
+ #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
+@@ -1922,7 +1931,10 @@
+     for (int b = 0; b < sched->n_backends; b++) {
+         sched->host_inputs_split[b] = -1;
+         sched->tail_pending[b]      = false;
++        sched->upload_pending[b]    = false;
+     }
++    sched->early_copy_split = -1;
++    sched->early_copy_mask  = 0;
+ 
+     {
+         const int first = ggml_backend_sched_next_prefetch_split(sched, 0);
+@@ -1946,6 +1958,15 @@
+             }
+         }
+ 
++        if (ggml_backend_buft_is_host(sched->bufts[split_backend_id])) {
++            for (int b = 0; b < sched->n_backends; b++) {
++                if (sched->upload_pending[b]) {
++                    ggml_backend_event_synchronize(sched->upload_done[b]);
++                    sched->upload_pending[b] = false;
++                }
++            }
++        }
++
+         // copy the input tensors to the split backend
+         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
+@@ -1956,6 +1977,23 @@
+                 continue; // copied by ggml_backend_sched_prefetch_split
+             }
+ 
++            if (split_id == sched->early_copy_split && input_id < 64 && (sched->early_copy_mask >> input_id) & 1) {
++                ggml_backend_event_synchronize(sched->host_inputs_ready[ggml_backend_sched_backend_id(sched, input_backend)]);
++                continue; // queued on the device stream after the head that computes it
++            }
++
++            // a device split's input computed by the CPU: queued on the device stream, which orders it after the
++            // device's earlier use of the copy and before the device's next use; the CPU wrote it synchronously
++            if (sched->async_host_copy && sched->upload_done[split_backend_id] && !(input->flags & GGML_TENSOR_FLAG_INPUT) &&
++                input->buffer && ggml_backend_buffer_is_host(input->buffer) &&
++                ggml_backend_buffer_get_usage(input->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
++                split_backend->iface.set_tensor_async) {
++                ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
++                ggml_backend_event_record(sched->upload_done[split_backend_id], split_backend);
++                sched->upload_pending[split_backend_id] = true;
++                continue;
++            }
++
+             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+@@ -2101,6 +2139,26 @@
+             if (ec != GGML_STATUS_SUCCESS) {
+                 return ec;
+             }
++            // the host split's inputs computed here go to it on the device stream: the host then waits for one
++            // event instead of synchronizing a copy per input
++            sched->early_copy_split = -1;
++            sched->early_copy_mask  = 0;
++            if (sched->async_host_copy && split_backend->iface.get_tensor_async) {
++                const struct ggml_backend_sched_split * next = &splits[split_id + 1];
++                for (int i = 0; i < next->n_inputs && i < 64; i++) {
++                    struct ggml_tensor * in = next->inputs[i];
++                    if ((in->flags & GGML_TENSOR_FLAG_INPUT) || ggml_backend_sched_is_host_weight(in) ||
++                        ggml_backend_sched_get_tensor_backend(sched, in) != split_backend) {
++                        continue;
++                    }
++                    struct ggml_tensor * in_cpy = tensor_copy(in, next->backend_id, sched->cur_copy);
++                    ggml_backend_tensor_get_async(split_backend, in, in_cpy->data, 0, ggml_nbytes(in));
++                    sched->early_copy_mask |= (uint64_t) 1 << i;
++                }
++                if (sched->early_copy_mask) {
++                    sched->early_copy_split = split_id + 1;
++                }
++            }
+             ggml_backend_event_record(sched->host_inputs_ready[split_backend_id], split_backend);
+             sched->host_inputs_split[split_backend_id] = split_id + 1;
+             ec = ggml_backend_graph_compute_async(split_backend, &tail);
+@@ -2218,6 +2276,10 @@
+     sched->splits_capacity = initial_splits_capacity;
+ 
+     sched->graph_inputs_capacity = GGML_SCHED_MAX_SPLIT_INPUTS;
++    {
++        const char * v = getenv("GGML_SCHED_ASYNC_HOST_COPY");
++        sched->async_host_copy = v == nullptr || atoi(v) != 0;
++    }
+     sched->graph_inputs = (struct ggml_tensor **) calloc(sched->graph_inputs_capacity, sizeof(struct ggml_tensor *));
+ 
+     for (int b = 0; b < n_backends; b++) {
+@@ -2235,6 +2297,11 @@
+         sched->tail_done[b]         = NULL;
+         sched->host_inputs_split[b] = -1;
+         sched->tail_pending[b]      = false;
++        sched->upload_done[b]       = NULL;
++        sched->upload_pending[b]    = false;
++        if (!ggml_backend_buft_is_host(sched->bufts[b])) {
++            sched->upload_done[b] = ggml_backend_event_new(backends[b]->device);
++        }
+         const char * early = getenv("GGML_SCHED_EARLY_HOST_INPUTS");
+         if (!ggml_backend_buft_is_host(sched->bufts[b]) && !(early && early[0] == '0')) {
+             sched->host_inputs_ready[b] = ggml_backend_event_new(backends[b]->device);
+@@ -2291,6 +2358,7 @@
+         ggml_backend_free(sched->expert_copy_backend[b]);
+         ggml_backend_event_free(sched->host_inputs_ready[b]);
+         ggml_backend_event_free(sched->tail_done[b]);
++        ggml_backend_event_free(sched->upload_done[b]);
+     }
+     free(sched->expert_split_slot);
+     ggml_gallocr_free(sched->galloc);

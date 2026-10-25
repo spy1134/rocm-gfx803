@@ -24,6 +24,12 @@
 #               VRAM is read at start, so start the server with your usual
 #               programs open. LLAMA_ARG_FIT_TARGET (MiB) overrides the total.
 #
+# A MoE model too large for the card keeps its routed experts in system RAM.
+# With a list of its most-used experts in $OLLAMA_DATA/moe-hot/ (made by
+# tools/moe_hot_calibrate.py), the VRAM left after the rest of the model holds
+# those experts instead of whole layers of them: Qwen3.6 35B-A3B generates
+# 39 instead of 34 tok/s. A model without a list loads as before.
+#
 # The 8-bit KV cache halves the context's VRAM, which on an 8 GB card decides
 # whether a model's context fits beside it at all: Qwen3 8B at 16k needs 2.3 GB
 # of f16 cache and spills layers to the CPU, but runs fully on the GPU with
@@ -55,7 +61,7 @@ case "${1:-}" in
             docker exec "$NAME" ollama ps 2>/dev/null; exit 0 ;;
   --list) running || die "the service is not running; start it first"
           exec docker exec "$NAME" ollama list ;;
-  -h|--help) sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  -h|--help) sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 esac
 
 if ! running; then
@@ -97,6 +103,7 @@ if ! running; then
   done
   home=/home/gfx803
   [ "${RUN_AS_ROOT:-0}" = "1" ] && home=/root
+  [ -d "$DATA/moe-hot" ] && GFX803_ARGS+=(-e "LLAMA_ARG_MOE_HOT=$home/.ollama/moe-hot")
   docker rm "$NAME" >/dev/null 2>&1 || true
   docker run -d --init --name "$NAME" \
     "${GFX803_ARGS[@]}" \
