@@ -127,6 +127,12 @@ any image built from this repository with the card passed through.
   WORKDIR with pytest, expecttest and hypothesis; the image is not changed). 25 tests per process,
   one per process again after a process dies. Expect 584 ok, 94 skipped, 11 expected failures and 2
   errors, both Cholesky, which needs MAGMA (the PyTorch build here has none); about 10 minutes.
+  `--fp16` checks every op that has float16 on the GPU against float32 on the CPU instead (about
+  6 minutes): about 500 ok and 50-55 failures, nearly all of them expected (the script lists the
+  kinds); `torch.mode` is wrong on an image whose compiler lacks
+  `patches/llvm/0003-amdgpu-gfx8-dynamic-lds-align.patch`, and `nonzero_static` with an empty input
+  and `size` > 0 kills the process (a division by zero in its launch arithmetic, in every PyTorch
+  2.8 build; PyTorch main fills the output instead).
 - `softmax_smem_check.py`: softmax and log_softmax forward and backward against float64 at the
   row lengths where the block reduction's shared-memory buffer can overrun its allocation and over
   the persistent-softmax range (rows up to 2048). `--device cpu` checks the script itself.

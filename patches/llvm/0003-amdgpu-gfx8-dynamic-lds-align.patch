@@ -1,0 +1,154 @@
+AMDGPU: dynamic LDS is 16-byte aligned where LDS accesses must be aligned
+
+Generic (subtargets without unaligned DS access: gfx8 and older; gfx803 is
+where it was found and tested).
+
+Verified on an RX 590 (gfx803) with clang built from ROCm llvm-project
+rocm-6.4.4 (d366fa84) with this patch on top of 0001 and 0002: the repro
+below and a variant that reaches the dynamic buffer through a non-inlined
+function are right (shmem at byte 16), gfx900 output is unchanged (byte 2),
+and PyTorch rebuilt with it returns torch.mode of short fp16 slices
+correctly, with the GEMM shim bit-identical (46 of 46), PyTorch's OpInfo
+comparison with the CPU unchanged (584 pass), the SD 1.5 UNet step and LoRA
+training at the same speed, and no GPU faults.
+
+WHY
+---
+Dynamic LDS (`extern __shared__ char shmem[]`) starts right after a
+kernel's static LDS, aligned only to the dynamic variable's own alignment,
+1 for a char array. CUDA aligns dynamic shared memory to 16 bytes, and
+CUDA code relies on it: it declares the buffer as char and casts it to
+wider types. On gfx9 and later unaligned DS accesses work, so the cast is
+harmless there. gfx8 has no unaligned DS access: a ds_write_b32 or
+ds_read_b32 at an address that is not a multiple of 4 uses the address
+rounded down, and reads or overwrites the bytes before it.
+
+PyTorch's torch.mode (TensorModeKernel.cuh, compute_mode) keeps the mode in
+a static `__shared__ T mode` and later reuses the dynamic buffer as
+`unsigned` scratch. For fp16, `mode` is the kernel's only static LDS (2
+bytes) and the dynamic buffer starts at byte 2, so the scratch store at byte
+2 lands on bytes 0-3 and replaces the mode with the low half of an index:
+torch.mode of [1, 2, 2, 3, 3, 3, 0.5] in fp16 on the GPU returns
+2.98e-07 (bit pattern 0x0005, the index of the last 3) instead of 3. fp32 is
+right, because there the static size is 4. The same code compiled for
+gfx900 has the same layout and the same ds_write_b32 at byte 2.
+
+Repro outside PyTorch (hipcc -O2 --offload-arch=gfx803):
+
+  template <typename T> __global__ void k(const T* in, T* out) {
+      extern __shared__ char shmem[];
+      T* smem = reinterpret_cast<T*>(shmem);
+      smem[threadIdx.x] = in[threadIdx.x]; __syncthreads();
+      __shared__ T mode;
+      if (threadIdx.x == 0) mode = smem[3];
+      __syncthreads();
+      if (threadIdx.x < 16) reinterpret_cast<unsigned*>(shmem)[threadIdx.x] = 1000u + threadIdx.x;
+      __syncthreads();
+      if (threadIdx.x == 0) out[0] = mode; }
+
+With T = __half the shipped compiler puts shmem at LDS byte 2 and out[0] is
+5.96e-05 (0x03E8, the low half of 1000); declared
+`extern __shared__ __attribute__((aligned(16))) char shmem[]` it is at byte
+16 and out[0] is the expected value.
+
+WHAT
+----
+On subtargets without unaligned DS access, dynamic LDS gets an alignment of
+at least 16: AMDGPUMachineFunction::setDynLDSAlign raises the alignment it
+pads the static size to (SIMachineFunctionInfo sets the minimum from the
+subtarget), and AMDGPULowerModuleLDS gives the representative dynamic LDS
+variable it creates for kernels that reach dynamic LDS through functions
+the same minimum, so the address it records matches the one instruction
+selection computes. A kernel's static LDS size grows by at most 15 bytes.
+Subtargets with unaligned DS access are unchanged.
+
+diff -ru a/llvm/lib/Target/AMDGPU/AMDGPULowerModuleLDSPass.cpp b/llvm/lib/Target/AMDGPU/AMDGPULowerModuleLDSPass.cpp
+--- a/llvm/lib/Target/AMDGPU/AMDGPULowerModuleLDSPass.cpp	2026-10-25 17:24:30.296491852 -0700
++++ b/llvm/lib/Target/AMDGPU/AMDGPULowerModuleLDSPass.cpp	2026-10-25 17:24:30.307495984 -0700
+@@ -179,6 +179,7 @@
+ #include "AMDGPU.h"
+ #include "AMDGPUMemoryUtils.h"
+ #include "AMDGPUTargetMachine.h"
++#include "GCNSubtarget.h"
+ #include "Utils/AMDGPUBaseInfo.h"
+ #include "llvm/ADT/BitVector.h"
+ #include "llvm/ADT/DenseMap.h"
+@@ -819,7 +820,7 @@
+ 
+   static GlobalVariable *
+   buildRepresentativeDynamicLDSInstance(Module &M, LDSUsesInfoTy &LDSUsesInfo,
+-                                        Function *func) {
++                                        Function *func, Align MinAlign) {
+     // Create a dynamic lds variable with a name associated with the passed
+     // function that has the maximum alignment of any dynamic lds variable
+     // reachable from this kernel. Dynamic LDS is allocated after the static LDS
+@@ -834,7 +835,10 @@
+ 
+     LLVMContext &Ctx = M.getContext();
+     const DataLayout &DL = M.getDataLayout();
+-    Align MaxDynamicAlignment(1);
++    // At least the alignment AMDGPUMachineFunction::setDynLDSAlign gives the
++    // dynamic LDS of a kernel on this subtarget, so that the address recorded
++    // here is the one instruction selection computes.
++    Align MaxDynamicAlignment = MinAlign;
+ 
+     auto UpdateMaxAlignment = [&MaxDynamicAlignment, &DL](GlobalVariable *GV) {
+       if (AMDGPU::isDynamicLDS(*GV)) {
+@@ -885,8 +889,12 @@
+             report_fatal_error("Anonymous kernels cannot use LDS variables");
+           }
+ 
+-          GlobalVariable *N =
+-              buildRepresentativeDynamicLDSInstance(M, LDSUsesInfo, func);
++          const Align MinAlign =
++              TM.getSubtarget<GCNSubtarget>(*func).hasUnalignedDSAccessEnabled()
++                  ? Align(1)
++                  : Align(16);
++          GlobalVariable *N = buildRepresentativeDynamicLDSInstance(
++              M, LDSUsesInfo, func, MinAlign);
+ 
+           KernelToCreatedDynamicLDS[func] = N;
+ 
+diff -ru a/llvm/lib/Target/AMDGPU/AMDGPUMachineFunction.cpp b/llvm/lib/Target/AMDGPU/AMDGPUMachineFunction.cpp
+--- a/llvm/lib/Target/AMDGPU/AMDGPUMachineFunction.cpp	2026-10-25 17:24:30.293098714 -0700
++++ b/llvm/lib/Target/AMDGPU/AMDGPUMachineFunction.cpp	2026-10-25 17:24:30.307184675 -0700
+@@ -203,8 +203,9 @@
+   const DataLayout &DL = M->getDataLayout();
+   assert(DL.getTypeAllocSize(GV.getValueType()).isZero());
+ 
+-  Align Alignment =
+-      DL.getValueOrABITypeAlignment(GV.getAlign(), GV.getValueType());
++  Align Alignment = std::max(
++      MinDynLDSAlign,
++      DL.getValueOrABITypeAlignment(GV.getAlign(), GV.getValueType()));
+   if (Alignment <= DynLDSAlign)
+     return;
+ 
+diff -ru a/llvm/lib/Target/AMDGPU/AMDGPUMachineFunction.h b/llvm/lib/Target/AMDGPU/AMDGPUMachineFunction.h
+--- a/llvm/lib/Target/AMDGPU/AMDGPUMachineFunction.h	2026-10-25 17:24:30.290732132 -0700
++++ b/llvm/lib/Target/AMDGPU/AMDGPUMachineFunction.h	2026-10-25 17:24:30.307115396 -0700
+@@ -46,6 +46,12 @@
+   /// stages.
+   Align DynLDSAlign;
+ 
++  /// Least alignment of dynamic shared memory. Code written for CUDA relies on
++  /// dynamic shared memory being 16-byte aligned and casts it to wider types;
++  /// where LDS accesses must be aligned (gfx8 and older), an access through
++  /// such a cast at a smaller alignment hits the aligned-down address.
++  Align MinDynLDSAlign;
++
+   // Flag to check dynamic LDS usage by kernel.
+   bool UsesDynamicLDS = false;
+ 
+diff -ru a/llvm/lib/Target/AMDGPU/SIMachineFunctionInfo.cpp b/llvm/lib/Target/AMDGPU/SIMachineFunctionInfo.cpp
+--- a/llvm/lib/Target/AMDGPU/SIMachineFunctionInfo.cpp	2026-10-25 17:24:30.294899268 -0700
++++ b/llvm/lib/Target/AMDGPU/SIMachineFunctionInfo.cpp	2026-10-25 17:24:30.307287725 -0700
+@@ -44,6 +44,8 @@
+       WorkItemIDY(false), WorkItemIDZ(false), ImplicitArgPtr(false),
+       GITPtrHigh(0xffffffff), HighBitsOf32BitAddress(0) {
+   const GCNSubtarget &ST = *static_cast<const GCNSubtarget *>(STI);
++  if (!ST.hasUnalignedDSAccessEnabled())
++    MinDynLDSAlign = Align(16);
+   FlatWorkGroupSizes = ST.getFlatWorkGroupSizes(F);
+   WavesPerEU = ST.getWavesPerEU(F);
+   MaxNumWorkGroups = ST.getMaxNumWorkGroups(F);

@@ -482,8 +482,9 @@ when another GPU process holds ~3 GB. Strict pinning of the 8 CPU threads
 (`-C 0xff --cpu-strict 1`) drops generation to 20.5 tok/s and the AVX2
 repacked expert layout (`--no-host 1`) gains nothing; the unpinned default
 stays. HIP graphs cost 1-3% here
-(llama-bench 27.51 -> 27.93 tok/s with them off), within noise through
-Ollama. The tables below are from the earlier profile.
+(llama-bench 27.51 -> 27.93 tok/s with them off) and 7% with hot experts
+(LLM-12); the Ollama image runs with them off. The tables below are from the
+earlier profile.
 
 | Part | Per token | How it was measured |
 | --- | --- | --- |
@@ -1367,6 +1368,18 @@ missed. On the base image 584 pass, 94 are skipped by the tests themselves
 the 2 errors are Cholesky, which needs MAGMA (FINDINGS section 4); those two
 tests lack the MAGMA skip the other linear algebra tests have. No process
 died. `tools/correctness-suite/pytorch/opinfo_compare_cpu.sh` runs it.
+
+That test checks one dtype per op, float32 for most, so the script's
+`--fp16` mode runs every op that has float16 on the GPU against float32 on
+the CPU. Besides the expected differences (random output, integer casts of
+out-of-range values, tie order, float16 rounding), it found `torch.mode`
+wrong in fp16, from a compiler bug (FINDINGS section 4,
+`patches/llvm/0003-*`), and `nonzero_static` with an empty input and
+`size` > 0 dying of a division by zero in its launch arithmetic (every
+PyTorch 2.8 build; PyTorch main fills the output instead). Open: fp16
+`torch.mode` over slices of about 1,024 elements and more, and `torch.linalg.eigh`
+on a batch of four 33x33 matrices, which misses its residual limit in about
+half of `linalg_check.py` runs on the current and the patched images alike.
 
 ### LLM-9: one q8_1 conversion per shared input
 

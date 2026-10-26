@@ -104,6 +104,7 @@ run with wrong numbers, not a crash. "It runs" was never taken as evidence.
 | No-return atomics on fine-grained host memory store their operand instead (user kernels) | Open (hardware; use the returned value) | 4 | none |
 | Non-inlined device functions read implicit kernel arguments from address 0: PyTorch's mixed fp16/fp32 binary ops crash, assert() faults at its trap | Fixed (clang and libamd_comgr rebuilt, PyTorch rebuilt with them) | 4 | `patches/llvm/` |
 | Flat (generic-pointer) accesses to LDS are dropped when M0 is not set (gfx8) | Fixed (same compiler) | 4 | `patches/llvm/` |
+| Dynamic LDS less aligned than CUDA code assumes: unaligned LDS accesses overwrite the variables before it (fp16 `torch.mode` returns an index as its value) | Fixed (same compiler) | 4 | `patches/llvm/0003-*` |
 | rocSOLVER and rocSPARSE ship no gfx803 code, so their kernels silently never run | Fixed (rebuilt for gfx803) | 4 | `patches/rocsolver/`, `patches/rocsparse/` |
 | VRAM exhaustion freezes the desktop | Mitigated (VRAM cap) | 7 | `training/gfx803-train.sh` |
 | llama.cpp prompt processing 10x slow | Fixed | 9 | `patches/ollama/llama-cpp/100-*` |
@@ -792,6 +793,24 @@ value. In one PyTorch source file it adds four `s_mov_b32` instructions to
 To check: `torch.maximum(torch.randn(1000, device="cuda").half(),
 torch.randn(1000, device="cuda"))` returns the elementwise maximum; with
 AMD's compiler it faults (with 1048576 elements it does not).
+
+Dynamic LDS (`extern __shared__ char shmem[]`) starts right after a kernel's
+static LDS, aligned only to the dynamic variable's own alignment: 1 for a
+char array. CUDA aligns dynamic shared memory to 16 bytes, and CUDA code
+casts the buffer to wider types. gfx9 and later have unaligned LDS access,
+so the cast is harmless there; gfx8 has none, and a 4-byte LDS access at an
+address that is not a multiple of 4 uses the address rounded down. PyTorch's
+`torch.mode` keeps the mode in a 2-byte static `__shared__` variable for
+fp16, the dynamic buffer then starts at byte 2, and the kernel's 4-byte
+scratch stores there overwrite the mode with the low half of an index:
+`torch.mode` of `[1, 2, 2, 3, 3, 3, 0.5]` in fp16 returned 2.98e-07 (bit
+pattern 0x0005) instead of 3. `patches/llvm/0003-*` starts dynamic LDS at a
+multiple of 16 on targets without unaligned LDS access. Slices of about
+1,024 elements and more still give wrong fp16 modes with or without it
+(other kernels; open), and fp32 and integer modes are right at every size.
+
+To check: `torch.mode(torch.tensor([1., 2., 2., 3., 3., 3., 0.5],
+device="cuda").half())` returns 3.
 
 ### rocSOLVER and rocSPARSE had no gfx803 code
 

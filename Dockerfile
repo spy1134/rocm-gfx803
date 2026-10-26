@@ -31,8 +31,9 @@
 #                before every kernel dispatch.
 #   clang, libamd_comgr
 #             -- on gfx8 the shipped compiler reads a non-inlined function's
-#                implicit kernel arguments from address 0 and leaves M0 unset
-#                for generic-pointer accesses to LDS; patches/llvm/. PyTorch is
+#                implicit kernel arguments from address 0, leaves M0 unset
+#                for generic-pointer accesses to LDS, and aligns dynamic LDS
+#                less than CUDA code assumes; patches/llvm/. PyTorch is
 #                built with the patched clang, and the image's hipcc and
 #                run-time compilation (hipRTC, MIOpen) use it.
 #   MIGraphX  -- prebuilt for gfx900+ only.
@@ -577,7 +578,9 @@ COPY --from=devlibs-builder /devlibs-out/ /
 # clang-19 and libamd_comgr from ROCm/llvm-project with the gfx8 code generation fixes (patches/llvm/). On gfx8 the
 # shipped compiler loads the queue pointer and the aperture bases of a non-inlined function from address 0, so
 # PyTorch's mixed fp16/fp32 elementwise kernels fault in their last partial block and a failed assert() faults at its
-# trap, and it leaves M0 unset for generic-pointer accesses that land in LDS, which drops the stores. libamd_comgr
+# trap; it leaves M0 unset for generic-pointer accesses that land in LDS, which drops the stores; and it starts dynamic
+# LDS at less than the 16-byte alignment CUDA code relies on, so wider accesses through a cast hit the bytes before
+# it (gfx8 has no unaligned LDS access). libamd_comgr
 # embeds its own copy of the compiler, so hipRTC (PyTorch's jiterator, MIGraphX) and MIOpen compile their run-time
 # kernels with the same defect; it also embeds the device libraries, so it is built from the tree that carries the
 # ockl signal patch. Only these two files leave the stage.
