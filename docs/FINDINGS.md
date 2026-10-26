@@ -105,6 +105,7 @@ run with wrong numbers, not a crash. "It runs" was never taken as evidence.
 | Non-inlined device functions read implicit kernel arguments from address 0: PyTorch's mixed fp16/fp32 binary ops crash, assert() faults at its trap | Fixed (clang and libamd_comgr rebuilt, PyTorch rebuilt with them) | 4 | `patches/llvm/` |
 | Flat (generic-pointer) accesses to LDS are dropped when M0 is not set (gfx8) | Fixed (same compiler) | 4 | `patches/llvm/` |
 | Dynamic LDS less aligned than CUDA code assumes: unaligned LDS accesses overwrite the variables before it (fp16 `torch.mode` returns an index as its value) | Fixed (same compiler) | 4 | `patches/llvm/0003-*` |
+| A saturating add/sub with a 32-bit literal loses its clamp and wraps (rocPRIM's merge sort: fp16 `torch.sort`/`torch.mode`, thrust sorts of non-numeric keys) | Fixed (same compiler) | 4 | `patches/llvm/0004-*` |
 | rocSOLVER and rocSPARSE ship no gfx803 code, so their kernels silently never run | Fixed (rebuilt for gfx803) | 4 | `patches/rocsolver/`, `patches/rocsparse/` |
 | VRAM exhaustion freezes the desktop | Mitigated (VRAM cap) | 7 | `training/gfx803-train.sh` |
 | llama.cpp prompt processing 10x slow | Fixed | 9 | `patches/ollama/llama-cpp/100-*` |
@@ -597,6 +598,22 @@ library is replaced; the Ollama image carries the identical stock file, so
 the same rebuilt file fits it. `CLR_GFX8_TC_INVALIDATE=0` switches the packet off in the same
 binary, which is how the fix is measured against itself.
 
+The slot starts with an `EVENT_WRITE CS_PARTIAL_FLUSH`. The CP runs a PM4 slot
+as soon as it reaches it, without waiting for the dispatch ahead of it (only
+the next kernel packet carries the AQL barrier bit), and `ACQUIRE_MEM` waits for
+nothing either. Without the flush the invalidate can run while the previous
+kernel's last workgroups are still loading, and the lines they load then
+survive into the next kernel. Batched `torch.linalg.eigh` showed it: in
+rocSOLVER's divide-and-conquer (`stedc`), a split-K Tensile GEMM loads C
+through descriptors with bit 27 clear while partner workgroups add to the same
+elements in L2, and `stedc_mergeUpdate` reads the result next. The last matrix
+of a batch of 4x33x33, whose workgroups run last, came out wrong in about a
+quarter of calls on identical input (never with `AMD_SERIALIZE_KERNEL=3`,
+never unbatched), and a rocBLAS strided-batched sgemm of that shape followed by
+a reader kernel saw about 1,800 stale elements in 300 iterations. With the
+flush both are 0 (eigh 0 of 300 calls), and an empty dispatch costs 4.1 instead
+of 4.2 us.
+
 The invalidate sits in the HIP runtime because the runtime issues the dispatch
 packets whose fence scopes promise it. Two other placements were measured and
 not taken. Setting bit 27 in every gfx8 buffer descriptor leaves no line to go
@@ -805,19 +822,26 @@ fp16, the dynamic buffer then starts at byte 2, and the kernel's 4-byte
 scratch stores there overwrite the mode with the low half of an index:
 `torch.mode` of `[1, 2, 2, 3, 3, 3, 0.5]` in fp16 returned 2.98e-07 (bit
 pattern 0x0005) instead of 3. `patches/llvm/0003-*` starts dynamic LDS at a
-multiple of 16 on targets without unaligned LDS access. Slices of about
-1,024 elements and more still give wrong fp16 modes with or without it, and
-fp32 and integer modes are right at every size: above 2,048 elements
-`torch.mode` sorts with rocThrust's `sort_by_key`, which takes rocPRIM's
-merge sort for a key type that is not a plain number (`c10::Half`, or any
-struct), and on gfx803 that merge sort corrupts its output as soon as the
-input spans more than one sorted block (about 1,024 elements): keys out of
-order, values detached from their keys, keys that were not in the input.
-It does so with every block configuration, with AMD's compiler and the
-patched one, and with kernels serialized; plain-number keys take the radix
-sort and are right. Reproduction outside PyTorch:
-`tools/correctness-suite/pytorch/rocprim_merge_sort_repro.hip`
-(rocprim::merge_sort, 4-byte struct keys, int64 values). Open.
+multiple of 16 on targets without unaligned LDS access.
+
+Longer fp16 slices were wrong for a second compiler reason. Above 2,048
+elements `torch.mode` sorts with rocThrust's `sort_by_key`, which takes
+rocPRIM's merge sort for a key type that is not a plain number (`c10::Half`,
+any struct), and that sort left every full 1,024-item tile unsorted: keys out
+of order, values detached from their keys. gfx8 has only the carry-out forms
+of the 32-bit integer add and subtract, so a saturating add or subtract
+(`llvm.usub.sat`, which InstCombine makes of `a < b ? 0 : a - b`) is that
+instruction with the clamp bit set. When the other operand is a 32-bit literal
+rather than an inline constant (up to 64), SIFoldOperands folds it in by
+shrinking the instruction to its VOP2 form, which has no clamp bit, and the
+result wraps: `__builtin_elementwise_sub_sat(5u, 1000u)` gives 4294966301.
+rocPRIM's merge path starts its search at `diag < input2_size ? 0 :
+diag - input2_size` with a compile-time half-tile size of 128 or more, so half
+the threads of every full tile merged from a wrapped index. gfx9 and later use
+the carry-less add and subtract and keep the clamp. `patches/llvm/0004-*`
+declines that fold when clamp is set; gfx900 and gfx1030 output is unchanged.
+Plain-number keys take the radix sort and were never affected.
+Reproduction: `tools/correctness-suite/pytorch/rocprim_merge_sort_repro.hip`.
 
 To check: `torch.mode(torch.tensor([1., 2., 2., 3., 3., 3., 0.5],
 device="cuda").half())` returns 3.

@@ -108,7 +108,8 @@ any image built from this repository with the card passed through.
   linked, not from rocPRIM.
 - `rocprim_merge_sort_repro.hip`: rocPRIM's merge sort (rocThrust's sort for keys that are not plain
   numbers, such as `c10::Half`, so fp16 `torch.mode` above 2,048 elements) against a host check. On
-  gfx803 every case beyond one sorted block (about 1,024 elements) is wrong; open.
+  gfx803, with a compiler that lacks `patches/llvm/0004-amdgpu-gfx8-carry-add-sub-clamp.patch`, every
+  case of one full sorted tile (1,024 elements) or more is wrong; with it, all are right.
 - `rocprim_ops_check.py`: nonzero, masked indexing, unique, sorts and argsorts (fp32, fp16,
   int64, up to 3M elements), cumsum, top-k, index_put with accumulate, bincount, searchsorted,
   randperm and embedding backward on the GPU against the CPU. Expect 118 of 118; an image

@@ -17,9 +17,10 @@ DAG="$SRC/llvm/lib/Target/AMDGPU/AMDGPUISelDAGToDAG.cpp"
 FIXSGPR="$SRC/llvm/lib/Target/AMDGPU/SIFixSGPRCopies.cpp"
 MFI="$SRC/llvm/lib/Target/AMDGPU/AMDGPUMachineFunction.cpp"
 LOWERLDS="$SRC/llvm/lib/Target/AMDGPU/AMDGPULowerModuleLDSPass.cpp"
+FOLD="$SRC/llvm/lib/Target/AMDGPU/SIFoldOperands.cpp"
 HSAQS="$SRC/amd/device-libs/ockl/src/hsaqs.cl"
 
-for f in "$ISEL" "$DAG" "$FIXSGPR" "$MFI" "$LOWERLDS" "$HSAQS"; do
+for f in "$ISEL" "$DAG" "$FIXSGPR" "$MFI" "$LOWERLDS" "$FOLD" "$HSAQS"; do
     [ -f "$f" ] || { echo "FATAL: $f is missing; the sparse checkout lacks a directory the patches touch" >&2; exit 1; }
 done
 
@@ -31,6 +32,7 @@ apply "$DEVLIBS_PATCHES/ockl-gfx8-signal-returning-atomics-6.4.4.patch"
 apply "$SELF_DIR/0001-amdgpu-callee-implicit-kernarg.patch"
 apply "$SELF_DIR/0002-amdgpu-gfx8-flat-lds-m0.patch"
 apply "$SELF_DIR/0003-amdgpu-gfx8-dynamic-lds-align.patch"
+apply "$SELF_DIR/0004-amdgpu-gfx8-carry-add-sub-clamp.patch"
 
 grep -q 'AF_SIGNAL(long, add,' "$HSAQS" \
     || { echo "FATAL: ockl signal patch did not apply" >&2; exit 1; }
@@ -42,4 +44,6 @@ grep -q 'range-check LDS accesses against M0' "$FIXSGPR" \
     || { echo "FATAL: flat-LDS M0 patch (SIFixSGPRCopies hunk) did not apply to $FIXSGPR" >&2; exit 1; }
 grep -q 'MinDynLDSAlign,' "$MFI" && grep -q 'func, MinAlign);' "$LOWERLDS" \
     || { echo "FATAL: dynamic-LDS alignment patch did not apply" >&2; exit 1; }
-echo "OK: ockl signal, callee implicit-kernarg, flat-LDS M0 and dynamic-LDS alignment patches applied"
+grep -q 'The e32 form has no clamp bit' "$FOLD" \
+    || { echo "FATAL: carry add/sub clamp patch did not apply to $FOLD" >&2; exit 1; }
+echo "OK: ockl signal, callee implicit-kernarg, flat-LDS M0, dynamic-LDS alignment and carry add/sub clamp patches applied"

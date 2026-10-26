@@ -1,8 +1,9 @@
 ROCclr (gfx7/gfx8), ROCm 6.4.4: the command processor does not maintain the
 shader caches at a dispatch boundary. A kernel that reads a page which a copy
 kernel refilled a moment earlier can be served the page's previous contents out
-of its CU's vector L1. One PM4 ACQUIRE_MEM packet, published in its own AQL
-ring slot, invalidates the vector L1 and the scalar cache:
+of its CU's vector L1. One AQL ring slot of PM4 waits for the dispatches ahead
+of it to finish (EVENT_WRITE CS_PARTIAL_FLUSH) and then invalidates the vector
+L1 and the scalar cache (ACQUIRE_MEM):
 
   1. Ahead of every kernel dispatch (the reader direction that fails on 6.4.4).
   2. Inside releaseGpuMemoryFence(), between its barrier and a second barrier.
@@ -56,6 +57,31 @@ space and entirely kernel-written:
     therefore reaches the page through L2, where every CU sees it; only a CU
     whose L1 still holds the page's old lines sees the old bytes.
 
+The invalidate has to run after the previous dispatch has finished, and a bare
+ACQUIRE_MEM in the slot does not: the CP runs the slot while the kernel ahead of
+it is still executing, and ACQUIRE_MEM itself waits for no prior work. Only the
+kernel packet that follows carries the barrier bit. Lines that the previous
+kernel's last workgroups load after the invalidate then survive into the next
+kernel. Tensile's split-K GEMMs hit this every time the host is ahead of the GPU:
+with GSU and atomic accumulation (e.g. MT32x8x32 GSU4 GSUASB, which rocBLAS picks
+for 33x33x33 strided batched), each workgroup loads its C tile with
+buffer_load_dword through a descriptor whose word3 is 0x20000 (bit 27 clear) and
+then adds into it with a buffer_atomic_cmpswap loop, while its split-K partners
+on other CUs add to the same elements at L2. The workgroups of the last batch
+run last, so a kernel that reads C right after the GEMM gets partial sums of the
+last matrix out of L1. rocSOLVER's divide-and-conquer eigensolver (stedc, under
+syevd and torch.linalg.eigh) merges with exactly such a GEMM followed by
+stedc_mergeUpdate reading its output: with the ACQUIRE_MEM alone, batched fp32
+eigh at n=31/33/34 returns wrong eigenvectors in a quarter to three quarters of
+calls, mostly for the last matrices of the batch. AMD_SERIALIZE_KERNEL=3, a host
+synchronize, or any extra dispatch between the GEMM and the reader hides it,
+and reading C with glc loads does too, while a reader that first spins for
+200k clocks still sees the wrong values: the data is stale in L1, the kernels
+do not overlap. The CS_PARTIAL_FLUSH ahead of the ACQUIRE_MEM makes the CP wait
+for every earlier dispatch on the queue to complete. The kernel packet behind
+the slot waits for the same thing through its barrier bit, so in an in-order
+stream the wait only moves earlier.
+
 A full L2 writeback and invalidate is included for the other direction: the
 copy engine and the host read memory and never look at the shader caches, so a
 D2H copy of a buffer a kernel just wrote copies the pre-write bytes unless the
@@ -82,8 +108,9 @@ WHAT
 `rocclr/device/rocm/rocvirtual.{hpp,cpp}`: `VirtualGPU::insertTcFence()` takes
 one 64-byte AQL slot with `hsa_queue_add_write_index_screlease`, waits for the
 slot to be free the way dispatchGenericAqlPacket does, and fills it with
-ACQUIRE_MEM (whole address range, poll interval 0xA), a NOP, and the trailing
-RELEASE_MEM whose EVENT_INDEX(AQL) retires the slot. This is the PM4-inside-an-
+EVENT_WRITE CS_PARTIAL_FLUSH (EVENT_INDEX 4), ACQUIRE_MEM (whole address range,
+poll interval 0xA), and the trailing RELEASE_MEM whose EVENT_INDEX(AQL) retires
+the slot (2 + 7 + 7 dwords, one 64-byte slot). This is the PM4-inside-an-
 AQL-slot protocol ROCr's gfx8 `AqlQueue::ExecutePM4()` uses, with the payload
 inlined instead of fetched through an indirect buffer. dword 0 is stored last
 with release semantics. The slot rings no doorbell: the packet the caller writes
@@ -106,7 +133,11 @@ launch ahead of it. Three call sites:
 
 COST: one 64-byte ring slot plus a full-range vector L1 and scalar cache
 invalidate per dispatch, on gfx7 and gfx8 only. Measured decode cost on a 7B Q4_K
-model is 2.3% to 2.7% (see above). The ROCm 10.x queue cap of 64 packets does not
+model is 2.3% to 2.7% (see above). The CS_PARTIAL_FLUSH adds nothing measurable:
+back-to-back empty kernels take 4.11 us each with it and 4.24 us with the bare
+ACQUIRE_MEM; a barrier-AND packet ahead of the slot also cures the eigh case but
+costs 6.55 us per empty dispatch. A kernel launched with hipExtAnyOrderLaunch
+(barrier bit clear) no longer overlaps the kernel ahead of it on gfx7/gfx8. The ROCm 10.x queue cap of 64 packets does not
 apply: ROC_AQL_QUEUE_SIZE is 16384 in 6.4.4.
 
 Applies to: ROCm/clr tag rocm-6.4.4 (commit 123eb5128769ba30fda8f84414421bc858e8c695),
@@ -125,13 +156,28 @@ VERIFICATION (RX 590, gfx803, MEC firmware 730, image built with this patch):
   * tools/tc-staleness: probe.py, soak.py, graphprobe.py, conbrace3.py and ms3.py
     are clean with the flag on. They are also clean with it off on this stack, so
     they do not isolate this bug; probe_rocblas.py does.
+  * Batched fp32 torch.linalg.eigh (seed 0, 4x33x33): 0 wrong in 300 calls; with
+    the bare ACQUIRE_MEM 8 of 30. n = 16/31/32/34/64/100 at batch 2/4/5/8, 40
+    calls each: 0 wrong (the bare ACQUIRE_MEM: n=31 batch 8 wrong in 30 of 40,
+    n=34 batch 8 in 16 of 40). rocsolver_ssyevd_strided_batched called directly,
+    n=33 batch 4: 0 of 300 (bare ACQUIRE_MEM: 35 of 150). rocblas_sgemm_strided_
+    batched 33x33x33 batch 4 followed by a reader kernel, 300 iterations: 0 wrong
+    elements (bare ACQUIRE_MEM: about 1,800, all in the last matrix).
+    linalg_check.py 204 of 204 in five runs; probe_rocblas.py all pass, and with
+    CLR_GFX8_TC_INVALIDATE=0 still stops at case 225.
+  With the CS_PARTIAL_FLUSH, in images rebuilt on it: batched eigh 0 wrong in 30
+  calls (8 before), linalg_check 204/204 three times, the GEMM shim bit-identical
+  (46 of 46), rocPRIM ops 118/118, the SD 1.5 UNet step 341.3 -> 342.1 ms, LoRA
+  training 2.53 -> 2.47 s/step, Ollama greedy output byte-identical on Qwen3 8B (10
+  of 10 answers), no GPU faults. The decode figures above are from the bare
+  ACQUIRE_MEM.
   Not covered: the L2 writeback direction (no failure reproduces on 6.4.4), why the
   L1 plus L2-invalidate word without writeback fails while the L1 word alone and
   the L2 pair pass, and workloads other than the ones above.
 
 --- a/rocclr/device/rocm/rocvirtual.cpp
 +++ b/rocclr/device/rocm/rocvirtual.cpp
-@@ -894,6 +894,72 @@
+@@ -894,6 +894,82 @@
  }
  
  // ================================================================================================
@@ -154,11 +200,19 @@ VERIFICATION (RX 590, gfx803, MEC firmware 730, image built with this patch):
 +// which write through L2; ROCr invalidates the instruction cache itself when a code object loads.
 +//
 +// The slot follows the gfx8 PM4-in-an-AQL-slot protocol that ROCr's AqlQueue::ExecutePM4 uses:
-+// raw PM4, a NOP pad, and a trailing RELEASE_MEM with EVENT_INDEX(AQL) that retires the slot.
-+// dword 0 is stored last with release semantics, so the CP never sees a half-written packet.
-+// The slot rings no doorbell: the packet the caller writes next sits at a higher ring index and
-+// its doorbell commits this slot as well. ACQUIRE_MEM stalls the CP until the cache action is
-+// done, so the following packet cannot launch before it.
++// raw PM4 and a trailing RELEASE_MEM with EVENT_INDEX(AQL) that retires the slot. dword 0 is
++// stored last with release semantics, so the CP never sees a half-written packet. The slot rings
++// no doorbell: the packet the caller writes next sits at a higher ring index and its doorbell
++// commits this slot as well. ACQUIRE_MEM stalls the CP until the cache action is done, so the
++// following packet cannot launch before it.
++//
++// The CP does not wait for the dispatch ahead of a PM4 slot to finish before it runs the slot,
++// and ACQUIRE_MEM does not wait for it either. A bare ACQUIRE_MEM can therefore run while the
++// previous kernel's last workgroups are still loading through descriptors with bit 27 clear, and
++// the lines they load survive into the kernel this slot was meant to protect. The leading
++// CS_PARTIAL_FLUSH makes the CP wait until every earlier dispatch on this queue has completed.
++// The next kernel packet waits for the same thing through its barrier bit, so in an in-order
++// stream the wait only moves earlier.
 +bool VirtualGPU::insertTcFence() {
 +  if (!CLR_GFX8_TC_INVALIDATE || dev().isa().versionMajor() > 8) return true;
 +
@@ -166,24 +220,26 @@ VERIFICATION (RX 590, gfx803, MEC firmware 730, image built with this patch):
 +  constexpr uint32_t kPm4Type3 = 3u << 30;
 +  // ROCr's PM4_HDR sets SHADER_TYPE only for gfxip 7.
 +  const uint32_t shaderType = (dev().isa().versionMajor() == 7) ? (1u << 1) : 0u;
++  const uint32_t eventWriteHdr = kPm4Type3 | ((2u - 2u) << 16) | (0x46u << 8) | shaderType;
 +  const uint32_t acquireMemHdr = kPm4Type3 | ((7u - 2u) << 16) | (0x58u << 8) | shaderType;
-+  const uint32_t nopHdr = kPm4Type3 | ((2u - 2u) << 16) | (0x10u << 8) | shaderType;
 +  const uint32_t releaseMemHdr = kPm4Type3 | ((7u - 2u) << 16) | (0x49u << 8) | shaderType;
 +  [[maybe_unused]] constexpr uint32_t kTcWbActionEna = 1u << 18;
 +  constexpr uint32_t kTcl1ActionEna = 1u << 22;
 +  [[maybe_unused]] constexpr uint32_t kTcActionEna = 1u << 23;
 +  constexpr uint32_t kShKcacheActionEna = 1u << 27;
 +  [[maybe_unused]] constexpr uint32_t kShIcacheActionEna = 1u << 29;
++  constexpr uint32_t kCsPartialFlush = (4u << 8) | 0x07u;  // EVENT_INDEX 4, CS_PARTIAL_FLUSH
 +  constexpr uint32_t kReleaseEventIndexAql = 7u << 8;
 +
 +  uint32_t slot[kSlotDwords] = {0};
-+  slot[0] = acquireMemHdr;
-+  slot[1] = kTcl1ActionEna | kShKcacheActionEna;
++  slot[0] = eventWriteHdr;
++  slot[1] = kCsPartialFlush;
++  slot[2] = acquireMemHdr;
++  slot[3] = kTcl1ActionEna | kShKcacheActionEna;
 +  // CP_COHER_CNTL 0x08400000
-+  slot[2] = 0xFFFFFFFFu;  // COHER_SIZE, in 256-byte granules
-+  slot[3] = 0xFFu;        // COHER_SIZE_HI: whole address space
-+  slot[6] = 0x0000000Au;  // poll interval, as gfx_v8_0_emit_mem_sync_compute uses
-+  slot[7] = nopHdr;
++  slot[4] = 0xFFFFFFFFu;  // COHER_SIZE, in 256-byte granules
++  slot[5] = 0xFFu;        // COHER_SIZE_HI: whole address space
++  slot[8] = 0x0000000Au;  // poll interval, as gfx_v8_0_emit_mem_sync_compute uses
 +  slot[9] = releaseMemHdr;
 +  slot[10] = kReleaseEventIndexAql;
 +
@@ -204,7 +260,7 @@ VERIFICATION (RX 590, gfx803, MEC firmware 730, image built with this patch):
  template <typename AqlPacket>
  bool VirtualGPU::dispatchGenericAqlPacket(
    AqlPacket* packet, uint16_t header, uint16_t rest, bool blocking, bool attach_signal) {
-@@ -901,6 +967,11 @@
+@@ -901,6 +977,11 @@
    const uint32_t queueMask = queueSize - 1;
    const uint32_t sw_queue_size = queueMask;
  
@@ -216,7 +272,7 @@ VERIFICATION (RX 590, gfx803, MEC firmware 730, image built with this patch):
    // Check for queue full and wait if needed.
    uint64_t index = hsa_queue_add_write_index_screlease(gpu_queue_, 1);
    uint64_t read = hsa_queue_load_read_index_relaxed(gpu_queue_);
-@@ -1258,6 +1329,16 @@
+@@ -1258,6 +1339,16 @@
    if (hasPendingDispatch_ || !Barriers().IsExternalSignalListEmpty()) {
      // Dispatch barrier packet into the queue
      dispatchBarrierPacket(kBarrierPacketHeader);
@@ -233,7 +289,7 @@ VERIFICATION (RX 590, gfx803, MEC firmware 730, image built with this patch):
      hasPendingDispatch_ = false;
      retainExternalSignals_ = false;
    }
-@@ -3685,6 +3766,16 @@
+@@ -3685,6 +3776,16 @@
              dispatchBarrierPacket(kNopPacketHeader, false);
            }
          } else {

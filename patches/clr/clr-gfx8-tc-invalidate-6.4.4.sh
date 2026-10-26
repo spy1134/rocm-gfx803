@@ -3,7 +3,8 @@
 # that the apply worked. The patch file gives the reason and the change.
 #
 # On gfx7 and gfx8 the CP does not act on the AQL acquire and release fence scopes, so ROCclr
-# publishes one PM4 ACQUIRE_MEM ring slot (vector L1 and scalar cache invalidate) ahead of every
+# publishes one PM4 ring slot (wait for the earlier dispatches, then vector L1 and scalar cache
+# invalidate) ahead of every
 # kernel dispatch, inside releaseGpuMemoryFence() before copy-engine work, and ahead of an
 # event-record barrier.
 #
@@ -33,6 +34,8 @@ patch -p1 -d "$SRC" < "$PATCH"
         grep -c 'if (!insertTcFence()) return false;' "$CPP")" >&2; exit 1; }
 grep -q 'CLR_GFX8_TC_RECORD_FENCE && !insertTcFence()' "$CPP" || {
     echo "FATAL: event-record TC writeback site missing from $CPP" >&2; exit 1; }
+grep -q 'slot\[1\] = kCsPartialFlush;' "$CPP" || {
+    echo "FATAL: the TC slot does not start with CS_PARTIAL_FLUSH in $CPP" >&2; exit 1; }
 grep -q 'bool VirtualGPU::insertTcFence()' "$CPP" || {
     echo "FATAL: insertTcFence() definition missing from $CPP" >&2; exit 1; }
 grep -q 'bool insertTcFence();' "$HPP" || {

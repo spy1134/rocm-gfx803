@@ -1,0 +1,86 @@
+AMDGPU: keep the clamp bit when folding a literal into a carry-out add/sub
+
+Generic (subtargets with integer clamp but no carry-less VALU add/sub:
+gfx8; gfx803 is where it was found and tested). Present unchanged in
+llvm-project main.
+
+Verified on an RX 590 (gfx803) with llc built from ROCm llvm-project
+rocm-6.4.4 (d366fa84) with this patch, compiling the device code that the
+shipped clang emits as bitcode: the repro below is right, rocPRIM 3.4.1's
+rocprim::merge_sort (struct keys, int32 and int64 values, the default and
+four explicit configurations, 1 to 300,000 items) and its block-sort kernel
+alone are right and stable, rocPRIM's radix sort is unchanged and right,
+and there are no GPU faults. gfx900 and gfx1030 output is byte-identical;
+on gfx803 only the instructions at the clamp sites change.
+With the full clang-19/libamd_comgr build and PyTorch rebuilt on it:
+torch.mode is right at every slice length from 7 to 20,000 in fp16, fp32
+and int64, the rocPRIM merge-sort repro has 0 wrong items over 15 cases,
+the GEMM shim is bit-identical (46 of 46), PyTorch's OpInfo comparison with
+the CPU is unchanged, and the SD 1.5 UNet step and LoRA training run at the
+same speed with no GPU faults.
+
+WHY
+---
+gfx8 has only the carry-out forms of the 32-bit VALU integer add and
+subtract (V_ADD_CO_U32, V_SUB_CO_U32, V_SUBREV_CO_U32), so instruction
+selection implements a saturating unsigned add or subtract (llvm.uadd.sat,
+llvm.usub.sat; InstCombine forms these from `a < b ? 0 : a - b` and the
+like) as the VOP3 form of that instruction with the clamp bit set. When the
+other operand is a 32-bit literal (not an inline constant), SIFoldOperands
+folds it in by shrinking the instruction to its VOP2 form, the only one that
+takes a literal on gfx8. VOP2 has no clamp bit and the fold does not check
+for one, so the result wraps instead of saturating: usub.sat(x, 1000)
+becomes `v_subrev_u32_e32 v, vcc, 0x3e8, v`. SIInstrInfo::canShrink, which
+the other shrink paths use, refuses instructions with clamp set; this
+special case does not call it. gfx9 and later select the carry-less
+V_ADD_U32/V_SUB_U32 for these and keep the clamp.
+
+rocPRIM's device merge sort (rocprim::merge_sort, behind thrust::sort and
+sort_by_key for keys that are not plain numbers: c10::Half in torch.sort and
+torch.mode, any struct key) is wrong because of this. In the block-level
+merge of block_sort_merge, merge_path starts its search at
+`diag < input2_size ? 0 : diag - input2_size`. For a full tile, input2_size
+is the compile-time half-tile size, 128 or more, so for every thread in the
+first half of the tile the start wraps to about 4e9, the search is skipped
+and the thread merges from a wrapped LDS index. Every full tile the
+block-sort kernel produces is wrong (512 of 1,024 values on the default
+configuration), and the merge passes after it inherit that. A partial tile
+passes its size at run time, which is why sorts shorter than one tile were
+right; the warp-level merge before it uses half sizes of at most 64, inline
+constants, and is right.
+
+Repro (hipcc -O2 --offload-arch=gfx803):
+
+  __global__ void k(const unsigned* in, unsigned* out) {
+      out[threadIdx.x] = __builtin_elementwise_sub_sat(in[threadIdx.x], 1000u); }
+
+in = 5 gives 4294966301 instead of 0; __builtin_elementwise_add_sat with a
+literal overflows to small numbers the same way. Or llc
+-mtriple=amdgcn-amd-amdhsa -mcpu=gfx803 on llvm.usub.sat.i32(%x, 1000):
+`v_subrev_u32_e32 v2, vcc, 0x3e8, v2`, where gfx900 gives
+`s_movk_i32 s2, 0x3e8` and `v_sub_u32_e64 v1, v1, s2 clamp`.
+
+WHAT
+----
+The carry-op special case in SIFoldOperands::tryAddToFoldList declines the
+fold when the instruction has clamp set and restores the operand order, as
+its other declining path does. The literal stays in an SGPR and the VOP3
+instruction keeps its clamp: one s_movk_i32 or s_mov_b32 per such site.
+Instructions without clamp fold as before.
+
+diff -ru a/llvm/lib/Target/AMDGPU/SIFoldOperands.cpp b/llvm/lib/Target/AMDGPU/SIFoldOperands.cpp
+--- a/llvm/lib/Target/AMDGPU/SIFoldOperands.cpp	2026-10-25 20:50:55.625143181 -0700
++++ b/llvm/lib/Target/AMDGPU/SIFoldOperands.cpp	2026-10-25 20:50:55.631621117 -0700
+@@ -578,7 +578,11 @@
+     if (!TII->isOperandLegal(*MI, CommuteOpNo, OpToFold)) {
+       if ((Opc != AMDGPU::V_ADD_CO_U32_e64 && Opc != AMDGPU::V_SUB_CO_U32_e64 &&
+            Opc != AMDGPU::V_SUBREV_CO_U32_e64) || // FIXME
+-          (!OpToFold->isImm() && !OpToFold->isFI() && !OpToFold->isGlobal())) {
++          (!OpToFold->isImm() && !OpToFold->isFI() && !OpToFold->isGlobal()) ||
++          // The e32 form has no clamp bit, and on subtargets without the
++          // carry-less add/sub a saturating 32-bit add or sub is exactly this
++          // instruction with clamp set: shrinking it would make it wrap.
++          TII->hasModifiersSet(*MI, AMDGPU::OpName::clamp)) {
+         TII->commuteInstruction(*MI, false, OpNo, CommuteOpNo);
+         return false;
+       }

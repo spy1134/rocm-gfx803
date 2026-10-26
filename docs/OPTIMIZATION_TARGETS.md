@@ -1373,19 +1373,13 @@ That test checks one dtype per op, float32 for most, so the script's
 `--fp16` mode runs every op that has float16 on the GPU against float32 on
 the CPU. Besides the expected differences (random output, integer casts of
 out-of-range values, tie order, float16 rounding), it found `torch.mode`
-wrong in fp16, from a compiler bug (FINDINGS section 4,
-`patches/llvm/0003-*`), and `nonzero_static` with an empty input and
+wrong in fp16, from two compiler bugs (FINDINGS section 4,
+`patches/llvm/0003-*` and `0004-*`), and `nonzero_static` with an empty input and
 `size` > 0 dying of a division by zero in its launch arithmetic (every
-PyTorch 2.8 build; PyTorch main fills the output instead). Open:
-- fp16 `torch.mode` over slices of about 1,024 elements and more: rocPRIM's
-  merge sort, which rocThrust uses for keys that are not plain numbers,
-  corrupts its output on gfx803 once the input spans more than one block
-  (FINDINGS section 4).
-- `torch.linalg.eigh` on a batch: the last matrix of a batch of 33x33
-  matrices comes out wrong in about a quarter of calls on identical input
-  (31 and 34 too; 16, 32 and 64 never), never unbatched, and never with
-  `AMD_SERIALIZE_KERNEL=3`: two of rocSOLVER's kernels overlap or one reads
-  what another has not finished writing.
+PyTorch 2.8 build; PyTorch main fills the output instead). `linalg_check.py`'s
+batched eigh case failed intermittently because the HIP runtime's cache
+invalidate before each dispatch could run ahead of the previous kernel's end;
+`patches/clr/` now waits for it (FINDINGS section 4).
 
 ### LLM-9: one q8_1 conversion per shared input
 
