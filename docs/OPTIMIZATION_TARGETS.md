@@ -194,7 +194,7 @@ Open targets in recommended order, then the done ones.
 | TRAIN-2 | fp16 LoRA training over a full-length run | checks `gfx803-train`'s default: same loss and images as fp32 over 1200 steps | Done |
 | SD-8 | Fused attention backward for training | SD1.5 LoRA 512 px, fp32: 3.37 -> 2.87 s/step and 7.6 -> 5.6 GB; 2.03 s/step without gradient checkpointing | Done |
 | SD-6 | Multi-wave fused attention | SD 1.5 fp16 step attention 129 -> 91 ms (step 395 -> 360 ms); SDXL self-attention 2.9x | Done |
-| PT-2 | PyTorch kernels that mix the host's 64-lane warp size with the device's 32 | correctness: wrong results or a GPU reset | Done: four kernels fixed, the audit's other suspects match the CPU; PyTorch's OpInfo sweep left |
+| PT-2 | PyTorch kernels that mix the host's 64-lane warp size with the device's 32 | correctness: wrong results or a GPU reset | Done: four kernels fixed, the audit's other suspects match the CPU, and PyTorch's OpInfo comparison with the CPU passes for every op that runs |
 | LLM-9 | Decode converts a shared input to q8_1 once (patch 111) | generation +1-2% (Qwen3 8B 30.1 -> 30.3-30.8 tok/s) | Done |
 | LLM-4 | llama.cpp prompts through dequantize + fp32 SGEMM (patch 106) | Qwen3 8B prompt 149 -> 215 tok/s in Ollama | Done |
 | LLM-7 | DeltaNet conv-input concat (patch 107) | Qwen3.6 35B-A3B pp2048 244 -> 270 tok/s | Done |
@@ -1359,9 +1359,14 @@ Each suspect got a GPU-against-CPU test of its op, run headless with
 `AMD_SERIALIZE_KERNEL=3` so that a trapping assert names its kernel and costs
 one reset.
 
-**Left.** PyTorch's own OpInfo tests (about 600 ops, against the suite's
-118), run the same way, one op per process, would find the cases the audit
-misses.
+**PyTorch's OpInfo comparison.** PyTorch's own test of every operator on the
+GPU against the CPU (`test_ops.py`, `test_compare_cpu`: each op's reference
+inputs, one dtype per op, tolerance 1e-3; 691 tests) catches what the audit
+missed. On the base image 584 pass, 94 are skipped by the tests themselves
+(non-deterministic outputs, MAGMA, slow cases), 11 are expected failures, and
+the 2 errors are Cholesky, which needs MAGMA (FINDINGS section 4); those two
+tests lack the MAGMA skip the other linear algebra tests have. No process
+died. `tools/correctness-suite/pytorch/opinfo_compare_cpu.sh` runs it.
 
 ### LLM-9: one q8_1 conversion per shared input
 
