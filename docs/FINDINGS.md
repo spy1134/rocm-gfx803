@@ -806,8 +806,18 @@ scratch stores there overwrite the mode with the low half of an index:
 `torch.mode` of `[1, 2, 2, 3, 3, 3, 0.5]` in fp16 returned 2.98e-07 (bit
 pattern 0x0005) instead of 3. `patches/llvm/0003-*` starts dynamic LDS at a
 multiple of 16 on targets without unaligned LDS access. Slices of about
-1,024 elements and more still give wrong fp16 modes with or without it
-(other kernels; open), and fp32 and integer modes are right at every size.
+1,024 elements and more still give wrong fp16 modes with or without it, and
+fp32 and integer modes are right at every size: above 2,048 elements
+`torch.mode` sorts with rocThrust's `sort_by_key`, which takes rocPRIM's
+merge sort for a key type that is not a plain number (`c10::Half`, or any
+struct), and on gfx803 that merge sort corrupts its output as soon as the
+input spans more than one sorted block (about 1,024 elements): keys out of
+order, values detached from their keys, keys that were not in the input.
+It does so with every block configuration, with AMD's compiler and the
+patched one, and with kernels serialized; plain-number keys take the radix
+sort and are right. Reproduction outside PyTorch:
+`tools/correctness-suite/pytorch/rocprim_merge_sort_repro.hip`
+(rocprim::merge_sort, 4-byte struct keys, int64 values). Open.
 
 To check: `torch.mode(torch.tensor([1., 2., 2., 3., 3., 3., 0.5],
 device="cuda").half())` returns 3.

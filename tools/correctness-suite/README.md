@@ -106,6 +106,9 @@ any image built from this repository with the card passed through.
 - `rocprim_repro.hip`: rocPRIM's select and transform outside PyTorch. Both work on gfx803,
   which shows that the "invalid device function" inside torch comes from how the libraries are
   linked, not from rocPRIM.
+- `rocprim_merge_sort_repro.hip`: rocPRIM's merge sort (rocThrust's sort for keys that are not plain
+  numbers, such as `c10::Half`, so fp16 `torch.mode` above 2,048 elements) against a host check. On
+  gfx803 every case beyond one sorted block (about 1,024 elements) is wrong; open.
 - `rocprim_ops_check.py`: nonzero, masked indexing, unique, sorts and argsorts (fp32, fp16,
   int64, up to 3M elements), cumsum, top-k, index_put with accumulate, bincount, searchsorted,
   randperm and embedding backward on the GPU against the CPU. Expect 118 of 118; an image
