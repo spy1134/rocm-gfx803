@@ -120,6 +120,10 @@ Without this project's changes, on these cards:
   multiple of 16384, and a failed device `assert()` faulted instead of reporting:
   AMD's compiler reads some of a function's implicit arguments from address 0
   on gfx8 when the function is not inlined.
+- fp16 `torch.sort` and `torch.mode` and rocSPARSE's `csrsort` returned
+  unsorted or mixed-up results: on gfx8 AMD's compiler drops the clamp of a
+  saturating add or subtract with a constant, which rocPRIM's merge sorts rely
+  on, and places dynamic shared memory less aligned than CUDA code assumes.
 - Ollama read prompts about ten times slower than the card allows, generated
   text below its memory bandwidth, could fill VRAM until the desktop stalled,
   and ran fp16-weight matmuls (vision encoders) with about 1% error.

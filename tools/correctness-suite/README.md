@@ -110,6 +110,12 @@ any image built from this repository with the card passed through.
   numbers, such as `c10::Half`, so fp16 `torch.mode` above 2,048 elements) against a host check. On
   gfx803, with a compiler that lacks `patches/llvm/0004-amdgpu-gfx8-carry-add-sub-clamp.patch`, every
   case of one full sorted tile (1,024 elements) or more is wrong; with it, all are right.
+- `rocsparse_csrsort_check.cpp`: `rocsparse_csrsort` (PyTorch's `hipsparseXcsrsort`) on rows of 1 to
+  65,536 entries against a host sort. rocSPARSE's segmented radix sort runs rocPRIM's stable warp
+  sort on rows of up to 4,096 entries; a rocSPARSE built with a compiler that lacks
+  `patches/llvm/0004-amdgpu-gfx8-carry-add-sub-clamp.patch` gets nearly every such row wrong.
+  Expect 0 wrong rows on every line and exit status 0:
+  `hipcc -O2 --offload-arch=gfx803 rocsparse_csrsort_check.cpp -lrocsparse -o csrsort_check && ./csrsort_check`.
 - `rocprim_ops_check.py`: nonzero, masked indexing, unique, sorts and argsorts (fp32, fp16,
   int64, up to 3M elements), cumsum, top-k, index_put with accumulate, bincount, searchsorted,
   randperm and embedding backward on the GPU against the CPU. Expect 118 of 118; an image

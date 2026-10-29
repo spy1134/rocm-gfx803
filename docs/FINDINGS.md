@@ -105,7 +105,7 @@ run with wrong numbers, not a crash. "It runs" was never taken as evidence.
 | Non-inlined device functions read implicit kernel arguments from address 0: PyTorch's mixed fp16/fp32 binary ops crash, assert() faults at its trap | Fixed (clang and libamd_comgr rebuilt, PyTorch rebuilt with them) | 4 | `patches/llvm/` |
 | Flat (generic-pointer) accesses to LDS are dropped when M0 is not set (gfx8) | Fixed (same compiler) | 4 | `patches/llvm/` |
 | Dynamic LDS less aligned than CUDA code assumes: unaligned LDS accesses overwrite the variables before it (fp16 `torch.mode` returns an index as its value) | Fixed (same compiler) | 4 | `patches/llvm/0003-*` |
-| A saturating add/sub with a 32-bit literal loses its clamp and wraps (rocPRIM's merge sort: fp16 `torch.sort`/`torch.mode`, thrust sorts of non-numeric keys) | Fixed (same compiler) | 4 | `patches/llvm/0004-*` |
+| A saturating add/sub with a 32-bit literal loses its clamp and wraps (rocPRIM's merge sort: fp16 `torch.sort`/`torch.mode`, thrust sorts of non-numeric keys; rocSPARSE's `csrsort`/`coosort`) | Fixed (same compiler; rocSPARSE rebuilt with it) | 4 | `patches/llvm/0004-*`, `patches/rocsparse/` |
 | rocSOLVER and rocSPARSE ship no gfx803 code, so their kernels silently never run | Fixed (rebuilt for gfx803) | 4 | `patches/rocsolver/`, `patches/rocsparse/` |
 | VRAM exhaustion freezes the desktop | Mitigated (VRAM cap) | 7 | `training/gfx803-train.sh` |
 | llama.cpp prompt processing 10x slow | Fixed | 9 | `patches/ollama/llama-cpp/100-*` |
@@ -842,6 +842,31 @@ the carry-less add and subtract and keep the clamp. `patches/llvm/0004-*`
 declines that fold when clamp is set; gfx900 and gfx1030 output is unchanged.
 Plain-number keys take the radix sort and were never affected.
 Reproduction: `tools/correctness-suite/pytorch/rocprim_merge_sort_repro.hip`.
+
+The same fold sat in rocSPARSE, which is compiled ahead of time. Its segmented
+radix sort, behind `rocsparse_csrsort`, `rocsparse_coosort` (PyTorch's
+`hipsparseXcsrsort` and `hipsparseXcoosortByRow`) and the adaptive `csrmv`,
+sorts segments of up to 4,096 entries with rocPRIM's stable warp sort, whose
+merge step subtracts from the literal 4,096 with saturation. Built with the
+shipped compiler it moved column indices between rows: `csrsort` returned
+nearly every row of 1 to 4,096 entries wrong, rows of a single entry
+included, and rows longer than that right. The rocSPARSE stage now builds
+with the patched `clang-19` and stops when that compiler still drops the
+clamp (`patches/rocsparse/check-clang.sh`). PyTorch's own sparse operations
+(`coalesce`, conversion to CSR, CSR addition and products) do not reach this
+sort and were right either way. Check:
+`tools/correctness-suite/pytorch/rocsparse_csrsort_check.cpp`, 0 wrong rows on
+every line.
+
+The other libraries built ahead of time keep AMD's compiler. Compiled with
+both compilers, the gfx803 code of rocBLAS's own kernels, rocSOLVER, the GEMM
+shim, the kernels MIOpen had cached and Ollama's llama.cpp has no clamp site;
+rocSOLVER's kernels whose dynamic LDS moves from byte 8 to 16 make no LDS
+access wider than 8 bytes; the M0 set-up of the flat-LDS fix lands in kernels
+that set M0 to the same value before it and call no function that could
+change it; and llama.cpp reads implicit arguments from address 0 only on its
+device-abort path, where a failed assert then faults instead of trapping.
+MIGraphX's and ONNX Runtime's precompiled kernels are not checked.
 
 To check: `torch.mode(torch.tensor([1., 2., 2., 3., 3., 3., 0.5],
 device="cuda").half())` returns 3.

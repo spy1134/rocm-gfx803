@@ -34,9 +34,9 @@
 #                implicit kernel arguments from address 0, leaves M0 unset
 #                for generic-pointer accesses to LDS, aligns dynamic LDS
 #                less than CUDA code assumes, and drops the clamp of a
-#                saturating add/sub with a literal; patches/llvm/. PyTorch is
-#                built with the patched clang, and the image's hipcc and
-#                run-time compilation (hipRTC, MIOpen) use it.
+#                saturating add/sub with a literal; patches/llvm/. PyTorch and
+#                rocSPARSE are built with the patched clang, and the image's
+#                hipcc and run-time compilation (hipRTC, MIOpen) use it.
 #   MIGraphX  -- prebuilt for gfx900+ only.
 #   PyTorch   -- no gfx803 wheel has ever been published.
 #   ORT       -- built against the MIGraphX above.
@@ -500,34 +500,6 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocsolver-ccache \
 FROM scratch AS rocsolver-export
 COPY --from=rocsolver-builder /rs-out/ /
 
-# rocSPARSE rebuilt for gfx803. The library in the base image has no gfx803 code object and launches for a missing
-# architecture are dropped without an error, so sparse products on the GPU return wrong values silently.
-# Builds against the gfx803 rocBLAS carried by rocblas-export. Only the library file leaves this stage.
-FROM python-base AS rocsparse-builder
-
-ARG ROCM_VERSION
-ARG ROCM_ARCH=gfx803
-ARG BUILD_PARALLEL_LEVEL
-
-COPY --from=rocblas-export /opt/rocm /opt/rocm
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        cmake ninja-build build-essential pkg-config ccache zstd \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN git clone --branch "rocm-${ROCM_VERSION}" --depth 1 \
-        https://github.com/ROCm/rocSPARSE.git /rocsparse-src
-
-COPY patches/rocsparse/build-rocsparse.sh /scripts/build-rocsparse.sh
-RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocsparse-ccache \
-    /scripts/build-rocsparse.sh configure
-RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocsparse-ccache \
-    /scripts/build-rocsparse.sh build \
-    && rm -rf /rsp-build
-
-FROM scratch AS rocsparse-export
-COPY --from=rocsparse-builder /rsp-out/ /
-
 # libamdhip64 rebuilt from ROCm/clr with the gfx8 cache-maintenance patch. The command processor of gfx803 does not
 # invalidate the per-CU vector L1 between dispatches, so a kernel can read the previous contents of a page that a copy
 # kernel has just refilled. The stage builds the one library and nothing else leaves it.
@@ -611,6 +583,41 @@ RUN --mount=type=cache,target=/root/.ccache,id=gfx803-llvm-ccache \
 
 FROM scratch AS llvm-export
 COPY --from=llvm-builder /llvm-out/ /
+
+# rocSPARSE rebuilt for gfx803. The library in the base image has no gfx803 code object and launches for a missing
+# architecture are dropped without an error, so sparse products on the GPU return wrong values silently.
+# Builds against the gfx803 rocBLAS carried by rocblas-export, with the patched clang-19 of llvm-export: its segmented
+# radix sort (csrsort, coosort, the adaptive csrmv) runs rocPRIM's stable warp sort, whose merge step subtracts with
+# saturation from a 32-bit literal, and built with the shipped compiler, which drops that clamp on gfx8, it moved column
+# indices between rows and sorted nearly every row of up to 4,096 entries wrong. Only the library file leaves this
+# stage.
+FROM python-base AS rocsparse-builder
+
+ARG ROCM_VERSION
+ARG ROCM_ARCH=gfx803
+ARG BUILD_PARALLEL_LEVEL
+
+COPY --from=rocblas-export /opt/rocm /opt/rocm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake ninja-build build-essential pkg-config ccache zstd \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --branch "rocm-${ROCM_VERSION}" --depth 1 \
+        https://github.com/ROCm/rocSPARSE.git /rocsparse-src
+
+COPY patches/rocsparse/build-rocsparse.sh /scripts/build-rocsparse.sh
+COPY --from=llvm-export /clang-19 /opt/rocm/lib/llvm/bin/clang-19
+COPY patches/rocsparse/check-clang.sh /scripts/check-clang.sh
+RUN sh /scripts/check-clang.sh
+RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocsparse-ccache \
+    /scripts/build-rocsparse.sh configure
+RUN --mount=type=cache,target=/root/.ccache,id=gfx803-rocsparse-ccache \
+    /scripts/build-rocsparse.sh build \
+    && rm -rf /rsp-build
+
+FROM scratch AS rocsparse-export
+COPY --from=rocsparse-builder /rsp-out/ /
 
 FROM python-base AS migraphx-builder
 
@@ -1156,8 +1163,10 @@ ENV PATH="$VIRTUAL_ENV/bin:${PATH}"
 COPY runtime/python/ /opt/rocm/lib/
 
 # clang-19 and libamd_comgr with the gfx8 code generation fixes: hipcc in images built on this one, and every kernel
-# that hipRTC, MIOpen and MIGraphX compile at run time. The libraries built in the stages above keep the compiler they
-# were built with. Late in the stage, with the shim, so a compiler change rebuilds only these layers. The check
+# that hipRTC, MIOpen and MIGraphX compile at run time. The other libraries built in the stages above keep AMD's
+# compiler; rocBLAS's and rocSOLVER's gfx803 code compiled with both differs only in M0 set-up that does not change
+# their results and in dynamic LDS offsets their accesses do not need. Late in the stage, with the shim, so a
+# compiler change rebuilds only these layers. The check
 # compiles through the installed libamd_comgr and needs no GPU.
 COPY --from=llvm-export /clang-19 /opt/rocm/lib/llvm/bin/clang-19
 COPY --from=llvm-export /libamd_comgr.so.3.0.60404 /opt/rocm/lib/
