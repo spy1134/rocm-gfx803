@@ -611,8 +611,12 @@ of a batch of 4x33x33, whose workgroups run last, came out wrong in about a
 quarter of calls on identical input (never with `AMD_SERIALIZE_KERNEL=3`,
 never unbatched), and a rocBLAS strided-batched sgemm of that shape followed by
 a reader kernel saw about 1,800 stale elements in 300 iterations. With the
-flush both are 0 (eigh 0 of 300 calls), and an empty dispatch costs 4.1 instead
-of 4.2 us.
+flush both are 0 (eigh 0 of 300 calls). An empty dispatch costs the same with
+the flush (4.1 against 4.2 us), but a dispatch that follows a running kernel now
+waits for it to drain before the invalidate. llama-server generation through
+the Ollama image, ten chat prompts of 400 tokens, two runs each: Qwen3 8B 30.85
+-> 30.35 tok/s (1.6%), Qwen3.6 35B-A3B with hot experts, about 1,000
+dispatches per token, 38.0 -> 36.8 tok/s (3.3%).
 
 The invalidate sits in the HIP runtime because the runtime issues the dispatch
 packets whose fence scopes promise it. Two other placements were measured and

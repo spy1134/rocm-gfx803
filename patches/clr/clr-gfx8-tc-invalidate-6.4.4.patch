@@ -133,9 +133,11 @@ launch ahead of it. Three call sites:
 
 COST: one 64-byte ring slot plus a full-range vector L1 and scalar cache
 invalidate per dispatch, on gfx7 and gfx8 only. Measured decode cost on a 7B Q4_K
-model is 2.3% to 2.7% (see above). The CS_PARTIAL_FLUSH adds nothing measurable:
-back-to-back empty kernels take 4.11 us each with it and 4.24 us with the bare
-ACQUIRE_MEM; a barrier-AND packet ahead of the slot also cures the eigh case but
+model is 2.3% to 2.7% (see above). The CS_PARTIAL_FLUSH costs nothing on empty
+kernels (4.11 us each with it, 4.24 us with the bare ACQUIRE_MEM), but a
+dispatch that follows a running kernel waits for it to drain: generation is
+1.6% slower on Qwen3 8B and 3.3% slower on Qwen3.6 35B-A3B with hot experts
+(about 1,000 dispatches per token) than with the bare ACQUIRE_MEM; a barrier-AND packet ahead of the slot also cures the eigh case but
 costs 6.55 us per empty dispatch. A kernel launched with hipExtAnyOrderLaunch
 (barrier bit clear) no longer overlaps the kernel ahead of it on gfx7/gfx8. The ROCm 10.x queue cap of 64 packets does not
 apply: ROC_AQL_QUEUE_SIZE is 16384 in 6.4.4.
