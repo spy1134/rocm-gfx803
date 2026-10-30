@@ -1,0 +1,448 @@
+llama.cpp (as fetched by Ollama v0.35.1, llama.cpp b11232, applied after
+141; needs 116 and 140): with hot experts, the add of the device's and the
+CPU's expert outputs runs inside the fused MoE tail, and the lookup of the
+CPU's expert ids runs inside the fused top-k kernel.
+Generic (all GPUs): not gfx803-specific code; measured on gfx803.
+
+WHY
+---
+A Qwen3.6 35B-A3B token with hot experts (patch 140) hands every layer to
+the CPU and back. The device's work from the CPU's return to the next
+hand-off is on the critical path: the add of the two expert halves, the
+MoE tail, the attention or DeltaNet block, the router, top-k, and the
+lookup of the ids the CPU runs (a GET_ROWS of the layer's cold-id table).
+On an RX 590 each dispatch there costs about 5.4 us of idle time before
+the next dependent kernel starts, besides the kernel's own run time. The
+add (about 6 us) and the lookup (about 5 us) are two such dispatches per
+layer, 80 per token, and each does almost no work.
+
+Measured on an RX 590 (llama-server from the Ollama image, Qwen3.6 35B-A3B
+Q4_K_M, hot experts with --moe-hot-mib 4096, ten chat prompts, 400 greedy
+tokens each, two runs per build): 37.76 -> 38.38 tok/s (+1.6%), and every
+answer byte-identical to the build without this patch. Under rocprof the
+token issues 928 instead of 1,007 dispatches; the fused tail takes 15.3
+instead of 11.7 us and the fused top-k 14.5 instead of 12.1 us, against
+the 6 and 5 us kernels and two dispatch gaps they replace.
+
+WHAT
+----
+- moe_tail_rms_norm_mul_q8_1_f32 gains a second experts input (a template
+  flag, so the one-input kernel is unchanged) and adds it element-wise
+  before weighting. ggml_cuda_match_moe_tail_add matches, at an ADD of two
+  same-shape f32 tensors, a weighted reduction and MoE tail (patch 116)
+  whose experts are that ADD, and checks the whole group with
+  ggml_can_fuse_subgraph; h must not overlap either half, since it is
+  written while they are read. graph_optimize keeps both halves allocated
+  until the tail's last node.
+- topk_moe_cuda gains an optional table and output: each selected id is
+  also looked up in the table (I32, one value per expert). The lookups are
+  issued after the selection loop, from the lane that holds each selected
+  expert, so their latency is paid once. The matcher accepts, right after
+  the top-k group, a RESHAPE of the ids and a GET_ROWS of such a table by
+  it, for one token; the RESHAPE stays an output because the hot experts'
+  lookup reads it too.
+
+Numerics are unchanged: the add is the same float add of the same two
+values, and the lookup copies integers.
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3903,6 +3903,51 @@
+     return true;
+ }
+ 
++// With hot experts in VRAM the device's and the CPU's halves of a layer's experts are added after the
++// hand-back from the CPU, so a separate add dispatch would sit on the critical path of every layer.
++// Matched at the ADD so that the tail can read both halves. With check_data the halves must not overlap
++// h, which is written while they are still read.
++static bool ggml_cuda_match_moe_tail_add(const ggml_cgraph * cgraph, int add_idx,
++        ggml_cuda_moe_weighted_reduction_match & red, ggml_cuda_moe_tail_match & tail, bool check_data) {
++    const ggml_tensor * add = cgraph->nodes[add_idx];
++    if (add->op != GGML_OP_ADD || add->type != GGML_TYPE_F32 || !ggml_is_contiguous(add) ||
++            add_idx + 1 >= cgraph->n_nodes) {
++        return false;
++    }
++    for (const ggml_tensor * t : { add->src[0], add->src[1] }) {
++        if (t == nullptr || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || !ggml_are_same_shape(t, add)) {
++            return false;
++        }
++    }
++    if (!ggml_cuda_match_moe_weighted_reduction(cgraph, add_idx + 1, red) || red.experts != add ||
++            !ggml_cuda_match_moe_tail(cgraph, add_idx + 1, red, tail, check_data)) {
++        return false;
++    }
++
++    const int node_count = tail.node_count + 1;
++    if (node_count >= 32) {
++        return false;
++    }
++    ggml_op ops[32];
++    for (int j = 0; j < node_count; ++j) {
++        ops[j] = cgraph->nodes[add_idx + j]->op;
++    }
++    const int k          = add_idx + 1 + red.node_count;
++    const int outputs[2] = { k + 1, k + 3 };
++    if (!ggml_can_fuse_subgraph(cgraph, add_idx, node_count, ops, outputs, 2)) {
++        return false;
++    }
++    if (check_data) {
++        for (const ggml_tensor * t : { add->src[0], add->src[1] }) {
++            if (ggml_cuda_bytes_overlap(tail.h, t)) {
++                return false;
++            }
++        }
++    }
++    tail.node_count = node_count;
++    return true;
++}
++
+ // A GET_ROWS that copies one recurrent-state row out of its cache for one sequence and is read, through
+ // a RESHAPE, only by the first later node of type consumer_op that uses it. Returns that node's index or
+ // -1. What lies between the two is for the caller to check.
+@@ -4878,13 +4923,23 @@
+         }
+     }
+ 
++    if (node->op == GGML_OP_ADD && cuda_ctx->curr_stream_no == 0) {
++        ggml_cuda_moe_weighted_reduction_match match;
++        ggml_cuda_moe_tail_match               tail;
++        if (ggml_cuda_match_moe_tail_add(cgraph, i, match, tail, /*check_data=*/true)) {
++            ggml_cuda_op_moe_tail_rms_norm_q8_1(*cuda_ctx, node->src[0], node->src[1], match.expert_scale,
++                match.weights, tail.shexp, tail.resid, tail.h, tail.rms_norm, tail.mul_w, tail.normed);
++            return tail.node_count - 1;
++        }
++    }
++
+     if (node->op == GGML_OP_MUL) {
+         ggml_cuda_moe_weighted_reduction_match match;
+         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
+             ggml_cuda_moe_tail_match tail;
+             if (cuda_ctx->curr_stream_no == 0 &&
+                     ggml_cuda_match_moe_tail(cgraph, i, match, tail, /*check_data=*/true)) {
+-                ggml_cuda_op_moe_tail_rms_norm_q8_1(*cuda_ctx, match.experts, match.expert_scale, match.weights,
++                ggml_cuda_op_moe_tail_rms_norm_q8_1(*cuda_ctx, match.experts, nullptr, match.expert_scale, match.weights,
+                     tail.shexp, tail.resid, tail.h, tail.rms_norm, tail.mul_w, tail.normed);
+                 return tail.node_count - 1;
+             }
+@@ -4963,10 +5018,37 @@
+                 weights      = cgraph->nodes[i + ops.size() - 1];
+                 out_nodes[1] = i + ops.size() - 1;
+ 
++                // a GET_ROWS of an I32 table [1, n_expert] by the ids (through a RESHAPE of them) right after the
++                // group: the table lookup is written by the same kernel, which saves a dispatch on the path to the
++                // CPU's expert split. The RESHAPE is a view of the ids and stays an output for its other readers.
++                const int j_view  = i + (int) ops.size();
++                const int j_remap = j_view + 1;
++                if (j_remap < cgraph->n_nodes && cgraph->nodes[j_view]->op == GGML_OP_RESHAPE &&
++                        cgraph->nodes[j_view]->src[0] == ids && ggml_is_contiguous_rows(ids)) {
++                    ggml_tensor * remap = cgraph->nodes[j_remap];
++                    const ggml_tensor * table = remap->src[0];
++                    if (remap->op == GGML_OP_GET_ROWS && remap->src[1] == cgraph->nodes[j_view] &&
++                            remap->type == GGML_TYPE_I32 && table->type == GGML_TYPE_I32 && table->ne[0] == 1 &&
++                            ggml_is_contiguous(table) && ggml_nrows(table) == ids->nb[1] / ids->nb[0] &&
++                            ggml_is_contiguous(remap) && ggml_nelements(remap) == ggml_nelements(ids) && ids->ne[1] == 1) {
++                        std::vector<ggml_op> ops_remap = ops;
++                        ops_remap.push_back(GGML_OP_RESHAPE);
++                        ops_remap.push_back(GGML_OP_GET_ROWS);
++                        const int out_remap[4] = { out_nodes[0], out_nodes[1], j_view, j_remap };
++                        if (ggml_can_fuse_subgraph(cgraph, i, ops_remap.size(), ops_remap.data(), out_remap, 4) &&
++                                ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
++                                ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops_remap.size(), out_remap, 4,
++                                                                     /*is_topk_moe=*/true)) {
++                            ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, table, remap, clamp, scale, bias, args);
++                            return ops_remap.size() - 1;
++                        }
++                    }
++                }
++
+                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
+                         ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
+                         ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
+-                    ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
++                    ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, nullptr, nullptr, clamp, scale, bias, args);
+                     return ops.size() - 1;
+                 }
+             } else if (!args.norm && !args.prob_bias) {
+@@ -4981,7 +5063,7 @@
+                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
+                         ggml_cuda_should_use_topk_moe(softmax, logits, weights, ids) &&
+                         ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
+-                    ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
++                    ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, nullptr, nullptr, clamp, scale, bias, args);
+                     return ops.size() - 1;
+                 }
+             }
+@@ -6027,6 +6109,13 @@
+                             params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(t), tail.normed);
+                         }
+                     }
++                    ggml_cuda_moe_weighted_reduction_match add_red;
++                    ggml_cuda_moe_tail_match               add_tail;
++                    if (i > 0 && ggml_cuda_match_moe_tail_add(cgraph, i - 1, add_red, add_tail, /*check_data=*/false)) {
++                        const ggml_tensor * add = cgraph->nodes[i - 1];
++                        params->add_alloc_dep(params->user_data, add->src[0], tail.normed);
++                        params->add_alloc_dep(params->user_data, add->src[1], tail.normed);
++                    }
+                 }
+                 i += match.node_count - 1;
+             }
+diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -789,21 +789,25 @@
+ // Each step repeats the expressions of the kernels it replaces (moe_weighted_reduction_f32, the fused
+ // add, rms_norm_f32<1024, true>, quantize_q8_1) with the same per-thread element order, the same
+ // block reduction and the same 32-lane quantization groups, so every value is bit-identical to
+-// running those kernels one after another.
+-template <int block_size>
++// running those kernels one after another. With experts_add the expert outputs are the element-wise sum of
++// two tensors, the float add of the ADD node they replace.
++template <int block_size, bool has_add>
+ static __global__ void moe_tail_rms_norm_mul_q8_1_f32(
+-        const float * experts, const float * expert_scale, const float * weights, const int n_expert_used,
+-        const float * shexp, const float * resid, float * h, const float * mul, float * dst, void * vy,
+-        const int ncols, const float eps) {
++        const float * experts, const float * experts_add, const float * expert_scale, const float * weights,
++        const int n_expert_used, const float * shexp, const float * resid, float * h, const float * mul, float * dst,
++        void * vy, const int ncols, const float eps) {
+     const int tid = threadIdx.x;
+ 
+     float tmp = 0.0f;
+     for (int col = tid; col < ncols; col += block_size) {
+         const float first_scale = expert_scale != nullptr ? expert_scale[0] : 1.0f;
+-        float       sum         = (experts[col] * first_scale) * weights[0];
++        const float first       = has_add ? experts[col] + experts_add[col] : experts[col];
++        float       sum         = (first * first_scale) * weights[0];
+         for (int expert = 1; expert < n_expert_used; ++expert) {
+-            const float scale = expert_scale != nullptr ? expert_scale[expert] : 1.0f;
+-            sum += (experts[(int64_t) expert * ncols + col] * scale) * weights[expert];
++            const int64_t idx   = (int64_t) expert * ncols + col;
++            const float   scale = expert_scale != nullptr ? expert_scale[expert] : 1.0f;
++            const float   e     = has_add ? experts[idx] + experts_add[idx] : experts[idx];
++            sum += (e * scale) * weights[expert];
+         }
+         float xi = sum;
+         xi = xi + shexp[col];
+@@ -848,6 +852,7 @@
+ 
+ void ggml_cuda_op_moe_tail_rms_norm_q8_1(ggml_backend_cuda_context & ctx,
+                                          const ggml_tensor *         experts,
++                                         const ggml_tensor *         experts_add,
+                                          const ggml_tensor *         expert_scale,
+                                          const ggml_tensor *         weights,
+                                          const ggml_tensor *         shexp,
+@@ -872,9 +877,10 @@
+     pending.q8_1   = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), q8_1_size);
+ 
+     cudaStream_t stream = ctx.stream();
+-    moe_tail_rms_norm_mul_q8_1_f32<1024><<<1, 1024, 32 * sizeof(float), stream>>>(
+-        (const float *) experts->data, expert_scale ? (const float *) expert_scale->data : nullptr,
+-        (const float *) weights->data, (int) experts->ne[1],
++    auto * kernel = experts_add ? moe_tail_rms_norm_mul_q8_1_f32<1024, true> : moe_tail_rms_norm_mul_q8_1_f32<1024, false>;
++    kernel<<<1, 1024, 32 * sizeof(float), stream>>>(
++        (const float *) experts->data, experts_add ? (const float *) experts_add->data : nullptr,
++        expert_scale ? (const float *) expert_scale->data : nullptr, (const float *) weights->data, (int) experts->ne[1],
+         (const float *) shexp->data, (const float *) resid->data, (float *) h->data,
+         (const float *) mul_w->data, (float *) dst->data, pending.q8_1->get(), (int) ncols, eps);
+     CUDA_CHECK(cudaGetLastError());
+diff --git a/ggml/src/ggml-cuda/norm.cuh b/ggml/src/ggml-cuda/norm.cuh
+--- a/ggml/src/ggml-cuda/norm.cuh
++++ b/ggml/src/ggml-cuda/norm.cuh
+@@ -20,11 +20,13 @@
+ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+ // (see ggml_cuda_try_fuse) MoE weighted reduction + shared expert + residual, then
+-// RMS norm * weight, writing h, the normed row and its q8_1 copy (kept as the next mmvq input)
++// RMS norm * weight, writing h, the normed row and its q8_1 copy (kept as the next mmvq input).
++// experts_add, when not null, is added to experts element-wise first (the hot and cold expert halves).
+ bool ggml_cuda_moe_tail_rms_norm_supported(int64_t ncols);
+ 
+ void ggml_cuda_op_moe_tail_rms_norm_q8_1(ggml_backend_cuda_context & ctx,
+                                          const ggml_tensor *         experts,
++                                         const ggml_tensor *         experts_add,
+                                          const ggml_tensor *         expert_scale,
+                                          const ggml_tensor *         weights,
+                                          const ggml_tensor *         shexp,
+diff --git a/ggml/src/ggml-cuda/topk-moe.cu b/ggml/src/ggml-cuda/topk-moe.cu
+--- a/ggml/src/ggml-cuda/topk-moe.cu
++++ b/ggml/src/ggml-cuda/topk-moe.cu
+@@ -82,7 +82,8 @@
+     This kernel does the following:
+     1. optionally softmax over the logits per token [n_experts, n_tokens]
+     2. argmax reduce over the top-k (n_experts_used) logits
+-    3. write weights + ids to global memory
++    3. write weights + ids to global memory, and with remap_table each id looked up in it (a GET_ROWS of an
++       I32 table by the ids, as the hot-expert split uses to send the CPU only the experts it runs)
+     4. optionally normalize the weights or apply softmax over the selected logits
+ 
+     It is intended as fusion of softmax->top-k->get_rows pipeline for MoE models
+@@ -92,6 +93,8 @@
+ __global__ void topk_moe_cuda(const float *         logits,
+                               float *               weights,
+                               int32_t *             ids,
++                              const int32_t *       remap_table,
++                              int32_t *             remapped,
+                               float *               bias,
+                               const int             n_rows,
+                               const int             n_expert_used,
+@@ -111,6 +114,9 @@
+     logits += n_experts * row;
+     weights += n_expert_used * row;
+     ids += n_experts * row;
++    if (remapped != nullptr) {
++        remapped += n_expert_used * row;
++    }
+ 
+     constexpr int experts_per_thread = (n_experts > WARP_SIZE) ? n_experts / WARP_SIZE : 1;
+ 
+@@ -178,10 +184,14 @@
+     float wt_sum = 0.f;
+ 
+     float output_weights[experts_per_thread];
++    // the k-th selected expert, kept by lane k like its weight; the reduction leaves max_expert the same in
++    // every lane, so the table lookups can all be issued after the loop instead of one per selection
++    int   selected[experts_per_thread];
+ 
+ #pragma unroll
+     for (int i = 0; i < experts_per_thread; i++) {
+         output_weights[i] = 0.f;
++        selected[i]       = 0;
+     }
+ 
+     ggml_cuda_pdl_lc();
+@@ -244,6 +254,7 @@
+ 
+         if ((k & (WARP_SIZE - 1)) == threadIdx.x) {
+             output_weights[k / WARP_SIZE] = max_val;
++            selected[k / WARP_SIZE]       = max_expert;
+         }
+ 
+         if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
+@@ -273,6 +284,9 @@
+         const int idx = i * WARP_SIZE + threadIdx.x;
+         if (idx < n_expert_used) {
+             weights[idx] = output_weights[i] * scale_val;
++            if (remapped != nullptr) {
++                remapped[idx] = remap_table[selected[i]];
++            }
+         }
+     }
+ }
+@@ -282,6 +296,8 @@
+                                  const float *               logits,
+                                  float *                     weights,
+                                  int32_t *                   ids,
++                                 const int32_t *             remap_table,
++                                 int32_t *                   remapped,
+                                  float *                     bias,
+                                  const int                   n_rows,
+                                  const int                   n_expert,
+@@ -300,51 +316,51 @@
+     switch (n_expert) {
+         case 1:
+             ggml_cuda_kernel_launch(topk_moe_cuda<1, has_bias>, launch_params,
+-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
++                logits, weights, ids, remap_table, remapped, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+             break;
+         case 2:
+             ggml_cuda_kernel_launch(topk_moe_cuda<2, has_bias>, launch_params,
+-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
++                logits, weights, ids, remap_table, remapped, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+             break;
+         case 4:
+             ggml_cuda_kernel_launch(topk_moe_cuda<4, has_bias>, launch_params,
+-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
++                logits, weights, ids, remap_table, remapped, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+             break;
+         case 8:
+             ggml_cuda_kernel_launch(topk_moe_cuda<8, has_bias>, launch_params,
+-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
++                logits, weights, ids, remap_table, remapped, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+             break;
+         case 16:
+             ggml_cuda_kernel_launch(topk_moe_cuda<16, has_bias>, launch_params,
+-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
++                logits, weights, ids, remap_table, remapped, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+             break;
+         case 32:
+             ggml_cuda_kernel_launch(topk_moe_cuda<32, has_bias>, launch_params,
+-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
++                logits, weights, ids, remap_table, remapped, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+             break;
+         case 64:
+             ggml_cuda_kernel_launch(topk_moe_cuda<64, has_bias>, launch_params,
+-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
++                logits, weights, ids, remap_table, remapped, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+             break;
+         case 128:
+             ggml_cuda_kernel_launch(topk_moe_cuda<128, has_bias>, launch_params,
+-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
++                logits, weights, ids, remap_table, remapped, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+             break;
+         case 256:
+             ggml_cuda_kernel_launch(topk_moe_cuda<256, has_bias>, launch_params,
+-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
++                logits, weights, ids, remap_table, remapped, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+             break;
+         case 288: // StepFun 3.7
+             ggml_cuda_kernel_launch(topk_moe_cuda<288, has_bias>, launch_params,
+-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
++                logits, weights, ids, remap_table, remapped, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+             break;
+         case 512:
+             ggml_cuda_kernel_launch(topk_moe_cuda<512, has_bias>, launch_params,
+-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
++                logits, weights, ids, remap_table, remapped, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+             break;
+         case 576:
+             ggml_cuda_kernel_launch(topk_moe_cuda<576, has_bias>, launch_params,
+-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
++                logits, weights, ids, remap_table, remapped, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+             break;
+         default:
+             GGML_ASSERT(false && "fatal error");
+@@ -356,6 +372,8 @@
+                            const ggml_tensor *             logits,
+                            ggml_tensor *                   weights,
+                            ggml_tensor *                   ids,
++                           const ggml_tensor *             remap_table,
++                           ggml_tensor *                   remapped,
+                            const ggml_tensor *             clamp,
+                            const ggml_tensor *             scale,
+                            const ggml_tensor *             bias,
+@@ -372,6 +390,9 @@
+     int32_t *     ids_d     = (int32_t *) ids->data;
+     float *       bias_d    = bias ? (float *) bias->data : nullptr;
+ 
++    const int32_t * remap_d    = remapped ? (const int32_t *) remap_table->data : nullptr;
++    int32_t *       remapped_d = remapped ? (int32_t *) remapped->data : nullptr;
++
+     float scale_val = scale ? ggml_get_op_params_f32(scale, 0) : 1.0f;
+ 
+     GGML_ASSERT(ids->nb[1] / ggml_type_size(ids->type) == (size_t) n_experts);
+@@ -392,10 +413,10 @@
+     config.delayed_softmax   = args.delayed_softmax;
+ 
+     if (bias) {
+-        launch_topk_moe_cuda<true>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used, clamp_val,
++        launch_topk_moe_cuda<true>(ctx, logits_d, weights_d, ids_d, remap_d, remapped_d, bias_d, n_rows, n_experts, n_expert_used, clamp_val,
+                              scale_val, config);
+     } else {
+-        launch_topk_moe_cuda<false>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used, clamp_val,
++        launch_topk_moe_cuda<false>(ctx, logits_d, weights_d, ids_d, remap_d, remapped_d, bias_d, n_rows, n_experts, n_expert_used, clamp_val,
+                              scale_val, config);
+     }
+ }
+diff --git a/ggml/src/ggml-cuda/topk-moe.cuh b/ggml/src/ggml-cuda/topk-moe.cuh
+--- a/ggml/src/ggml-cuda/topk-moe.cuh
++++ b/ggml/src/ggml-cuda/topk-moe.cuh
+@@ -20,6 +20,8 @@
+                            const ggml_tensor *             logits,
+                            ggml_tensor *                   weights,
+                            ggml_tensor *                   ids,
++                           const ggml_tensor *             remap_table,
++                           ggml_tensor *                   remapped,
+                            const ggml_tensor *             clamp,
+                            const ggml_tensor *             scale,
+                            const ggml_tensor *             bias,

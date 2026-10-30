@@ -619,6 +619,13 @@ measurements and a reproduction. In short:
   are byte-identical to keeping those layers in VRAM. Qwen3.6 35B-A3B through
   llama-server, ten chat prompts not used to choose the list, 400 tokens
   each, with 139: whole layers 33.8 tok/s, hot experts (3.8 GB) 39.2.
+- **142-moe-hot-fuse-add-lookup.patch**: with hot experts, two small kernels
+  per layer sit on the path between the CPU's return and the next hand-off:
+  the add of the device's and the CPU's expert outputs, and the lookup of the
+  ids the CPU runs. The add now runs inside the fused MoE tail (116) and the
+  lookup inside the fused top-k kernel, 80 dispatches per token fewer, with
+  identical output. Same setup with the hot budget fixed at 4096 MiB: 37.76
+  -> 38.38 tok/s.
 - **127-gcn4-cublas-dst-pad.patch**: 106 pads the weight and activation rows
   of a prompt matmul, but the output kept its natural stride, and with 8192
   rows (Qwen3.6's DeltaNet input projection) the output's columns lie 32 KiB

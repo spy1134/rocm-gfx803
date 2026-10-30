@@ -209,6 +209,11 @@ RUN CC=/opt/rocm/llvm/bin/clang CXX=/opt/rocm/llvm/bin/clang++ \
     && { grep -q "this expert runs on another device" \
              build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/mmvq.cu \
          || { echo "141-mmvq-skip-unselected-expert.patch was not applied" >&2; exit 1; }; } \
+    && { grep -q ggml_cuda_match_moe_tail_add \
+             build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/ggml-cuda.cu \
+         && grep -q remap_table \
+             build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/topk-moe.cu \
+         || { echo "142-moe-hot-fuse-add-lookup.patch was not applied" >&2; exit 1; }; } \
     && cmake --build build/llama-server-rocm_v7_2 --parallel "$(nproc)" \
     && cmake --install build/llama-server-rocm_v7_2 --component llama-server --strip
 
