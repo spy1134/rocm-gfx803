@@ -1,0 +1,135 @@
+llama.cpp (as fetched by Ollama v0.35.1, llama.cpp b11232, applied after
+102 and 129): patch 102's decode kernel for head size 512, which Gemma 4
+uses in its full-attention layers.
+gfx803-specific: engages only for cc == GGML_CUDA_CC_GCN4 (host) and GCN4
+(device code).
+
+WHY
+---
+Gemma 4 26B-A4B has five full-attention layers with head size 512 and 16
+query heads over 2 K/V heads; its other 25 layers use head size 256 over a
+1024-token sliding window. The vec kernel has no instance for head size 512,
+so with a q8_0 KV cache one query token of those five layers goes to the
+tile kernel. That converts the whole K/V range to fp16 first and then runs
+a tile instance that spills about 4 KB per lane to scratch. On an RX 590
+(test-backend-ops perf, 2 K/V heads x 8 query heads) one layer takes:
+
+    K/V length       512    2048    8192    32768
+    tile kernel      635    1402    4529    16495 us
+
+At 32k tokens of context that is 82 ms per generated token in those five
+layers alone. Generation falls from 18.5 tok/s with ~2,000 tokens of
+context to 10.6 tok/s at 19,500.
+
+WHAT
+----
+ggml_cuda_flash_attn_ext_gcn4_decode() also takes head size 512, and
+ggml_cuda_flash_attn_ext() tries it in the tile branch before the tile
+kernel. The function's other conditions are unchanged (gfx803, one query
+token, q8_0 K and V, GQA ratio 2 or more, a mask, a KV length that is a
+multiple of 256). On gfx803 a quantized KV cache with head size 256 or less
+already takes the vec branch for one query token, so head size 512 is the
+only case this adds.
+
+At head size 512 a lane holds 8 output dimensions per query head. Only the
+2-head blocks stay within 128 VGPRs (115, against 134 and 209 at 4 and 8
+heads, no spills), and the second wave per SIMD that allows is faster than
+sharing each K/V row among more heads at every length:
+
+    K/V length       512    2048    8192    32768
+    8 heads/block    139     240     474     1723 us
+    4 heads/block     77     142     434     1483 us
+    2 heads/block     48      88     260      887 us
+
+so head size 512 always runs 2 heads per block; head sizes 64-256 keep
+patch 102's choice.
+
+Result on an RX 590, Gemma 4 26B-A4B-it heretic-ara i1-Q4_K_M, experts in
+system RAM, llama-server, q8_0 KV cache, greedy:
+
+    eight ~2,000-token prompts, 300 tokens   18.53 -> 21.44 tok/s
+    7,800-token prompt, 150 tokens           14.82 -> 20.80 tok/s
+    19,500-token prompt, 150 tokens          10.56 -> 19.95 tok/s
+
+Prompt processing is unchanged.
+
+VERIFIED ON REAL HARDWARE (RX 590):
+- test-backend-ops test -b ROCm0 -o FLASH_ATTN_EXT: all 604 q8_0 cases
+  pass against the CPU backend, including 240 added one-token cases with
+  q8_0 K/V: head sizes 256 and 512, 1, 2 and 4 K/V heads, GQA ratios 2, 3,
+  4, 8 and 16, KV length 256-4096, with and without sinks.
+- llama-perplexity KL divergence against the CPU backend with one-token
+  micro-batches (-ub 1), so that every token runs this kernel: 8 chunks of
+  512 tokens 0.436 before, 0.416 after (same top token 80.9% / 81.2%);
+  2 chunks of 2048 tokens, which score positions past the 1024-token
+  sliding window, 0.322 / 0.324 (82.3% / 82.4%). Two CPU code paths (with
+  and without weight repacking) differ by 0.36 on this model.
+diff --git a/ggml/src/ggml-cuda/fattn-gcn4-decode.cuh b/ggml/src/ggml-cuda/fattn-gcn4-decode.cuh
+index 12c2b01..cb3965d 100644
+--- a/ggml/src/ggml-cuda/fattn-gcn4-decode.cuh
++++ b/ggml/src/ggml-cuda/fattn-gcn4-decode.cuh
+@@ -283,19 +283,28 @@ static void ggml_cuda_flash_attn_ext_gcn4_decode_case(ggml_backend_cuda_context
+ 
+ template <int D>
+ static void ggml_cuda_flash_attn_ext_gcn4_decode_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int gqa_ratio) {
+-    // Wider head groups read K/V fewer times but give fewer, longer blocks, which only pays
+-    // off once there are enough blocks to fill the GPU. The block counts at which a width
+-    // starts to win were measured on an RX 590 (36 CUs) with 4 and 8 K/V heads.
+-    const ggml_tensor * K = dst->src[1];
+-    auto nblocks = [&](const int ncols2) {
+-        return K->ne[2]*K->ne[3]*((gqa_ratio + ncols2 - 1)/ncols2)*(K->ne[1]/fattn_gcn4_rows);
+-    };
+-    if (gqa_ratio > 4 && nblocks(8) >= 128) {
+-        ggml_cuda_flash_attn_ext_gcn4_decode_case<D, 8>(ctx, dst);
+-    } else if (gqa_ratio > 2 && nblocks(4) >= 32) {
+-        ggml_cuda_flash_attn_ext_gcn4_decode_case<D, 4>(ctx, dst);
+-    } else {
++    if constexpr (D == 512) {
++        // A lane holds 8 output dimensions per query head here: the 2-head blocks fit in 128 VGPRs,
++        // and the second wave per SIMD that allows beats sharing K/V among more heads at every KV
++        // length (RX 590, 2 K/V heads x 8 query heads, 512-32768 keys: 48-889 us against 77-1483
++        // at 4 heads and 139-1723 at 8).
++        GGML_UNUSED(gqa_ratio);
+         ggml_cuda_flash_attn_ext_gcn4_decode_case<D, 2>(ctx, dst);
++    } else {
++        // Wider head groups read K/V fewer times but give fewer, longer blocks, which only pays
++        // off once there are enough blocks to fill the GPU. The block counts at which a width
++        // starts to win were measured on an RX 590 (36 CUs) with 4 and 8 K/V heads.
++        const ggml_tensor * K = dst->src[1];
++        auto nblocks = [&](const int ncols2) {
++            return K->ne[2]*K->ne[3]*((gqa_ratio + ncols2 - 1)/ncols2)*(K->ne[1]/fattn_gcn4_rows);
++        };
++        if (gqa_ratio > 4 && nblocks(8) >= 128) {
++            ggml_cuda_flash_attn_ext_gcn4_decode_case<D, 8>(ctx, dst);
++        } else if (gqa_ratio > 2 && nblocks(4) >= 32) {
++            ggml_cuda_flash_attn_ext_gcn4_decode_case<D, 4>(ctx, dst);
++        } else {
++            ggml_cuda_flash_attn_ext_gcn4_decode_case<D, 2>(ctx, dst);
++        }
+     }
+ }
+ 
+@@ -331,6 +340,7 @@ static bool ggml_cuda_flash_attn_ext_gcn4_decode(ggml_backend_cuda_context & ctx
+         case  64: ggml_cuda_flash_attn_ext_gcn4_decode_switch_ncols2< 64>(ctx, dst, gqa_ratio); return true;
+         case 128: ggml_cuda_flash_attn_ext_gcn4_decode_switch_ncols2<128>(ctx, dst, gqa_ratio); return true;
+         case 256: ggml_cuda_flash_attn_ext_gcn4_decode_switch_ncols2<256>(ctx, dst, gqa_ratio); return true;
++        case 512: ggml_cuda_flash_attn_ext_gcn4_decode_switch_ncols2<512>(ctx, dst, gqa_ratio); return true;
+         default:  return false;
+     }
+ }
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index 9eddea0..4336227 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -763,6 +763,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+         case BEST_FATTN_KERNEL_NONE:
+             GGML_ABORT("fatal error");
+         case BEST_FATTN_KERNEL_TILE:
++            // The vec kernel has no instance for head size 512, so one query token of Gemma 4's global
++            // layers lands here.
++            if (ggml_cuda_flash_attn_ext_gcn4_decode(ctx, dst)) {
++                break;
++            }
+             if (!ggml_cuda_flash_attn_ext_gcn4_prompt(ctx, dst)) {
+                 ggml_cuda_flash_attn_ext_tile(ctx, dst);
+             }

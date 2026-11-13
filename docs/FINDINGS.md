@@ -111,6 +111,7 @@ run with wrong numbers, not a crash. "It runs" was never taken as evidence.
 | llama.cpp prompt processing 10x slow | Fixed | 9 | `patches/ollama/llama-cpp/100-*` |
 | llama.cpp long-context prompts slow | Fixed | 9 | `patches/ollama/llama-cpp/101-*` |
 | llama.cpp q8_0 generation slows with context | Fixed | 9 | `patches/ollama/llama-cpp/102-*` |
+| llama.cpp generation at head size 512 (Gemma 4) on a spilling kernel | Fixed | 9 | `patches/ollama/llama-cpp/144-*` |
 | llama.cpp K-quant generation below memory bandwidth | Fixed | 9 | `patches/ollama/llama-cpp/103-*` |
 | llama.cpp integer dot products built from byte unpacking | Faster (decode kernels) | 9 | `patches/ollama/llama-cpp/104-*`, `105-*` |
 | llama.cpp prompts on emulated int8 (mmq) | Faster (fp32 GEMMs on the shim) | 9 | `patches/ollama/llama-cpp/106-*` |
@@ -1410,6 +1411,19 @@ bullets are the original findings (patches 100-105); the rest build on them.
   Generation 8k deep: Qwen3 8B 20.9 -> 24.4 tok/s, Qwen2.5-Coder 7B 24.8 ->
   27.2. With it, the 8-bit cache is as fast as f16 or faster from about 4k
   tokens, at half the VRAM, which on 8 GB decides whether a 16k context fits.
+- **Generation at head size 512 fell off the gfx803 kernel** (Gemma 4's five
+  full-attention layers, 16 query heads over 2 K/V heads). The vec kernel has
+  no head-512 instance, so with a q8_0 cache one query token went to the tile
+  kernel, which converts all of K and V to fp16 first and then spills about 4
+  KB per lane: 635 us per layer at 512 tokens of context, 16.5 ms at 32k.
+  Patch 144 runs patch 102's kernel there, always with 2 query heads per block:
+  at head size 512 a lane holds 8 output dimensions per head, and only the
+  2-head block stays within 128 VGPRs, where a second wave per SIMD hides the
+  loads better than wider K/V sharing does (48 us at 512 tokens, 887 us at
+  32k). Gemma 4 26B-A4B generation: 18.5 -> 21.4 tok/s at ~2,000 tokens of
+  context, 10.6 -> 20.0 at 19,500. KL divergence against the CPU with every
+  token through the kernel (-ub 1) 0.436 -> 0.416, inside the model's
+  CPU-vs-CPU spread of 0.36.
 - **Generation below the memory bandwidth for K-quant models.** Generating a
   token reads every weight once, so it should run at the card's bandwidth, and
   for q8_0 and f16 weights it does (222-229 GB/s for a single-token matmul).

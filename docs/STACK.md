@@ -746,6 +746,15 @@ measurements and a reproduction. In short:
   now writes 0, as the CPU backend does. Only padding rows are fully masked
   in a prompt, so no model output changes; test-backend-ops FLASH_ATTN_EXT
   passes in full.
+- **144-gfx803-fattn-decode-d512.patch**: generation at head size 512
+  (Gemma 4's full-attention layers) ran on the tile kernel, which the vec
+  kernel's missing head-512 instance left as the only choice; it spills on
+  gfx803 and converts the whole K/V range to fp16 for every token. 102's
+  kernel now takes head size 512 too, always at 2 query heads per block, the
+  only width within 128 VGPRs there: 635 -> 48 us per layer at 512 tokens of
+  context, 16.5 -> 0.89 ms at 32k. Gemma 4 26B-A4B generation 18.5 -> 21.4
+  tok/s at ~2,000 tokens of context, 10.6 -> 20.0 at 19,500. FLASH_ATTN_EXT
+  q8_0 tests pass (604/604, with 240 added one-token cases).
 - **113-116: fewer dispatches per generated token.** On gfx803 every GPU
   dispatch costs about 4.3 us of command-processor time however small the
   kernel, and a Qwen3.6 35B-A3B token issues about 1,425 of them. Four

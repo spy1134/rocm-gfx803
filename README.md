@@ -129,7 +129,8 @@ Without this project's changes, on these cards:
   and ran fp16-weight matmuls (vision encoders) with about 1% error. The
   background copy of MoE experts that speeds up its prompts gave wrong
   prompt results for MoE models that read a view of an expert weight, such
-  as Gemma 4.
+  as Gemma 4. Gemma 4's head-512 attention layers ran on a kernel that spills
+  registers on gfx803, so its generation halved by 20k tokens of context.
 
 All of these are fixed or mitigated. [`docs/FINDINGS.md`](docs/FINDINGS.md)
 gives each problem's symptom, cause, fix and how to reproduce the check.
