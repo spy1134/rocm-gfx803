@@ -1,0 +1,191 @@
+llama.cpp (as fetched by Ollama v0.35.1, llama.cpp b11232, applied after
+140): the MoE expert prefetch (patches 108 and 126) decides once which split
+inputs live in its slots, and zeroes the padding after each slot copy's last
+row after every copy. Not gfx803-specific code; found and measured on gfx803.
+
+WHY
+---
+Without this patch, prompt processing of a MoE model whose experts stay in
+system RAM gives wrong logits when a layer reads a view of a host weight, and
+NaN when an expert matrix's rows are not a whole number of MMQ K blocks.
+Gemma 4 26B-A4B does both; Qwen3.6 35B-A3B does neither and is unaffected.
+
+1. Views of host weights. The prefetch places a split's host weights in a
+   slot when it assigns the slots, and at compute time the scheduler skips
+   the normal copy of every input that ggml_backend_sched_is_host_weight()
+   accepts, because the prefetch copies those. That test reads the tensor's
+   buffer. A view gets its buffer only when the graph allocator initializes
+   views, which happens after the slots are assigned. Gemma 4 scales each
+   expert's down projection by a reshaped view of blk.N.ffn_down_exps.scale,
+   an input of every down-projection split. At assignment the view had no
+   buffer, so it got no slot and the graph allocator placed its copy in the
+   compute buffer. At compute time it had one, so the normal copy was skipped
+   and the prefetch copied it on the copy stream into that compute-buffer
+   address. That copy is ordered only against the slot events, not against
+   the splits that reuse the compute buffer, so its 512 bytes landed in live
+   activations of the splits running at that moment. The damage depends on
+   timing: it changes with the number of slots and with SDMA on or off, and
+   it disappears when the GPU is serialized. It is not a copy engine or HIP
+   runtime fault: plain HIP reproductions of the slot schedule (pinned and
+   pageable sources, 4 KiB to 520 MiB slots, copies overlapping
+   memory-heavy kernels) are correct with the image's HIP runtime and with
+   AMD's stock one, and the failure occurs with both.
+
+2. Padding. The CUDA/HIP buffer type pads a quantized tensor after its last
+   row (MATRIX_ROW_PADDING), and MMQ reads that padding when a row is not a
+   whole number of its K blocks: Gemma 4's down projections are 704 wide
+   (Q5_0 and Q8_0 in alternate layers), Qwen3.8-Flash's 640. Patch 108 zeroes
+   a slot only when it allocates it. The slots are then reused by splits
+   with other layouts, so a tensor's padding holds bytes of whatever tensor
+   the previous user placed there; read as Q5_0 blocks, some of them decode
+   to inf or NaN scales, and inf or NaN times the zero activations past the
+   row is NaN. A probe of the shipped scheduler found 12 of 60 such paddings
+   nonzero during a 385-token Gemma 4 batch.
+
+Measurements, RX 590, Gemma 4 26B-A4B-it heretic-ara i1-Q4_K_M, experts in
+system RAM, llama-perplexity KL divergence against the CPU backend over 8
+chunks of 512 tokens of fiction prose (-ub 512, q8_0 KV cache, flash
+attention). Gemma 4 is very sensitive to rounding: two CPU code paths (with
+and without weight repacking) already differ by 0.36.
+
+| | mean KLD | same top token |
+| --- | --- | --- |
+| CPU without repack | 0.36 | 82.0% |
+| stock llama.cpp b12340 on the GPU | 0.43 | 80.9% |
+| before, weights memory-mapped | 4.46 | 35.2% |
+| before, weights pinned (--load-mode none) | 9.76 | 9.3% |
+| before, GGML_SCHED_EXPERT_PREFETCH=0 | 0.41 | 81.4% |
+| this patch, pinned or memory-mapped | 0.41 | 81.4% |
+
+With this patch the logits are byte-identical to the run without prefetch.
+
+WHAT
+----
+- ggml_backend_sched_assign_expert_slots records in expert_in_slot which
+  inputs of which split it placed in a slot. ggml_backend_sched_prefetch_split
+  copies exactly those, and the compute loop skips exactly those; every other
+  input, the view included, takes the normal copy path as without prefetch.
+- For each slot copy whose allocation is larger than the tensor, the
+  assignment places an I8 tensor over the padding, and the prefetch zeroes it
+  from a host buffer of zeros on the copy stream right after the tensor's
+  copy. The zeros buffer only grows, after a synchronization, because a
+  queued copy may still be reading it.
+
+VERIFIED ON REAL HARDWARE (RX 590), in the image built with this patch:
+- Gemma 4 26B-A4B as above, prefetch on, pinned weights: mean KLD 0.413499,
+  the same value as with GGML_SCHED_EXPERT_PREFETCH=0.
+- Qwen3.6 35B-A3B heretic Q4_K_M with its hot list, through llama-server:
+  next-token distributions after 20-1,200 words of prose agree with the CPU
+  backend to a mean KL divergence of 0.046 with and without this patch;
+  eight ~2,000-token fiction prompts, 400 greedy tokens each: prompts 545 /
+  548 tok/s, generation 39.75 / 39.53 tok/s without / with it. No GPU fault.
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -853,6 +853,15 @@
+     bool                  expert_compute_recorded[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_EXPERT_MAX_SLOTS];
+     int                 * expert_split_slot; // [splits_capacity]: slot of each split, -1 = none
+     int                   expert_split_slot_cap;
++    // which split inputs ggml_backend_sched_assign_expert_slots placed in a slot, decided once: a view of a host
++    // weight gets its buffer only when the graph allocator initializes views, after the slots are assigned, so
++    // asking ggml_backend_sched_is_host_weight again at compute time answers differently for it
++    bool                * expert_in_slot;    // [expert_split_slot_cap * GGML_SCHED_MAX_SPLIT_INPUTS]
++    // the padding after each slot copy's last row, zeroed after every copy: see ggml_backend_sched_prefetch_split
++    struct ggml_context * expert_pad_ctx;
++    struct ggml_tensor ** expert_pad;        // [expert_split_slot_cap * GGML_SCHED_MAX_SPLIT_INPUTS], NULL = no padding
++    uint8_t             * expert_pad_zeros;  // host zeros, as many as the largest padding
++    size_t                expert_pad_zeros_size;
+ 
+     // early host inputs: see ggml_backend_sched_host_inputs_end
+     ggml_backend_event_t  host_inputs_ready[GGML_SCHED_MAX_BACKENDS];
+@@ -1702,6 +1711,11 @@
+     for (int b = 0; b < sched->n_backends; b++) {
+         sched->expert_slot_need[b] = 0;
+     }
++    const size_t n_pad = (size_t) sched->expert_split_slot_cap * GGML_SCHED_MAX_SPLIT_INPUTS;
++    sched->expert_pad = (struct ggml_tensor **) realloc(sched->expert_pad, n_pad * sizeof(struct ggml_tensor *));
++    memset(sched->expert_pad, 0, n_pad * sizeof(struct ggml_tensor *));
++    sched->expert_in_slot = (bool *) realloc(sched->expert_in_slot, n_pad * sizeof(bool));
++    memset(sched->expert_in_slot, 0, n_pad * sizeof(bool));
+     if (!sched->expert_prefetch || sched->n_copies != 1 || !sched->op_offload) {
+         return;
+     }
+@@ -1763,6 +1777,14 @@
+         sched->expert_slot_size[b] = sched->expert_slot_need[b];
+     }
+ 
++    ggml_free(sched->expert_pad_ctx);
++    struct ggml_init_params pad_params = {
++        /* .mem_size   = */ n_pad * ggml_tensor_overhead(),
++        /* .mem_buffer = */ NULL,
++        /* .no_alloc   = */ true,
++    };
++    sched->expert_pad_ctx = ggml_init(pad_params);
++
+     for (int i = 0; i < sched->n_splits; i++) {
+         const int s = sched->expert_split_slot[i];
+         if (s < 0) {
+@@ -1780,7 +1802,22 @@
+             struct ggml_tensor * input_cpy = tensor_copy(split->inputs[j], b, 0);
+             offset = GGML_PAD(offset, align);
+             ggml_backend_tensor_alloc(buf, input_cpy, (char *) ggml_backend_buffer_get_base(buf) + offset);
+-            offset += ggml_backend_buft_get_alloc_size(sched->bufts[b], input_cpy);
++            sched->expert_in_slot[(size_t) i * GGML_SCHED_MAX_SPLIT_INPUTS + j] = true;
++            const size_t alloc_size = ggml_backend_buft_get_alloc_size(sched->bufts[b], input_cpy);
++            const size_t pad_size   = alloc_size - ggml_nbytes(input_cpy);
++            if (pad_size > 0) {
++                struct ggml_tensor * pad = ggml_new_tensor_1d(sched->expert_pad_ctx, GGML_TYPE_I8, (int64_t) pad_size);
++                ggml_backend_tensor_alloc(buf, pad, (char *) input_cpy->data + ggml_nbytes(input_cpy));
++                sched->expert_pad[(size_t) i * GGML_SCHED_MAX_SPLIT_INPUTS + j] = pad;
++                if (pad_size > sched->expert_pad_zeros_size) {
++                    // a queued pad copy may still read the old zeros
++                    ggml_backend_sched_expert_sync(sched);
++                    free(sched->expert_pad_zeros);
++                    sched->expert_pad_zeros      = (uint8_t *) calloc(pad_size, 1);
++                    sched->expert_pad_zeros_size = pad_size;
++                }
++            }
++            offset += alloc_size;
+         }
+     }
+ }
+@@ -1795,10 +1832,18 @@
+     if (sched->expert_compute_recorded[b][s]) {
+         ggml_backend_event_wait(copy_backend, sched->expert_compute_done[b][s]);
+     }
++    // The slot's previous splits copied their own tensors over this split's layout, so the padding after a
++    // tensor's last row can hold another tensor's bytes. MMQ reads that padding when a row is not a whole
++    // number of its K blocks (Gemma 4's 704-wide and Qwen3.8's 640-wide down projections); stale bytes there
++    // decode as inf or NaN block scales, and their product with the zero activations is NaN.
+     for (int j = 0; j < split->n_inputs; j++) {
+         struct ggml_tensor * input = split->inputs[j];
+-        if (ggml_backend_sched_is_host_weight(input)) {
++        if (sched->expert_in_slot[(size_t) k * GGML_SCHED_MAX_SPLIT_INPUTS + j]) {
+             ggml_backend_tensor_set_async(copy_backend, tensor_copy(input, b, 0), input->data, 0, ggml_nbytes(input));
++            struct ggml_tensor * pad = sched->expert_pad[(size_t) k * GGML_SCHED_MAX_SPLIT_INPUTS + j];
++            if (pad) {
++                ggml_backend_tensor_set_async(copy_backend, pad, sched->expert_pad_zeros, 0, ggml_nbytes(pad));
++            }
+         }
+     }
+     ggml_backend_event_record(sched->expert_copy_done[b][s], copy_backend);
+@@ -1973,7 +2018,7 @@
+             struct ggml_tensor * input = split->inputs[input_id];
+             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+ 
+-            if (sched->expert_split_slot[split_id] >= 0 && ggml_backend_sched_is_host_weight(input)) {
++            if (sched->expert_split_slot[split_id] >= 0 && sched->expert_in_slot[(size_t) split_id * GGML_SCHED_MAX_SPLIT_INPUTS + input_id]) {
+                 continue; // copied by ggml_backend_sched_prefetch_split
+             }
+ 
+@@ -2361,6 +2406,10 @@
+         ggml_backend_event_free(sched->upload_done[b]);
+     }
+     free(sched->expert_split_slot);
++    free(sched->expert_in_slot);
++    free(sched->expert_pad);
++    free(sched->expert_pad_zeros);
++    ggml_free(sched->expert_pad_ctx);
+     ggml_gallocr_free(sched->galloc);
+     ggml_free(sched->ctx);
+     ggml_hash_set_free(&sched->hash_set);

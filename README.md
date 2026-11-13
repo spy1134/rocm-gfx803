@@ -126,7 +126,10 @@ Without this project's changes, on these cards:
   on, and places dynamic shared memory less aligned than CUDA code assumes.
 - Ollama read prompts about ten times slower than the card allows, generated
   text below its memory bandwidth, could fill VRAM until the desktop stalled,
-  and ran fp16-weight matmuls (vision encoders) with about 1% error.
+  and ran fp16-weight matmuls (vision encoders) with about 1% error. The
+  background copy of MoE experts that speeds up its prompts gave wrong
+  prompt results for MoE models that read a view of an expert weight, such
+  as Gemma 4.
 
 All of these are fixed or mitigated. [`docs/FINDINGS.md`](docs/FINDINGS.md)
 gives each problem's symptom, cause, fix and how to reproduce the check.

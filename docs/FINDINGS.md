@@ -1510,6 +1510,43 @@ bullets are the original findings (patches 100-105); the rest build on them.
   the greedy text with prefetch on follows the text with it off for 295
   characters and then diverges at a near-tie; with prefetch off the text is
   identical to the unpatched scheduler's.
+- **The expert prefetch corrupted prompts of MoE models that read a view of
+  a host weight.** Gemma 4 26B-A4B with its experts in system RAM scored a
+  mean KL divergence of 4.5 against the CPU backend over 4,096 tokens of
+  prose (same top token 35%) with the model memory-mapped, and 9.8 (9%)
+  with it in pinned memory as Ollama loads it, against 0.41 with
+  `GGML_SCHED_EXPERT_PREFETCH=0` and 0.43 for stock llama.cpp b12340 on the
+  same card. Two faults in the prefetch, both fixed by
+  `143-moe-prefetch-slot-inputs.patch`:
+  1. The prefetch tests "is this input a host weight" by the tensor's
+     buffer, once when it assigns the slots and again at compute time, when
+     it skips the normal copy of the inputs it handles. A view gets its
+     buffer only when the graph allocator initializes views, after the slot
+     assignment. Gemma 4 scales each expert's down projection by a reshaped
+     view of `blk.N.ffn_down_exps.scale`; that view got no slot, so its copy
+     went to the compute buffer, but at compute time its normal copy was
+     skipped and the prefetch wrote it there on the copy stream, ordered only
+     against the slot events while the compute buffer held other live
+     tensors. The patch records the assignment's decision and uses it in
+     both places.
+  2. A quantized tensor's allocation ends with padding that MMQ reads when a
+     row is not a whole number of its K blocks (Gemma 4's down projections
+     are 704 wide, Qwen3.8-Flash's 640). The slots were zeroed only when
+     allocated and then reused with other layouts, so the padding held other
+     tensors' bytes, some of which decode as inf or NaN block scales. The
+     patch zeroes each slot copy's padding after the copy.
+  With the patch the logits are byte-identical to the run without prefetch,
+  pinned or memory-mapped. The fault depended on timing (slot count, SDMA on
+  or off, serialization) but not on the HIP runtime: reproductions of the
+  slot schedule in plain HIP were correct, and AMD's stock `libamdhip64`
+  failed the same way. Qwen3.6 35B-A3B, which has no such view and 512-wide
+  expert rows, is unaffected: its next-token distributions after 20-1,200
+  words of prose agree with the CPU's to a KL divergence of 0.046, as close
+  as two CPU code paths (0.051), with and without the patch, and its speed
+  is unchanged (generation 39.75 / 39.53 tok/s, prompts 545 / 548 tok/s with
+  its hot list). To check: `llama-perplexity --kl-divergence` against a CPU
+  base on a Gemma 4 GGUF with `--load-mode none` and a fit that keeps the
+  experts in RAM.
 - **Each GPU tensor a CPU expert split reads cost a full round trip.** In
   generation with experts in RAM, every layer hands its hidden state, router
   weights and expert ids to the CPU, and the scheduler copied each with a

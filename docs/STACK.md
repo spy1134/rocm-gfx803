@@ -626,6 +626,17 @@ measurements and a reproduction. In short:
   lookup inside the fused top-k kernel, 80 dispatches per token fewer, with
   identical output. Same setup with the hot budget fixed at 4096 MiB: 37.76
   -> 38.38 tok/s.
+- **143-moe-prefetch-slot-inputs.patch**: the prefetch of 108 and 126
+  decides once, when it assigns the slots, which split inputs it copies, and
+  zeroes the padding after each slot copy's last row after every copy.
+  Without it a view of a host weight (Gemma 4's per-expert down-projection
+  scale) was skipped by the normal copy at compute time but written by the
+  prefetch into the compute buffer while other tensors used that memory, and
+  stale bytes in a reused slot's padding gave NaN when an expert row is not
+  a whole number of MMQ K blocks. Gemma 4 26B-A4B prompts, KL divergence
+  against the CPU over 4,096 tokens: 9.8 -> 0.41, byte-identical to the
+  prefetch switched off. Qwen3.6 35B-A3B output and speed unchanged.
+  docs/FINDINGS.md (section 9) has the measurements.
 - **127-gcn4-cublas-dst-pad.patch**: 106 pads the weight and activation rows
   of a prompt matmul, but the output kept its natural stride, and with 8192
   rows (Qwen3.6's DeltaNet input projection) the output's columns lie 32 KiB
