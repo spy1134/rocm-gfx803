@@ -189,6 +189,7 @@ Open targets in recommended order, then the done ones.
 | PT-3 | Triton for gfx803: `torch.compile`, then vLLM | a capability rather than a speedup: `torch.compile` (inductor), Triton-based libraries (Unsloth, Liger, SageAttention, FlashAttention's AMD Triton backend) and vLLM need Triton, which the images do not build. Schaka/rocm-gfx803's ROCm 10 line has four hardware-verified Triton patches for a newer Triton; PyTorch 2.8 needs Triton 3.4, so three have to be ported and one is probably unneeded there. A plain Triton GEMM reached 0.59 TFLOPS there (the shim: 4-5), so tuning is most of the work | Open, not started |
 | LLM-3 | mmvq vs mmq for 9-16 tokens | speculative/parallel decoding | Open |
 | LLM-1b | SDWA dot product losses (2-token decode) | 1-11% on 2-token decode | Open, minor |
+| LLM-13 | MoE generation: llama.cpp's own expert cache with a CPU share (b12191+) instead of the hot list | upstream's cache + CPU share gains 11-19% on stock llama.cpp, the hot list 27% on this stack | Measured, not adopted: the hot list stays |
 | LLM-12 | MoE generation: the hottest experts in VRAM instead of whole layers | Qwen3.6 35B-A3B through llama-server's fit, chat prompts: 31.5 -> 39.2 tok/s (async hand-off copies 139: 33.2; HIP graphs off: 33.8; hot experts 140/141); the hot set serves 50% of a chat's expert selections against 20% for whole layers | Done: the per-layer CPU hand-off and the CPU's remaining experts are what is left |
 | TRAIN-1 | fp16 LoRA training against fp32 | 2.87 -> 2.47 s/step, 5.8 -> 3.6 GB; without checkpointing 2.07 -> 1.73 s/step, 7.1 -> 4.9 GB | Done (fp16 is `gfx803-train`'s default) |
 | TRAIN-2 | fp16 LoRA training over a full-length run | checks `gfx803-train`'s default: same loss and images as fp32 over 1200 steps | Done |
@@ -1020,6 +1021,50 @@ counting during generation: 48.8% against 50.2%.
   tok/s through llama-server. At the 256k context it is set up with, its
   dense weights and KV cache do not fit beside each other, so nothing is
   left for experts and the fit places layers as before.
+
+### LLM-13: llama.cpp's expert cache with a CPU share
+
+**Why.** llama.cpp gained a GPU cache for experts kept in host memory
+(`--moe-cache-mib`, PR #29887) and later the option to compute a share of
+the cache misses on the CPU instead of uploading them
+(`--moe-cache-cpu-share`, PR #30966, b12191), with a tuning script
+(`scripts/moe-cache-tune.py`). Both apply to batches of up to 32 tokens,
+so to generation. A cache adapts to the text, where the hot list (LLM-12)
+is chosen once on chat transcripts. Ollama 0.40.16 pins b12177, which has
+the cache but not the CPU share; both read their settings from the
+environment (`LLAMA_ARG_MOE_CACHE_MIB`, `LLAMA_ARG_MOE_CACHE_CPU_SHARE`).
+
+**Measured.** Qwen3.6 35B-A3B heretic Q4_K_M, the arguments Ollama passes,
+eight continuation prompts from fiction chapters (~2,000-token prompts),
+400 greedy tokens each, generation tok/s (mean of prompts 2-8). This
+stack's image against stock llama.cpp b12340 built for gfx803 with no
+patches, the cache capped at the hot list's 3,573 MiB:
+
+| Experts in VRAM | 32k context | 64k context |
+| --- | --- | --- |
+| this image, whole layers (fit) | 30.9 | 30.9 |
+| this image, hot list (3,573 MiB) | 39.3 | 39.1 |
+| stock, whole layers (fit) | (left out: ran beside a large download) | 22.5 |
+| stock, `-cmoe`, no cache | 21.0 | 21.1 |
+| stock, cache at share 1 (fills once, then fixed) | 23.3 | 21.8 |
+| stock, cache + the tuner's share 0.8 | 25.2 | 25.0 |
+
+The tuner measured 10.6 GiB/s of uploads over PCIe 3.0 against 120 GiB/s
+for the CPU, so computing a miss on the CPU beats uploading it; at share 1
+the cache is a list fixed by whatever filled it first, and adapting it
+(share 0.8) gains 8% on that. Relative to each build's whole-layer
+placement, the cache with the CPU share gains 11-12% and the hot list 27%.
+Stock llama.cpp also reads prompts at ~27 tok/s on this card against ~590
+with this image's prompt kernels (100, 106), and its decode kernels are
+slower, so the comparison by absolute speed is lopsided either way.
+
+The tuner runs a few servers at cache sizes it derives from the device's
+free memory, which ROCm reports without the desktop's framebuffers (8,164
+MiB free while the desktop held about 200 MiB): it tried a 5,248 MiB cache
+above the requested cap. Cap it with `--max-mib`.
+
+**Not adopted.** Rebasing patches 100-142 onto b12191+ to use the cache
+would replace the hot list with something slower on this card.
 
 ### PT-3: Triton for gfx803
 
