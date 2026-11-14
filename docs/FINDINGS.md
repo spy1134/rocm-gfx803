@@ -121,6 +121,7 @@ run with wrong numbers, not a crash. "It runs" was never taken as evidence.
 | MoE generation: one GPU round trip per tensor handed to the CPU experts | Patch kept but not applied: no speedup in the image; with SDMA on it reset the GPU on kernel 6.18.55 | 9 | `patches/ollama/unapplied/` |
 | GPU resets: `ring sdma0 timeout` with SDMA copies on | Fixed in the image (trigger removed): a kernel waiting for scratch, the page-table update that maps it, and a user SDMA queue polling for a kernel behind it deadlock engine 0 once a second process tips page-table jobs onto that engine; CLR now waits for dependencies on the CPU (prompt speed unchanged). The engine's behaviour remains | 3 | `ROC_CPU_WAIT_FOR_SIGNAL=1` in Dockerfile-Ollama |
 | MoE generation: the GPU idles during the CPU experts, the shared expert waits for them | Faster (all GPUs) | 9 | `patches/ollama/llama-cpp-sched/112-*` |
+| MoE generation: Gemma 4's dense MLP waits for the CPU experts | Faster (all GPUs) | 9 | `patches/ollama/llama-cpp-sched/146-*` |
 | MoE generation: ~1,425 GPU dispatches per token at ~4.3 us each | Faster (all GPUs) | 9 | `patches/ollama/llama-cpp/113-*` to `116-*` |
 | MoE prompts: the DeltaNet recurrence spends a wave per state column (26% of a Qwen3.6 prompt batch) | Faster (all GPUs; prompts +26%) | 9 | `patches/ollama/llama-cpp/117-*` |
 | Ollama rejects argument-less tools | Fixed (all GPUs) | 9 | `patches/ollama/ollama/` |
@@ -1613,6 +1614,16 @@ bullets are the original findings (patches 100-105); the rest build on them.
   scheduler's synchronous copies and changes only what they wait for (an
   event instead of the whole stream); no SDMA fault occurred in any run.
   `GGML_SCHED_EARLY_HOST_INPUTS=0` disables it.
+- **Gemma 4's dense MLP waited for the CPU experts.** Gemma 4 runs a dense
+  MLP beside the MoE in every layer, both fed from the attention output, but
+  build_moe_ffn expands the router and the routed experts into the graph
+  first, so the MLP (about 130 us of GPU work) ran after the CPU's experts
+  on each of the 22 layers whose experts sit in RAM. Patch 146 hands it to
+  112's `moe_expand_after_weights`, with the experts' input norm expanded
+  before the router so that the GPU split's head still ends there: Gemma 4
+  26B-A4B generation 20.6 -> 22.0 tok/s, the waits on the CPU 26.2 -> 21.9
+  ms per token, the same greedy text and the same KL divergence against the CPU
+  to every printed digit.
 - **Every dispatch costs ~4.3 us on gfx803, and a MoE token issued ~1,425.**
   The command processor needs ~2.65 us per kernel launch, plus 1.65 us for
   the vector-L1 invalidate slot (section 4), however small the kernel; a

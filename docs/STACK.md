@@ -587,6 +587,12 @@ measurements and a reproduction. In short:
   (llama-bench with every expert in RAM: 24.6 -> 25.6), identical outputs.
   Like 108, it is in `patches/ollama/llama-cpp-sched/`, because both the
   scheduler and the model graphs are compiled into the CPU build.
+- **146-gemma4-dense-mlp-overlap.patch**: the same for Gemma 4's dense MLP,
+  which runs beside the MoE in every layer and had landed after the CPU's
+  experts in the graph. The gemma4 graph now expands it right after the
+  router through 112's hook, with the experts' input norm placed before the
+  router. Gemma 4 26B-A4B generation 20.6 -> 22.0 tok/s, the same text and
+  KL divergence.
 - **126-moe-prefetch-slots.patch**: 108's prefetch kept two device slots, so
   the copy of an expert split could only start once the split two back had
   finished; with the copies already at the PCIe link's limit (13.3 GB/s) and

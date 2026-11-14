@@ -190,7 +190,7 @@ Open targets in recommended order, then the done ones.
 | LLM-3 | mmvq vs mmq for 9-16 tokens | speculative/parallel decoding | Open |
 | LLM-1b | SDWA dot product losses (2-token decode) | 1-11% on 2-token decode | Open, minor |
 | LLM-13 | MoE generation: llama.cpp's own expert cache with a CPU share (b12191+) instead of the hot list | upstream's cache + CPU share gains 11-19% on stock llama.cpp, the hot list 27% on this stack | Measured, not adopted: the hot list stays |
-| LLM-14 | Gemma 4 26B-A4B: attention at head size 512 | its five full-attention layers ran on the spilling tile kernel for prompts and generation; patch 144 (102's decode kernel at 2 heads per block) and 145 (prompt attention as two SGEMMs and a softmax): generation 18.5 -> 21.4 tok/s at ~2k tokens of context, 10.6 -> 20.0 at 19.5k; prompts 220 -> 305 and 74 -> 265 tok/s | Done: what is left is the CPU experts (~23 of 50 ms per token) |
+| LLM-14 | Gemma 4 26B-A4B: attention at head size 512 | its five full-attention layers ran on the spilling tile kernel for prompts and generation; patch 144 (102's decode kernel at 2 heads per block) and 145 (prompt attention as two SGEMMs and a softmax): generation 18.5 -> 21.4 tok/s at ~2k tokens of context, 10.6 -> 20.0 at 19.5k; prompts 220 -> 305 and 74 -> 265 tok/s. Patch 146 (the dense MLP overlaps the CPU experts): generation +7% | Done: what is left is the CPU experts (~22 of 45 ms per token) |
 | LLM-12 | MoE generation: the hottest experts in VRAM instead of whole layers | Qwen3.6 35B-A3B through llama-server's fit, chat prompts: 31.5 -> 39.2 tok/s (async hand-off copies 139: 33.2; HIP graphs off: 33.8; hot experts 140/141); the hot set serves 50% of a chat's expert selections against 20% for whole layers | Done: the per-layer CPU hand-off and the CPU's remaining experts are what is left |
 | TRAIN-1 | fp16 LoRA training against fp32 | 2.87 -> 2.47 s/step, 5.8 -> 3.6 GB; without checkpointing 2.07 -> 1.73 s/step, 7.1 -> 4.9 GB | Done (fp16 is `gfx803-train`'s default) |
 | TRAIN-2 | fp16 LoRA training over a full-length run | checks `gfx803-train`'s default: same loss and images as fp32 over 1200 steps | Done |
@@ -1085,10 +1085,13 @@ generation at 16.7 tok/s against 18.6 for whole layers, because every layer
 then pays a CPU hand-off; batch sizes of 1024 and 2048 changed prompts by
 +5% and -26% and generation by -3%.
 
-**Left.** The CPU experts. A dense MLP runs beside the MoE in every Gemma 4
-layer; on the GPU it comes after the CPU's experts (about 130 us per layer),
-so overlapping it with them as patch 112 does for Qwen's shared expert would
-take up to ~3 ms per token.
+Patch 146 then moved Gemma 4's dense MLP (about 130 us of GPU work per
+layer), which ran after the CPU's experts, into the window where the GPU
+waits for them, as patch 112 does for Qwen's shared expert: 20.6 -> 22.0
+tok/s.
+
+**Left.** The CPU experts themselves: about 22 ms of a 45 ms token, close
+to what DDR4-2800 delivers for the bytes they read.
 
 ### PT-3: Triton for gfx803
 

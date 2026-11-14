@@ -78,6 +78,9 @@ RUN cmake -S llama/server --preset cpu \
     && { grep -q expert_in_slot \
              build/llama-server-cpu/_deps/llama_cpp-src/ggml/src/ggml-backend.cpp \
          || { echo "143-moe-prefetch-slot-inputs.patch was not applied" >&2; exit 1; }; } \
+    && { grep -q "moe_expand_after_weights = cur_mlp" \
+             build/llama-server-cpu/_deps/llama_cpp-src/src/models/gemma4.cpp \
+         || { echo "146-gemma4-dense-mlp-overlap.patch was not applied" >&2; exit 1; }; } \
     && cmake --build build/llama-server-cpu --parallel "$(nproc)" \
     && cmake --install build/llama-server-cpu --component llama-server --strip \
     && { grep -q GGML_SCHED_EXPERT_PREFETCH dist/lib/ollama/libggml-base.so.0.* \
