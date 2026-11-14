@@ -755,6 +755,17 @@ measurements and a reproduction. In short:
   context, 16.5 -> 0.89 ms at 32k. Gemma 4 26B-A4B generation 18.5 -> 21.4
   tok/s at ~2,000 tokens of context, 10.6 -> 20.0 at 19,500. FLASH_ATTN_EXT
   q8_0 tests pass (604/604, with 240 added one-token cases).
+- **145-gfx803-fattn-prompt-d512-gemm.patch**: prompt attention at head
+  size 512 ran on the same spilling tile kernel at 0.16 TFLOPS, and neither
+  a wider register budget nor patch 131's layout fits it. On gfx803 it now
+  runs as two fp32 strided-batched SGEMMs on the base image's shim (scores
+  for the query heads of a K/V head, then V times the softmax weights,
+  written straight into the output) with an exact masked softmax between
+  them; the fp32 K/V copies and the scores lie in the compute buffer's
+  reservation (+32 MiB for Gemma 4 at a 32k context). 1711 -> 132 ms per
+  layer for a 512-token batch at 16k keys. Gemma 4 26B-A4B prompts 220 ->
+  305 tok/s at ~2,000 tokens, 74 -> 265 at 19,500; KL divergence against the
+  CPU unchanged.
 - **113-116: fewer dispatches per generated token.** On gfx803 every GPU
   dispatch costs about 4.3 us of command-processor time however small the
   kernel, and a Qwen3.6 35B-A3B token issues about 1,425 of them. Four

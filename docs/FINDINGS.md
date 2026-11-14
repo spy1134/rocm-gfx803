@@ -112,6 +112,7 @@ run with wrong numbers, not a crash. "It runs" was never taken as evidence.
 | llama.cpp long-context prompts slow | Fixed | 9 | `patches/ollama/llama-cpp/101-*` |
 | llama.cpp q8_0 generation slows with context | Fixed | 9 | `patches/ollama/llama-cpp/102-*` |
 | llama.cpp generation at head size 512 (Gemma 4) on a spilling kernel | Fixed | 9 | `patches/ollama/llama-cpp/144-*` |
+| llama.cpp prompt attention at head size 512 (Gemma 4) at 0.16 TFLOPS | Faster (fp32 GEMMs on the shim) | 9 | `patches/ollama/llama-cpp/145-*` |
 | llama.cpp K-quant generation below memory bandwidth | Fixed | 9 | `patches/ollama/llama-cpp/103-*` |
 | llama.cpp integer dot products built from byte unpacking | Faster (decode kernels) | 9 | `patches/ollama/llama-cpp/104-*`, `105-*` |
 | llama.cpp prompts on emulated int8 (mmq) | Faster (fp32 GEMMs on the shim) | 9 | `patches/ollama/llama-cpp/106-*` |
@@ -1356,6 +1357,17 @@ bullets are the original findings (patches 100-105); the rest build on them.
   (3-4.5e-8 NMSE), the tile kernel's up to 4.8e-5. Checks against the CPU
   backend with f16 K and V measure distance to a reference that itself
   accumulates the output in fp16 and rounds Q to fp16.
+- **Prompt attention at head size 512** (Gemma 4's full-attention layers) ran
+  on the tile kernel at 0.16 TFLOPS: its 32-column tile spills about 6 KB per
+  lane at the 128 VGPRs its 512 threads leave, and still 1433 VGPRs at 256
+  threads; a 16-key fp32 K/V tile pair in patch 131's layout would take 66 KB
+  of shared memory. Patch 145 runs it as two fp32 SGEMMs on the shim with an
+  exact softmax between them (scores for the query heads of one K/V head,
+  softmax per column, V times the weights written straight into the output),
+  scratch reserved in the compute buffer: 2.0-2.2 TFLOPS, a 512-token batch
+  at 16k keys 1711 -> 132 ms per layer. Gemma 4 26B-A4B prompts: 220 -> 305
+  tok/s at ~2,000 tokens, 74 -> 265 tok/s at 19,500. KL divergence against
+  the CPU unchanged (0.304 -> 0.300 over positions 1024-2048).
 - **Prompt attention wrote its output at a few GB/s.** Patch 130's kernel
   split a head's keys over blocks only where the GPU would otherwise idle,
   because the split's partial results cost far more than their size (a

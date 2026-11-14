@@ -220,6 +220,9 @@ RUN CC=/opt/rocm/llvm/bin/clang CXX=/opt/rocm/llvm/bin/clang++ \
     && { grep -qF 'ggml_cuda_flash_attn_ext_gcn4_decode_switch_ncols2<512>' \
              build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/fattn-gcn4-decode.cuh \
          || { echo "144-gfx803-fattn-decode-d512.patch was not applied" >&2; exit 1; }; } \
+    && { grep -qF ggml_cuda_flash_attn_ext_gcn4_gemm_applies \
+             build/llama-server-rocm_v7_2/_deps/llama_cpp-src/ggml/src/ggml-cuda/fattn.cu \
+         || { echo "145-gfx803-fattn-prompt-d512-gemm.patch was not applied" >&2; exit 1; }; } \
     && cmake --build build/llama-server-rocm_v7_2 --parallel "$(nproc)" \
     && cmake --install build/llama-server-rocm_v7_2 --component llama-server --strip
 
